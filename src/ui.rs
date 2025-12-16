@@ -4,11 +4,9 @@ use std::sync::{
     mpsc::Receiver,
 };
 
-use eframe::egui;
-
-use crate::Args;
 use crate::barcode_reader::{ScanEvent, ScanResult};
 use crate::discogs::Release;
+use eframe::egui::{self, RichText};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -17,7 +15,6 @@ pub enum Tab {
 }
 
 pub struct RecordShelfApp {
-    args: Args,
     rx: Receiver<ScanEvent>,
     scan_results: Vec<ScanResult>,
     status: String,
@@ -26,9 +23,8 @@ pub struct RecordShelfApp {
 }
 
 impl RecordShelfApp {
-    pub fn new(args: Args, rx: Receiver<ScanEvent>, stop: Arc<AtomicBool>) -> Self {
+    pub fn new(rx: Receiver<ScanEvent>, stop: Arc<AtomicBool>) -> Self {
         Self {
-            args,
             rx,
             scan_results: Vec::new(),
             status: "Waiting for scans...".to_string(),
@@ -54,16 +50,11 @@ impl RecordShelfApp {
     }
 
     fn ui_scan(&mut self, ui: &mut egui::Ui) {
-        ui.label(format!("Device: {}", self.args.device));
-        ui.label(format!("Status: {}", self.status));
-        ui.separator();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for result in &self.scan_results {
                     ui.group(|ui| {
-                        ui.heading(format!("Barcode: {}", result.barcode));
-                        ui.label(format!("Lookup time: {:.0?}", result.elapsed));
                         if let Some(err) = &result.error {
                             ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
                         } else if let Some(release) = &result.release {
@@ -115,8 +106,9 @@ impl Drop for RecordShelfApp {
 }
 
 fn render_release(ui: &mut egui::Ui, release: &Release) {
+    // Primary info (bold)
     if let Some(title) = &release.title {
-        ui.label(format!("Title: {title}"));
+        ui.label(RichText::new(format!("Title: {title}")).strong());
     }
     if let Some(artists) = &release.artists {
         if !artists.is_empty() {
@@ -126,7 +118,7 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
                 .collect::<Vec<_>>()
                 .join(", ");
             if !names.is_empty() {
-                ui.label(format!("Artist: {names}"));
+                ui.label(RichText::new(format!("Artist: {names}")).strong());
             }
         }
     }
@@ -146,18 +138,22 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
                 .collect::<Vec<_>>()
                 .join("; ");
             if !labels_str.is_empty() {
-                ui.label(format!("Label: {labels_str}"));
+                ui.label(RichText::new(format!("Label: {labels_str}")).strong());
             }
         }
     }
     if let Some(year) = release.year {
         if year > 0 {
-            ui.label(format!("Year: {year}"));
+            ui.label(RichText::new(format!("Year: {year}")).strong());
         }
     }
+
+    ui.add_space(8.0);
+
+    // Secondary info
     if let Some(country) = &release.country {
         if !country.is_empty() {
-            ui.label(format!("Country: {country}"));
+            ui.label(RichText::new(format!("Country: {country}")).small());
         }
     }
     if let Some(formats) = &release.formats {
@@ -176,24 +172,28 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
                 .collect::<Vec<_>>()
                 .join("; ");
             if !formats_str.is_empty() {
-                ui.label(format!("Format: {formats_str}"));
+                ui.label(RichText::new(format!("Format: {formats_str}")).small());
             }
         }
     }
     if let Some(genres) = &release.genres {
         if !genres.is_empty() {
-            ui.label(format!("Genres: {}", genres.join(", ")));
+            ui.label(RichText::new(format!("Genres: {}", genres.join(", "))).small());
         }
     }
     if let Some(styles) = &release.styles {
         if !styles.is_empty() {
-            ui.label(format!("Styles: {}", styles.join(", ")));
+            ui.label(RichText::new(format!("Styles: {}", styles.join(", "))).small());
         }
     }
+
+    ui.add_space(8.0);
+
+    // Tracklist
     if let Some(tracks) = &release.tracklist {
         if !tracks.is_empty() {
-            ui.label("Tracklist (first 10):");
-            for track in tracks.iter().take(10) {
+            ui.label(RichText::new("Tracklist:").strong());
+            for track in tracks {
                 let mut title = track.title.clone().unwrap_or_default();
                 if let Some(duration) = &track.duration {
                     if !duration.is_empty() {
@@ -201,11 +201,16 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
                     }
                 }
                 let pos = track.position.as_deref().unwrap_or("");
-                ui.label(format!("  {pos} {title}"));
+                ui.label(RichText::new(format!("  {pos} {title}")).small());
             }
-            if tracks.len() > 10 {
-                ui.label(format!("  ... and {} more tracks", tracks.len() - 10));
-            }
+        }
+    }
+
+    ui.add_space(8.0);
+
+    if let Some(uri) = &release.uri {
+        if !uri.is_empty() {
+            ui.hyperlink(uri);
         }
     }
 }

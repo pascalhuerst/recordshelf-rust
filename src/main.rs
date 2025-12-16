@@ -53,7 +53,7 @@ fn main() -> Result<()> {
             )
             .expect("spawn barcode reader");
 
-            Box::new(RecordShelfApp::new(args.clone(), rx, stop))
+            Box::new(RecordShelfApp::new(rx, stop))
         }),
     )
     .map_err(|e| anyhow::anyhow!(e.to_string()))
