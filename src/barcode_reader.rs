@@ -1,18 +1,26 @@
 use std::{
     io::ErrorKind,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::Sender,
-        Arc,
     },
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context as AnyhowContext, Result};
+use eframe::egui::Context as EguiContext;
 use evdev::{Device, EventSummary, KeyCode};
 
 use crate::discogs::{DiscogsClient, Release};
+
+fn emit(tx: &Sender<ScanEvent>, repaint: &Option<EguiContext>, event: ScanEvent) {
+    let _ = tx.send(event);
+    if let Some(ctx) = repaint {
+        ctx.request_repaint();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanResult {
@@ -36,10 +44,11 @@ impl BarcodeReader {
         discogs: DiscogsClient,
         stop: Arc<AtomicBool>,
         tx: Sender<ScanEvent>,
+        repaint: Option<EguiContext>,
     ) -> Result<()> {
         thread::Builder::new()
             .name("barcode-scanner".to_string())
-            .spawn(move || scanner_loop(device_path, discogs, stop, tx))
+            .spawn(move || scanner_loop(device_path, discogs, stop, tx, repaint))
             .context("spawn barcode scanner thread")?;
         Ok(())
     }
@@ -50,30 +59,25 @@ fn scanner_loop(
     discogs: DiscogsClient,
     stop: Arc<AtomicBool>,
     tx: Sender<ScanEvent>,
+    repaint: Option<EguiContext>,
 ) {
     let mut device = match Device::open(&device_path) {
         Ok(d) => d,
         Err(err) => {
-            let _ = tx.send(ScanEvent::Info(format!(
-                "Failed to open device {}: {err}",
-                device_path
-            )));
+            emit(
+                &tx,
+                &repaint,
+                ScanEvent::Info(format!("Failed to open device {}: {err}", device_path)),
+            );
             return;
         }
     };
 
-    if let Err(err) = device.set_nonblocking(true) {
-        let _ = tx.send(ScanEvent::Info(format!(
-            "Failed to set non-blocking mode on {}: {err}",
-            device_path
-        )));
-        return;
-    }
-
-    let _ = tx.send(ScanEvent::Info(format!(
-        "Listening for scans on {}",
-        device_path
-    )));
+    emit(
+        &tx,
+        &repaint,
+        ScanEvent::Info(format!("Listening for scans on {}", device_path)),
+    );
 
     let mut buffer = String::new();
 
@@ -94,20 +98,28 @@ fn scanner_loop(
                             let start = Instant::now();
                             match lookup_release(&discogs, &code) {
                                 Ok(release) => {
-                                    let _ = tx.send(ScanEvent::Result(ScanResult {
-                                        barcode: code,
-                                        release: Some(release),
-                                        error: None,
-                                        elapsed: start.elapsed(),
-                                    }));
+                                    emit(
+                                        &tx,
+                                        &repaint,
+                                        ScanEvent::Result(ScanResult {
+                                            barcode: code,
+                                            release: Some(release),
+                                            error: None,
+                                            elapsed: start.elapsed(),
+                                        }),
+                                    );
                                 }
                                 Err(err) => {
-                                    let _ = tx.send(ScanEvent::Result(ScanResult {
-                                        barcode: code,
-                                        release: None,
-                                        error: Some(err.to_string()),
-                                        elapsed: start.elapsed(),
-                                    }));
+                                    emit(
+                                        &tx,
+                                        &repaint,
+                                        ScanEvent::Result(ScanResult {
+                                            barcode: code,
+                                            release: None,
+                                            error: Some(err.to_string()),
+                                            elapsed: start.elapsed(),
+                                        }),
+                                    );
                                 }
                             }
                         } else if let Some(ch) = translate_key(keycode) {
@@ -121,10 +133,11 @@ fn scanner_loop(
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }
-                let _ = tx.send(ScanEvent::Info(format!(
-                    "Read error on {}: {err}",
-                    device_path
-                )));
+                emit(
+                    &tx,
+                    &repaint,
+                    ScanEvent::Info(format!("Read error on {}: {err}", device_path)),
+                );
                 thread::sleep(Duration::from_millis(25));
             }
         }

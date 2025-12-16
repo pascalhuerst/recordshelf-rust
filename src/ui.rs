@@ -1,14 +1,14 @@
 use std::sync::{
+    Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::Receiver,
-    Arc,
 };
 
 use eframe::egui;
 
+use crate::Args;
 use crate::barcode_reader::{ScanEvent, ScanResult};
 use crate::discogs::Release;
-use crate::Args;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -37,19 +37,20 @@ impl RecordShelfApp {
         }
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(ev) = self.rx.try_recv() {
+            changed = true;
             match ev {
                 ScanEvent::Info(msg) => self.status = msg,
                 ScanEvent::Result(res) => {
                     self.status = format!("Last scan {} ({:.0?})", res.barcode, res.elapsed);
-                    self.scan_results.insert(0, res);
-                    if self.scan_results.len() > 1000 {
-                        self.scan_results.pop();
-                    }
+                    self.scan_results.clear();
+                    self.scan_results.push(res);
                 }
             }
         }
+        changed
     }
 
     fn ui_scan(&mut self, ui: &mut egui::Ui) {
@@ -83,7 +84,10 @@ impl RecordShelfApp {
 
 impl eframe::App for RecordShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        let updated = self.drain_events();
+        if updated {
+            ctx.request_repaint();
+        }
 
         egui::TopBottomPanel::top("top-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
