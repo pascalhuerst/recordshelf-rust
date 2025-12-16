@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 
+#[derive(Clone)]
 pub struct DiscogsClient {
     http: Client,
     base: String,
@@ -50,7 +51,7 @@ impl DiscogsClient {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Release {
     pub title: Option<String>,
     pub artists: Option<Vec<Artist>>,
@@ -64,24 +65,24 @@ pub struct Release {
     pub uri: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Artist {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Label {
     pub name: Option<String>,
     pub catno: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Format {
     pub name: Option<String>,
     pub descriptions: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Track {
     pub position: Option<String>,
     pub title: Option<String>,
