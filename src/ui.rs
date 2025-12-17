@@ -4,8 +4,9 @@ use std::sync::{
     mpsc::Receiver,
 };
 
+use crate::Args;
 use crate::barcode_reader::{ScanEvent, ScanResult};
-use crate::discogs::Release;
+use crate::discogs::{DiscogsClient, Release, SearchItem, SearchQuery};
 use eframe::egui::{self, RichText};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15,21 +16,46 @@ pub enum Tab {
 }
 
 pub struct RecordShelfApp {
+    _args: Args,
+    discogs: DiscogsClient,
     rx: Receiver<ScanEvent>,
     scan_results: Vec<ScanResult>,
     status: String,
     tab: Tab,
     stop: Arc<AtomicBool>,
+    search_q: String,
+    search_artist: String,
+    search_title: String,
+    search_catno: String,
+    search_results: Vec<SearchItem>,
+    selected_result: Option<usize>,
+    selected_release: Option<Release>,
+    search_error: Option<String>,
 }
 
 impl RecordShelfApp {
-    pub fn new(rx: Receiver<ScanEvent>, stop: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        args: Args,
+        discogs: DiscogsClient,
+        rx: Receiver<ScanEvent>,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
         Self {
+            _args: args,
+            discogs,
             rx,
             scan_results: Vec::new(),
             status: "Waiting for scans...".to_string(),
             tab: Tab::Scan,
             stop,
+            search_q: String::new(),
+            search_artist: String::new(),
+            search_title: String::new(),
+            search_catno: String::new(),
+            search_results: Vec::new(),
+            selected_result: None,
+            selected_release: None,
+            search_error: None,
         }
     }
 
@@ -68,8 +94,96 @@ impl RecordShelfApp {
             });
     }
 
-    fn ui_search_placeholder(&mut self, ui: &mut egui::Ui) {
-        ui.label("Search tab coming soon.");
+    fn ui_search(&mut self, ui: &mut egui::Ui) {
+        let mut trigger_search = false;
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("Query:");
+                let resp = ui.text_edit_singleline(&mut self.search_q);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    trigger_search = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Artist:");
+                let resp = ui.text_edit_singleline(&mut self.search_artist);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    trigger_search = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Release:");
+                let resp = ui.text_edit_singleline(&mut self.search_title);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    trigger_search = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Catalog No:");
+                let resp = ui.text_edit_singleline(&mut self.search_catno);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    trigger_search = true;
+                }
+            });
+
+            if trigger_search {
+                self.perform_search();
+            }
+
+            if let Some(err) = &self.search_error {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let up_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                    let down_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                    for (idx, item) in self.search_results.iter().enumerate() {
+                        let title = item.title_display();
+                        let artist = item.artist_display();
+                        let label = item.label_display();
+                        let formats = item.format_display();
+                        let year = item.year.map(|y| y.to_string()).unwrap_or_default();
+                        let country = item.country.clone().unwrap_or_default();
+                        let line = format!(
+                            "{title} | {artist} | {label} | {year} | {country} | {formats}"
+                        );
+                        let selected = self.selected_result == Some(idx);
+                        if ui.selectable_label(selected, line).clicked() {
+                            self.selected_result = Some(idx);
+                        }
+                    }
+                    if up_pressed {
+                        if let Some(sel) = self.selected_result {
+                            if sel > 0 {
+                                self.selected_result = Some(sel - 1);
+                            }
+                        }
+                    }
+                    if down_pressed {
+                        let len = self.search_results.len();
+                        if len > 0 {
+                            let sel = self.selected_result.unwrap_or(0);
+                            if sel + 1 < len {
+                                self.selected_result = Some(sel + 1);
+                            }
+                        }
+                    }
+                    if enter_pressed {
+                        self.load_selected_release();
+                    }
+                });
+
+            ui.separator();
+
+            if let Some(release) = &self.selected_release {
+                render_release(ui, release);
+            }
+        });
     }
 }
 
@@ -94,7 +208,7 @@ impl eframe::App for RecordShelfApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Scan => self.ui_scan(ui),
-            Tab::Search => self.ui_search_placeholder(ui),
+            Tab::Search => self.ui_search(ui),
         });
     }
 }
@@ -102,6 +216,64 @@ impl eframe::App for RecordShelfApp {
 impl Drop for RecordShelfApp {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl RecordShelfApp {
+    fn perform_search(&mut self) {
+        let query = SearchQuery {
+            query: non_empty(&self.search_q),
+            artist: non_empty(&self.search_artist),
+            release_title: non_empty(&self.search_title),
+            catno: non_empty(&self.search_catno),
+            page: Some(1),
+            per_page: Some(25),
+        };
+
+        match self.discogs.search(&query) {
+            Ok(resp) => {
+                self.search_results = resp.results;
+                self.selected_result = if self.search_results.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                self.selected_release = None;
+                self.search_error = None;
+            }
+            Err(err) => {
+                self.search_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn load_selected_release(&mut self) {
+        if let Some(idx) = self.selected_result {
+            if let Some(item) = self.search_results.get(idx) {
+                if let Some(id) = item.id {
+                    match self.discogs.release(id) {
+                        Ok(rel) => {
+                            self.selected_release = Some(rel);
+                            self.search_error = None;
+                        }
+                        Err(err) => {
+                            self.search_error = Some(err.to_string());
+                        }
+                    }
+                } else {
+                    self.search_error = Some("Selected item missing id".to_string());
+                }
+            }
+        }
+    }
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
