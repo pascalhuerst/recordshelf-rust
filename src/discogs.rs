@@ -9,11 +9,10 @@ pub struct DiscogsClient {
     http: Client,
     base: String,
     currency: String,
-    username: String,
 }
 
 impl DiscogsClient {
-    pub fn new(user_agent: &str, token: &str, currency: &str, username: &str) -> Result<Self> {
+    pub fn new(user_agent: &str, token: &str, currency: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
@@ -34,7 +33,6 @@ impl DiscogsClient {
             http,
             base: "https://api.discogs.com".to_string(),
             currency: currency.to_string(),
-            username: username.to_string(),
         })
     }
 
@@ -87,14 +85,8 @@ impl DiscogsClient {
                 let id = f.get("id").and_then(val_to_u32);
                 let name = f.get("name").and_then(val_to_string).unwrap_or_default();
                 let count = f.get("count").and_then(val_to_u32);
-                let resource_url = f.get("resource_url").and_then(val_to_string);
                 if let Some(id) = id {
-                    out.folders.push(CollectionFolder {
-                        id,
-                        name,
-                        count,
-                        resource_url,
-                    });
+                    out.folders.push(CollectionFolder { id, name, count });
                 }
             }
         }
@@ -121,95 +113,45 @@ impl DiscogsClient {
         let raw: serde_json::Value = resp
             .json()
             .context("decode collection instances response")?;
-        eprintln!("collection instances raw: {raw}");
+
         let mut out = Vec::new();
-        let mut total = 0usize;
-        let mut kept = 0usize;
 
         if let Some(instances) = raw.get("instances").and_then(|v| v.as_array()) {
-            total += instances.len();
             for inst in instances {
                 let instance_id = inst
                     .get("instance_id")
                     .and_then(val_to_u32)
                     .or_else(|| inst.get("id").and_then(val_to_u32));
                 let folder_id = inst.get("folder_id").and_then(val_to_u32);
-                if let (Some(instance_id), Some(folder_id)) = (instance_id, folder_id) {
-                    kept += 1;
-                    out.push(CollectionInstance {
-                        instance_id,
-                        folder_id,
-                    });
+                if let (Some(instance_id), Some(_folder_id)) = (instance_id, folder_id) {
+                    out.push(CollectionInstance { instance_id });
                 }
             }
         } else if let Some(releases) = raw.get("releases").and_then(|v| v.as_array()) {
             for rel in releases {
-                if let (Some(instance_id), Some(folder_id)) = (
+                if let (Some(instance_id), Some(_folder_id)) = (
                     rel.get("instance_id").and_then(val_to_u32),
                     rel.get("folder_id").and_then(val_to_u32),
                 ) {
-                    kept += 1;
-                    total += 1;
-                    out.push(CollectionInstance {
-                        instance_id,
-                        folder_id,
-                    });
+                    out.push(CollectionInstance { instance_id });
                     continue;
                 }
                 if let Some(instances) = rel.get("instances").and_then(|v| v.as_array()) {
-                    total += instances.len();
                     for inst in instances {
                         let instance_id = inst
                             .get("instance_id")
                             .and_then(val_to_u32)
                             .or_else(|| inst.get("id").and_then(val_to_u32));
                         let folder_id = inst.get("folder_id").and_then(val_to_u32);
-                        if let (Some(instance_id), Some(folder_id)) = (instance_id, folder_id) {
-                            kept += 1;
-                            out.push(CollectionInstance {
-                                instance_id,
-                                folder_id,
-                            });
+                        if let (Some(instance_id), Some(_folder_id)) = (instance_id, folder_id) {
+                            out.push(CollectionInstance { instance_id });
                         }
                     }
                 }
             }
         }
 
-        eprintln!(
-            "collection instances parsed: total={}, kept={}",
-            total, kept
-        );
         Ok(out)
-    }
-
-    pub fn move_instance(
-        &self,
-        username: &str,
-        release_id: u32,
-        instance_id: u32,
-        from_folder_id: u32,
-        to_folder_id: u32,
-    ) -> Result<()> {
-        let url = format!(
-            "{}/users/{}/collection/folders/{}/releases/{}/instances/{}",
-            self.base, username, from_folder_id, release_id, instance_id
-        );
-        let resp = self
-            .http
-            .post(url)
-            .form(&[("folder_id", to_folder_id)])
-            .send()
-            .context("send move instance request")?;
-        if let Err(err) = resp.error_for_status_ref() {
-            eprintln!(
-                "Discogs move instance status: {} body={:?}",
-                resp.status(),
-                resp.text().ok()
-            );
-            return Err(err).context("Discogs move instance error response");
-        }
-        Ok(())
     }
 
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResponse> {
@@ -246,16 +188,10 @@ impl DiscogsClient {
             .context("Discogs search error response")?;
 
         let raw: serde_json::Value = resp.json().context("decode search response body")?;
-        //eprintln!("discogs search raw response: {raw}");
         let mut out = SearchResponse::default();
-        let mut total = 0usize;
-        let mut kept = 0usize;
-
         if let Some(results) = raw.get("results").and_then(|v| v.as_array()) {
-            total = results.len();
             for v in results {
                 let id = v.get("id").and_then(val_to_u32);
-                let type_field = v.get("type").and_then(val_to_string);
                 let title = v.get("title").and_then(val_to_string);
                 let artist = v.get("artist").and_then(val_to_string);
                 let year = v.get("year").and_then(val_to_u32);
@@ -266,10 +202,8 @@ impl DiscogsClient {
                 let uri = v.get("uri").and_then(val_to_string);
 
                 if let Some(id) = id {
-                    kept += 1;
                     out.results.push(SearchItem {
                         id: Some(id),
-                        type_field,
                         title,
                         artist,
                         year,
@@ -281,10 +215,6 @@ impl DiscogsClient {
                     });
                 }
             }
-        }
-        //let _ = eprintln!("discogs search parsed: total={}, kept={}", total, kept);
-        if let Some(pag) = raw.get("pagination") {
-            out.pagination = serde_json::from_value(pag.clone()).ok();
         }
 
         Ok(out)
@@ -301,28 +231,10 @@ pub struct SearchQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct SearchResponse {
     #[serde(default)]
     pub results: Vec<SearchItem>,
-    pub pagination: Option<SearchPagination>,
-}
-
-impl Default for SearchResponse {
-    fn default() -> Self {
-        Self {
-            results: Vec::new(),
-            pagination: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct SearchPagination {
-    pub page: Option<u32>,
-    pub pages: Option<u32>,
-    pub per_page: Option<u32>,
-    pub items: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,7 +245,6 @@ pub struct CollectionFolders {
 #[derive(Debug, Clone)]
 pub struct CollectionInstance {
     pub instance_id: u32,
-    pub folder_id: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -341,15 +252,12 @@ pub struct CollectionFolder {
     pub id: u32,
     pub name: String,
     pub count: Option<u32>,
-    pub resource_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SearchItem {
     #[serde(deserialize_with = "deserialize_opt_u32")]
     pub id: Option<u32>,
-    #[serde(rename = "type")]
-    pub type_field: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_string")]
     pub title: Option<String>,
     #[serde(deserialize_with = "deserialize_opt_string")]
@@ -407,18 +315,6 @@ impl SearchItem {
             .as_ref()
             .map(|f| f.join(", "))
             .unwrap_or_default()
-    }
-
-    pub fn uri_display(&self) -> String {
-        if let Some(uri) = &self.uri {
-            if uri.starts_with("http") {
-                uri.clone()
-            } else {
-                format!("https://www.discogs.com{uri}")
-            }
-        } else {
-            String::new()
-        }
     }
 }
 

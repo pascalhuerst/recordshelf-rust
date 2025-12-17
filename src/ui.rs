@@ -110,7 +110,7 @@ impl RecordShelfApp {
             });
     }
 
-    fn ui_search(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn ui_search(&mut self, ui: &mut egui::Ui) {
         let mut trigger_search = false;
         let mut search_fields_active = false;
         ui.vertical(|ui| {
@@ -324,7 +324,7 @@ impl eframe::App for RecordShelfApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Scan => self.ui_scan(ui),
-            Tab::Search => self.ui_search(ui, ctx),
+            Tab::Search => self.ui_search(ui),
         });
     }
 }

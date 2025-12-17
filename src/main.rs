@@ -36,12 +36,7 @@ pub struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let discogs = DiscogsClient::new(
-        &args.user_agent,
-        &args.token,
-        &args.currency,
-        &args.username,
-    )?;
+    let discogs = DiscogsClient::new(&args.user_agent, &args.token, &args.currency)?;
 
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
