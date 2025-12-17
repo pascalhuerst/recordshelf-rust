@@ -101,6 +101,117 @@ impl DiscogsClient {
         Ok(out)
     }
 
+    pub fn collection_instances(
+        &self,
+        username: &str,
+        release_id: u32,
+    ) -> Result<Vec<CollectionInstance>> {
+        let url = format!(
+            "{}/users/{}/collection/releases/{}",
+            self.base, username, release_id
+        );
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .context("send collection instances request")?
+            .error_for_status()
+            .context("Discogs collection instances error response")?;
+
+        let raw: serde_json::Value = resp
+            .json()
+            .context("decode collection instances response")?;
+        eprintln!("collection instances raw: {raw}");
+        let mut out = Vec::new();
+        let mut total = 0usize;
+        let mut kept = 0usize;
+
+        if let Some(instances) = raw.get("instances").and_then(|v| v.as_array()) {
+            total += instances.len();
+            for inst in instances {
+                let instance_id = inst
+                    .get("instance_id")
+                    .and_then(val_to_u32)
+                    .or_else(|| inst.get("id").and_then(val_to_u32));
+                let folder_id = inst.get("folder_id").and_then(val_to_u32);
+                if let (Some(instance_id), Some(folder_id)) = (instance_id, folder_id) {
+                    kept += 1;
+                    out.push(CollectionInstance {
+                        instance_id,
+                        folder_id,
+                    });
+                }
+            }
+        } else if let Some(releases) = raw.get("releases").and_then(|v| v.as_array()) {
+            for rel in releases {
+                if let (Some(instance_id), Some(folder_id)) = (
+                    rel.get("instance_id").and_then(val_to_u32),
+                    rel.get("folder_id").and_then(val_to_u32),
+                ) {
+                    kept += 1;
+                    total += 1;
+                    out.push(CollectionInstance {
+                        instance_id,
+                        folder_id,
+                    });
+                    continue;
+                }
+                if let Some(instances) = rel.get("instances").and_then(|v| v.as_array()) {
+                    total += instances.len();
+                    for inst in instances {
+                        let instance_id = inst
+                            .get("instance_id")
+                            .and_then(val_to_u32)
+                            .or_else(|| inst.get("id").and_then(val_to_u32));
+                        let folder_id = inst.get("folder_id").and_then(val_to_u32);
+                        if let (Some(instance_id), Some(folder_id)) = (instance_id, folder_id) {
+                            kept += 1;
+                            out.push(CollectionInstance {
+                                instance_id,
+                                folder_id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "collection instances parsed: total={}, kept={}",
+            total, kept
+        );
+        Ok(out)
+    }
+
+    pub fn move_instance(
+        &self,
+        username: &str,
+        release_id: u32,
+        instance_id: u32,
+        from_folder_id: u32,
+        to_folder_id: u32,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/users/{}/collection/folders/{}/releases/{}/instances/{}",
+            self.base, username, from_folder_id, release_id, instance_id
+        );
+        let resp = self
+            .http
+            .post(url)
+            .form(&[("folder_id", to_folder_id)])
+            .send()
+            .context("send move instance request")?;
+        if let Err(err) = resp.error_for_status_ref() {
+            eprintln!(
+                "Discogs move instance status: {} body={:?}",
+                resp.status(),
+                resp.text().ok()
+            );
+            return Err(err).context("Discogs move instance error response");
+        }
+        Ok(())
+    }
+
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResponse> {
         let url = format!("{}/database/search", self.base);
         let mut params: Vec<(&str, String)> = Vec::new();
@@ -217,6 +328,12 @@ pub struct SearchPagination {
 #[derive(Debug, Clone)]
 pub struct CollectionFolders {
     pub folders: Vec<CollectionFolder>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectionInstance {
+    pub instance_id: u32,
+    pub folder_id: u32,
 }
 
 #[derive(Debug, Clone)]

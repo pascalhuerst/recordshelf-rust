@@ -6,7 +6,9 @@ use std::sync::{
 
 use crate::Args;
 use crate::barcode_reader::{ScanEvent, ScanResult};
-use crate::discogs::{CollectionFolder, DiscogsClient, Release, SearchItem, SearchQuery};
+use crate::discogs::{
+    CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
+};
 use eframe::egui::{self, RichText};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,6 +29,9 @@ pub struct RecordShelfApp {
     folders: Vec<CollectionFolder>,
     folder_picker_open: bool,
     folder_selected: Option<usize>,
+    collection_instance: Option<CollectionInstance>,
+    collection_info: Option<String>,
+    search_focus: bool,
     search_q: String,
     search_artist: String,
     search_title: String,
@@ -56,6 +61,9 @@ impl RecordShelfApp {
             folders: Vec::new(),
             folder_picker_open: false,
             folder_selected: None,
+            collection_instance: None,
+            collection_info: None,
+            search_focus: false,
             search_q: String::new(),
             search_artist: String::new(),
             search_title: String::new(),
@@ -104,10 +112,18 @@ impl RecordShelfApp {
 
     fn ui_search(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut trigger_search = false;
+        let mut search_fields_active = false;
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label("Query:");
                 let resp = ui.text_edit_singleline(&mut self.search_q);
+                if self.search_focus {
+                    resp.request_focus();
+                    self.search_focus = false;
+                }
+                if resp.has_focus() {
+                    search_fields_active = true;
+                }
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     trigger_search = true;
                 }
@@ -115,6 +131,9 @@ impl RecordShelfApp {
             ui.horizontal(|ui| {
                 ui.label("Artist:");
                 let resp = ui.text_edit_singleline(&mut self.search_artist);
+                if resp.has_focus() {
+                    search_fields_active = true;
+                }
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     trigger_search = true;
                 }
@@ -122,6 +141,9 @@ impl RecordShelfApp {
             ui.horizontal(|ui| {
                 ui.label("Release:");
                 let resp = ui.text_edit_singleline(&mut self.search_title);
+                if resp.has_focus() {
+                    search_fields_active = true;
+                }
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     trigger_search = true;
                 }
@@ -129,6 +151,9 @@ impl RecordShelfApp {
             ui.horizontal(|ui| {
                 ui.label("Catalog No:");
                 let resp = ui.text_edit_singleline(&mut self.search_catno);
+                if resp.has_focus() {
+                    search_fields_active = true;
+                }
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     trigger_search = true;
                 }
@@ -150,6 +175,7 @@ impl RecordShelfApp {
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let up_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
                     let down_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                    let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
                     let a_pressed = ui.input(|i| i.key_pressed(egui::Key::A));
 
                     for (idx, item) in self.search_results.iter().enumerate() {
@@ -168,11 +194,12 @@ impl RecordShelfApp {
                         }
                     }
 
-                    if a_pressed {
-                        if !self.folder_picker_open {
-                            if self.ensure_folders_loaded() {
-                                self.folder_picker_open = true;
-                            }
+                    if a_pressed && !search_fields_active {
+                        if self.selected_result.is_none() {
+                            self.search_error =
+                                Some("Select a result before choosing a folder".to_string());
+                        } else if !self.folder_picker_open {
+                            self.prepare_folder_picker();
                         } else {
                             self.add_selected_to_collection();
                         }
@@ -198,6 +225,11 @@ impl RecordShelfApp {
                         if enter_pressed {
                             self.add_selected_to_collection();
                         }
+                        if esc_pressed {
+                            self.folder_picker_open = false;
+                            self.collection_instance = None;
+                            self.collection_info = None;
+                        }
                     } else {
                         if up_pressed {
                             if let Some(sel) = self.selected_result {
@@ -218,26 +250,48 @@ impl RecordShelfApp {
                         if enter_pressed {
                             self.load_selected_release();
                         }
+                        if esc_pressed {
+                            self.selected_result = None;
+                            self.selected_release = None;
+                            self.search_focus = true;
+                        }
                     }
                 });
 
             if self.folder_picker_open {
                 let ctx = ui.ctx().clone();
-                let mut open = true;
-                egui::Window::new("Select folder")
-                    .open(&mut open)
-                    .collapsible(false)
-                    .show(&ctx, |ui| {
-                        for (idx, folder) in self.folders.iter().enumerate() {
-                            let selected = self.folder_selected == Some(idx);
-                            let label =
-                                format!("{} ({} items)", folder.name, folder.count.unwrap_or(0));
-                            if ui.selectable_label(selected, label).clicked() {
-                                self.folder_selected = Some(idx);
+                let esc_picker = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                if esc_picker {
+                    self.folder_picker_open = false;
+                    self.collection_instance = None;
+                    self.collection_info = None;
+                } else {
+                    let mut open = true;
+                    egui::Window::new("Add to folder")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .show(&ctx, |ui| {
+                            if let Some(info) = &self.collection_info {
+                                ui.colored_label(egui::Color32::YELLOW, info);
                             }
-                        }
-                    });
-                self.folder_picker_open = open;
+                            for (idx, folder) in self.folders.iter().enumerate() {
+                                let selected = self.folder_selected == Some(idx);
+                                let label = format!(
+                                    "{} ({} items)",
+                                    folder.name,
+                                    folder.count.unwrap_or(0)
+                                );
+                                if ui.selectable_label(selected, label).clicked() {
+                                    self.folder_selected = Some(idx);
+                                }
+                            }
+                        });
+                    self.folder_picker_open = open;
+                }
+            }
+
+            if !self.folder_picker_open && self.search_focus {
+                // focus will be applied on next frame
             }
 
             ui.separator();
@@ -307,6 +361,12 @@ impl RecordShelfApp {
                 self.search_error = Some(err.to_string());
             }
         }
+
+        self.search_q.clear();
+        self.search_artist.clear();
+        self.search_title.clear();
+        self.search_catno.clear();
+        self.search_focus = self.search_results.is_empty();
     }
 
     fn load_selected_release(&mut self) {
@@ -355,6 +415,61 @@ impl RecordShelfApp {
         true
     }
 
+    fn prepare_folder_picker(&mut self) {
+        if !self.ensure_folders_loaded() {
+            return;
+        }
+        self.collection_instance = None;
+        self.collection_info = None;
+        if let Some(idx) = self.selected_result {
+            if let Some(item) = self.search_results.get(idx) {
+                if let Some(id) = item.id {
+                    match self.discogs.collection_instances(&self.username, id) {
+                        Ok(instances) => {
+                            if let Some(inst) = instances.first() {
+                                let url = item
+                                    .uri
+                                    .as_ref()
+                                    .map(|u| {
+                                        if u.starts_with("http") {
+                                            u.clone()
+                                        } else {
+                                            format!("https://www.discogs.com{u}")
+                                        }
+                                    })
+                                    .unwrap_or_else(|| {
+                                        format!("https://www.discogs.com/release/{id}")
+                                    });
+                                match open::that(&url) {
+                                    Ok(_) => {
+                                        self.search_error = Some(format!(
+                                            "Release already in collection (instance {}). Opened release page to move manually.",
+                                            inst.instance_id
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        self.search_error = Some(format!(
+                                            "Release already in collection; failed to open browser: {err}"
+                                        ));
+                                    }
+                                }
+                                self.folder_picker_open = false;
+                                self.collection_instance = None;
+                                self.collection_info = None;
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            self.search_error = Some(err.to_string());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.folder_picker_open = true;
+    }
+
     fn add_selected_to_collection(&mut self) {
         if self.username.trim().is_empty() {
             self.search_error = Some("Collection: username required".to_string());
@@ -377,17 +492,49 @@ impl RecordShelfApp {
         if let Some(idx) = self.selected_result {
             if let Some(item) = self.search_results.get(idx) {
                 if let Some(id) = item.id {
-                    match self
-                        .discogs
-                        .add_to_collection(&self.username, folder.id, id)
-                    {
-                        Ok(_) => {
-                            self.search_error =
-                                Some(format!("Added release {id} to folder {}", folder.name));
-                            self.folder_picker_open = false;
+                    if let Some(inst) = &self.collection_instance {
+                        let url = item
+                            .uri
+                            .as_ref()
+                            .map(|u| {
+                                if u.starts_with("http") {
+                                    u.clone()
+                                } else {
+                                    format!("https://www.discogs.com{u}")
+                                }
+                            })
+                            .unwrap_or_else(|| format!("https://www.discogs.com/release/{id}"));
+                        match open::that(&url) {
+                            Ok(_) => {
+                                self.search_error = Some(format!(
+                                    "Release already in collection (instance {}). Opened release page in browser to move manually.",
+                                    inst.instance_id
+                                ));
+                            }
+                            Err(err) => {
+                                self.search_error = Some(format!(
+                                    "Release already in collection; failed to open browser: {err}"
+                                ));
+                            }
                         }
-                        Err(err) => {
-                            self.search_error = Some(err.to_string());
+                        self.folder_picker_open = false;
+                        self.collection_instance = None;
+                        self.collection_info = None;
+                    } else {
+                        match self
+                            .discogs
+                            .add_to_collection(&self.username, folder.id, id)
+                        {
+                            Ok(_) => {
+                                let msg = format!("Added release {id} to folder {}", folder.name);
+                                self.search_error = Some(msg);
+                                self.folder_picker_open = false;
+                                self.collection_instance = None;
+                                self.collection_info = None;
+                            }
+                            Err(err) => {
+                                self.search_error = Some(err.to_string());
+                            }
                         }
                     }
                 } else {
