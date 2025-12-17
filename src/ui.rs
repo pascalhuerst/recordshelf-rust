@@ -6,7 +6,7 @@ use std::sync::{
 
 use crate::Args;
 use crate::barcode_reader::{ScanEvent, ScanResult};
-use crate::discogs::{DiscogsClient, Release, SearchItem, SearchQuery};
+use crate::discogs::{CollectionFolder, DiscogsClient, Release, SearchItem, SearchQuery};
 use eframe::egui::{self, RichText};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,10 @@ pub struct RecordShelfApp {
     status: String,
     tab: Tab,
     stop: Arc<AtomicBool>,
+    username: String,
+    folders: Vec<CollectionFolder>,
+    folder_picker_open: bool,
+    folder_selected: Option<usize>,
     search_q: String,
     search_artist: String,
     search_title: String,
@@ -41,13 +45,17 @@ impl RecordShelfApp {
         stop: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            _args: args,
+            _args: args.clone(),
             discogs,
             rx,
             scan_results: Vec::new(),
             status: "Waiting for scans...".to_string(),
             tab: Tab::Scan,
             stop,
+            username: args.username.clone(),
+            folders: Vec::new(),
+            folder_picker_open: false,
+            folder_selected: None,
             search_q: String::new(),
             search_artist: String::new(),
             search_title: String::new(),
@@ -94,7 +102,7 @@ impl RecordShelfApp {
             });
     }
 
-    fn ui_search(&mut self, ui: &mut egui::Ui) {
+    fn ui_search(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut trigger_search = false;
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -142,6 +150,8 @@ impl RecordShelfApp {
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let up_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
                     let down_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                    let a_pressed = ui.input(|i| i.key_pressed(egui::Key::A));
+
                     for (idx, item) in self.search_results.iter().enumerate() {
                         let title = item.title_display();
                         let artist = item.artist_display();
@@ -157,26 +167,78 @@ impl RecordShelfApp {
                             self.selected_result = Some(idx);
                         }
                     }
-                    if up_pressed {
-                        if let Some(sel) = self.selected_result {
-                            if sel > 0 {
-                                self.selected_result = Some(sel - 1);
+
+                    if a_pressed {
+                        if !self.folder_picker_open {
+                            if self.ensure_folders_loaded() {
+                                self.folder_picker_open = true;
                             }
+                        } else {
+                            self.add_selected_to_collection();
                         }
                     }
-                    if down_pressed {
-                        let len = self.search_results.len();
-                        if len > 0 {
-                            let sel = self.selected_result.unwrap_or(0);
-                            if sel + 1 < len {
-                                self.selected_result = Some(sel + 1);
+
+                    if self.folder_picker_open {
+                        if up_pressed {
+                            if let Some(sel) = self.folder_selected {
+                                if sel > 0 {
+                                    self.folder_selected = Some(sel - 1);
+                                }
                             }
                         }
-                    }
-                    if enter_pressed {
-                        self.load_selected_release();
+                        if down_pressed {
+                            let len = self.folders.len();
+                            if len > 0 {
+                                let sel = self.folder_selected.unwrap_or(0);
+                                if sel + 1 < len {
+                                    self.folder_selected = Some(sel + 1);
+                                }
+                            }
+                        }
+                        if enter_pressed {
+                            self.add_selected_to_collection();
+                        }
+                    } else {
+                        if up_pressed {
+                            if let Some(sel) = self.selected_result {
+                                if sel > 0 {
+                                    self.selected_result = Some(sel - 1);
+                                }
+                            }
+                        }
+                        if down_pressed {
+                            let len = self.search_results.len();
+                            if len > 0 {
+                                let sel = self.selected_result.unwrap_or(0);
+                                if sel + 1 < len {
+                                    self.selected_result = Some(sel + 1);
+                                }
+                            }
+                        }
+                        if enter_pressed {
+                            self.load_selected_release();
+                        }
                     }
                 });
+
+            if self.folder_picker_open {
+                let ctx = ui.ctx().clone();
+                let mut open = true;
+                egui::Window::new("Select folder")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .show(&ctx, |ui| {
+                        for (idx, folder) in self.folders.iter().enumerate() {
+                            let selected = self.folder_selected == Some(idx);
+                            let label =
+                                format!("{} ({} items)", folder.name, folder.count.unwrap_or(0));
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.folder_selected = Some(idx);
+                            }
+                        }
+                    });
+                self.folder_picker_open = open;
+            }
 
             ui.separator();
 
@@ -208,7 +270,7 @@ impl eframe::App for RecordShelfApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Scan => self.ui_scan(ui),
-            Tab::Search => self.ui_search(ui),
+            Tab::Search => self.ui_search(ui, ctx),
         });
     }
 }
@@ -255,6 +317,74 @@ impl RecordShelfApp {
                         Ok(rel) => {
                             self.selected_release = Some(rel);
                             self.search_error = None;
+                        }
+                        Err(err) => {
+                            self.search_error = Some(err.to_string());
+                        }
+                    }
+                } else {
+                    self.search_error = Some("Selected item missing id".to_string());
+                }
+            }
+        }
+    }
+
+    fn ensure_folders_loaded(&mut self) -> bool {
+        if self.username.trim().is_empty() {
+            self.search_error = Some("Collection: username required".to_string());
+            return false;
+        }
+        if self.folders.is_empty() {
+            match self.discogs.collection_folders(&self.username) {
+                Ok(resp) => {
+                    self.folders = resp.folders;
+                }
+                Err(err) => {
+                    self.search_error = Some(err.to_string());
+                    return false;
+                }
+            }
+        }
+        if self.folders.is_empty() {
+            self.search_error = Some("No folders found".to_string());
+            return false;
+        }
+        if self.folder_selected.is_none() {
+            self.folder_selected = Some(0);
+        }
+        true
+    }
+
+    fn add_selected_to_collection(&mut self) {
+        if self.username.trim().is_empty() {
+            self.search_error = Some("Collection: username required".to_string());
+            return;
+        }
+        let folder_idx = match self.folder_selected {
+            Some(idx) => idx,
+            None => {
+                self.search_error = Some("Select a folder first".to_string());
+                return;
+            }
+        };
+        let folder = match self.folders.get(folder_idx) {
+            Some(f) => f,
+            None => {
+                self.search_error = Some("Select a valid folder".to_string());
+                return;
+            }
+        };
+        if let Some(idx) = self.selected_result {
+            if let Some(item) = self.search_results.get(idx) {
+                if let Some(id) = item.id {
+                    match self
+                        .discogs
+                        .add_to_collection(&self.username, folder.id, id)
+                    {
+                        Ok(_) => {
+                            self.search_error =
+                                Some(format!("Added release {id} to folder {}", folder.name));
+                            self.folder_picker_open = false;
                         }
                         Err(err) => {
                             self.search_error = Some(err.to_string());

@@ -9,10 +9,11 @@ pub struct DiscogsClient {
     http: Client,
     base: String,
     currency: String,
+    username: String,
 }
 
 impl DiscogsClient {
-    pub fn new(user_agent: &str, token: &str, currency: &str) -> Result<Self> {
+    pub fn new(user_agent: &str, token: &str, currency: &str, username: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
@@ -33,6 +34,7 @@ impl DiscogsClient {
             http,
             base: "https://api.discogs.com".to_string(),
             currency: currency.to_string(),
+            username: username.to_string(),
         })
     }
 
@@ -49,6 +51,54 @@ impl DiscogsClient {
 
         let release: Release = resp.json().context("decode release response")?;
         Ok(release)
+    }
+
+    pub fn add_to_collection(&self, username: &str, folder_id: u32, release_id: u32) -> Result<()> {
+        let url = format!(
+            "{}/users/{}/collection/folders/{}/releases/{}",
+            self.base, username, folder_id, release_id
+        );
+        self.http
+            .post(url)
+            .query(&[("quantity", 1u32)])
+            .send()
+            .context("send add-to-collection request")?
+            .error_for_status()
+            .context("Discogs collection error response")?;
+        Ok(())
+    }
+
+    pub fn collection_folders(&self, username: &str) -> Result<CollectionFolders> {
+        let url = format!("{}/users/{}/collection/folders", self.base, username);
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .context("send collection folders request")?
+            .error_for_status()
+            .context("Discogs collection folders error response")?;
+
+        let raw: serde_json::Value = resp.json().context("decode collection folders response")?;
+        let mut out = CollectionFolders {
+            folders: Vec::new(),
+        };
+        if let Some(folders) = raw.get("folders").and_then(|v| v.as_array()) {
+            for f in folders {
+                let id = f.get("id").and_then(val_to_u32);
+                let name = f.get("name").and_then(val_to_string).unwrap_or_default();
+                let count = f.get("count").and_then(val_to_u32);
+                let resource_url = f.get("resource_url").and_then(val_to_string);
+                if let Some(id) = id {
+                    out.folders.push(CollectionFolder {
+                        id,
+                        name,
+                        count,
+                        resource_url,
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResponse> {
@@ -85,7 +135,7 @@ impl DiscogsClient {
             .context("Discogs search error response")?;
 
         let raw: serde_json::Value = resp.json().context("decode search response body")?;
-        eprintln!("discogs search raw response: {raw}");
+        //eprintln!("discogs search raw response: {raw}");
         let mut out = SearchResponse::default();
         let mut total = 0usize;
         let mut kept = 0usize;
@@ -121,7 +171,7 @@ impl DiscogsClient {
                 }
             }
         }
-        let _ = eprintln!("discogs search parsed: total={}, kept={}", total, kept);
+        //let _ = eprintln!("discogs search parsed: total={}, kept={}", total, kept);
         if let Some(pag) = raw.get("pagination") {
             out.pagination = serde_json::from_value(pag.clone()).ok();
         }
@@ -162,6 +212,19 @@ pub struct SearchPagination {
     pub pages: Option<u32>,
     pub per_page: Option<u32>,
     pub items: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectionFolders {
+    pub folders: Vec<CollectionFolder>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectionFolder {
+    pub id: u32,
+    pub name: String,
+    pub count: Option<u32>,
+    pub resource_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

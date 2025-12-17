@@ -28,11 +28,20 @@ pub struct Args {
     /// Discogs marketplace currency
     #[arg(long, default_value = "EUR")]
     pub currency: String,
+
+    /// Discogs username for collection actions
+    #[arg(long, default_value = "pasomukke")]
+    pub username: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let discogs = DiscogsClient::new(&args.user_agent, &args.token, &args.currency)?;
+    let discogs = DiscogsClient::new(
+        &args.user_agent,
+        &args.token,
+        &args.currency,
+        &args.username,
+    )?;
 
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
