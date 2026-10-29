@@ -381,10 +381,12 @@ impl RecordShelfApp {
         }
     }
 
-    fn handle_collection_keys(&mut self, ctx: &egui::Context) {
+    /// Keys that work while the search field has the focus too: the arrows move
+    /// through the list, Esc clears the search.
+    fn handle_collection_navigation(&mut self, ctx: &egui::Context) {
         let pressed = |key| ctx.input(|i| i.key_pressed(key) && !i.modifiers.command);
-        if pressed(egui::Key::Escape) {
-            self.collection.clear();
+        if pressed(egui::Key::Escape) && self.collection.clear() {
+            // the search was cleared: carry on typing
             self.collection.focus_search = true;
         }
         if self
@@ -392,6 +394,14 @@ impl RecordShelfApp {
             .step(pressed(egui::Key::ArrowUp), pressed(egui::Key::ArrowDown))
         {
             self.collection.details = None;
+        }
+    }
+
+    /// Single letter commands; only while nothing is being typed.
+    fn handle_collection_commands(&mut self, ctx: &egui::Context) {
+        let pressed = |key| ctx.input(|i| i.key_pressed(key) && !i.modifiers.command);
+        if pressed(egui::Key::Slash) {
+            self.collection.focus_search = true;
         }
         if pressed(Command::Print.key()) {
             self.print_stored();
@@ -460,8 +470,11 @@ impl RecordShelfApp {
             }
         });
 
-        if !search_active && !self.collection.dialog_open() {
-            self.handle_collection_keys(ui.ctx());
+        if !self.collection.dialog_open() {
+            self.handle_collection_navigation(ui.ctx());
+            if !search_active {
+                self.handle_collection_commands(ui.ctx());
+            }
         }
         self.show_collection_dialogs(ui.ctx());
 
@@ -585,7 +598,7 @@ impl RecordShelfApp {
             if ui.button("Quit  [Q]").clicked() {
                 action = Some(Command::Quit);
             }
-            ui.label(RichText::new("Up/Down: browse   Esc: clear the search").small());
+            ui.label(RichText::new("Up/Down: browse   Esc: clear the search   /: search").small());
         });
         match action {
             Some(Command::Print) => self.print_stored(),
@@ -1490,6 +1503,130 @@ mod tests {
         assert!(
             !app.collection.editor.as_ref().unwrap().focus,
             "the focus was given once"
+        );
+    }
+
+    // --- keyboard ---------------------------------------------------------------
+
+    fn key_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// One frame of the tab with these key presses.
+    fn frame(app: &mut RecordShelfApp, keys: &[egui::Key]) {
+        let raw = egui::RawInput {
+            events: keys.iter().map(|k| key_event(*k)).collect(),
+            ..Default::default()
+        };
+        let ctx = app.repaint.clone();
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_collection(ui));
+        });
+    }
+
+    fn type_text(app: &mut RecordShelfApp, text: &str) {
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Text(text.to_string())],
+            ..Default::default()
+        };
+        let ctx = app.repaint.clone();
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_collection(ui));
+        });
+    }
+
+    #[test]
+    fn the_arrows_work_right_after_the_tab_opens_while_the_search_has_the_focus() {
+        let mut app = loaded_app();
+        assert!(
+            app.collection.focus_search,
+            "the search field is focused when the tab opens"
+        );
+        frame(&mut app, &[]);
+        frame(&mut app, &[]);
+        assert_eq!(app.collection.selected_id, Some(1));
+        frame(&mut app, &[egui::Key::ArrowDown]);
+        assert_eq!(
+            app.collection.selected_id,
+            Some(2),
+            "Down moved the selection without Esc first"
+        );
+        frame(&mut app, &[egui::Key::ArrowDown]);
+        assert_eq!(app.collection.selected_id, Some(3));
+        frame(&mut app, &[egui::Key::ArrowUp]);
+        assert_eq!(app.collection.selected_id, Some(2));
+    }
+
+    #[test]
+    fn typing_searches_and_the_arrows_still_move() {
+        let mut app = loaded_app();
+        frame(&mut app, &[]);
+        frame(&mut app, &[]);
+        type_text(&mut app, "garnier");
+        assert_eq!(app.collection.search, "garnier");
+        assert_eq!(app.collection.filtered.len(), 1);
+        type_text(&mut app, " ");
+        frame(&mut app, &[egui::Key::ArrowDown]);
+        assert_eq!(
+            app.collection.selected_id,
+            Some(3),
+            "the only match stays selected at the end of the list"
+        );
+    }
+
+    #[test]
+    fn letters_are_text_while_typing_and_commands_otherwise() {
+        let mut app = loaded_app();
+        frame(&mut app, &[]);
+        frame(&mut app, &[]);
+        // the search field has the focus: D is a letter of the search
+        type_text(&mut app, "d");
+        assert_eq!(app.collection.search, "d");
+        assert!(app.collection.confirm_delete.is_none());
+        // Esc clears the search and keeps typing possible
+        frame(&mut app, &[egui::Key::Escape]);
+        assert_eq!(app.collection.search, "");
+        // a second Esc leaves the field: now D is a command
+        frame(&mut app, &[]);
+        frame(&mut app, &[egui::Key::Escape]);
+        frame(&mut app, &[]);
+        assert!(!app.collection.focus_search);
+        frame(&mut app, &[egui::Key::D]);
+        assert!(
+            app.collection.confirm_delete.is_some(),
+            "D asks to delete when no text is being typed"
+        );
+    }
+
+    #[test]
+    fn slash_goes_back_to_the_search() {
+        let mut app = loaded_app();
+        frame(&mut app, &[]);
+        frame(&mut app, &[egui::Key::Escape]);
+        frame(&mut app, &[]);
+        assert!(!app.collection.focus_search);
+        frame(&mut app, &[egui::Key::Slash]);
+        assert!(app.collection.focus_search, "/ asks for the search field");
+        frame(&mut app, &[]);
+        type_text(&mut app, "b");
+        assert_eq!(app.collection.search, "b");
+    }
+
+    #[test]
+    fn the_keys_do_nothing_while_a_dialog_is_open() {
+        let mut app = loaded_app();
+        app.collection.confirm_delete = Some((1, "x".into()));
+        frame(&mut app, &[egui::Key::ArrowDown]);
+        assert_eq!(
+            app.collection.selected_id,
+            Some(1),
+            "the list stays where it is behind the dialog"
         );
     }
 }
