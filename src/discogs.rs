@@ -230,6 +230,9 @@ pub struct SearchItem {
     pub catno: Option<String>,
     #[serde(rename = "format", deserialize_with = "deserialize_opt_string_vec")]
     pub format_descriptions: Option<Vec<String>>,
+    /// Detailed formats (with colour/remarks); preferred over `format_descriptions`.
+    #[serde(deserialize_with = "deserialize_lenient_formats")]
+    pub formats: Option<Vec<Format>>,
     #[serde(deserialize_with = "deserialize_opt_string")]
     pub uri: Option<String>,
     /// Small cover (150px) for list rows.
@@ -277,6 +280,7 @@ impl SearchItem {
             label: Some(names(|l| l.name.as_ref())),
             catno: names(|l| l.catno.as_ref()).into_iter().next(),
             format_descriptions: Some(formats),
+            formats: release.formats.clone(),
             uri: release.uri.clone(),
             thumb: release
                 .images
@@ -306,10 +310,14 @@ impl SearchItem {
     }
 
     pub fn format_display(&self) -> String {
-        self.format_descriptions
-            .as_ref()
-            .map(|f| f.join(", "))
-            .unwrap_or_default()
+        match self.formats.as_deref().map(format_line) {
+            Some(line) if !line.is_empty() => line,
+            _ => self
+                .format_descriptions
+                .as_ref()
+                .map(|f| f.join(", "))
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -421,6 +429,39 @@ pub struct Label {
 pub struct Format {
     pub name: Option<String>,
     pub descriptions: Option<Vec<String>>,
+    /// Free text, e.g. the colour ("X-ray Colour") or "180 Gram / Green Marble".
+    pub text: Option<String>,
+}
+
+/// Everything Discogs says about the physical format, e.g.
+/// `Vinyl, 12", 33 ⅓ RPM, EP, Stereo, X-ray Colour`. Several formats
+/// (box sets) are separated by " | ".
+pub fn format_line(formats: &[Format]) -> String {
+    formats
+        .iter()
+        .map(|f| {
+            f.name
+                .iter()
+                .chain(f.descriptions.iter().flatten())
+                .chain(f.text.iter())
+                .map(String::as_str)
+                .filter(|p| !p.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Search results carry `formats` as objects; anything unexpected is ignored
+/// instead of failing the whole response.
+fn deserialize_lenient_formats<'de, D>(deserializer: D) -> Result<Option<Vec<Format>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<Value>::deserialize(deserializer)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -729,5 +770,46 @@ mod tests {
                 .remove_from_collection("me", 3, 99, 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn format_line_includes_descriptions_and_free_text() {
+        let it = item(
+            r#"{"id": 1, "format": ["Vinyl", "12\"", "EP"],
+                "formats": [{"name": "Vinyl", "qty": "1", "text": "X-ray Colour",
+                             "descriptions": ["12\"", "33 ⅓ RPM", "EP", "Stereo"]}]}"#,
+        );
+        assert_eq!(
+            it.format_display(),
+            "Vinyl, 12\", 33 ⅓ RPM, EP, Stereo, X-ray Colour"
+        );
+    }
+
+    #[test]
+    fn pressings_that_only_differ_in_the_free_text_look_different() {
+        let a = item(
+            r#"{"id": 1, "formats": [{"name": "Vinyl", "descriptions": ["12\"", "EP"], "text": "X-ray Colour"}]}"#,
+        );
+        let b = item(
+            r#"{"id": 2, "formats": [{"name": "Vinyl", "descriptions": ["12\"", "EP"], "text": "180 Gram / Green Marble"}]}"#,
+        );
+        assert_ne!(a.format_display(), b.format_display());
+    }
+
+    #[test]
+    fn format_display_falls_back_to_the_flat_list() {
+        let it = item(r#"{"id": 1, "format": ["Vinyl", "LP"]}"#);
+        assert_eq!(it.format_display(), "Vinyl, LP");
+        let odd = item(r#"{"id": 1, "format": ["Vinyl"], "formats": "unexpected"}"#);
+        assert_eq!(odd.format_display(), "Vinyl");
+        assert_eq!(item(r#"{"id": 1, "formats": []}"#).format_display(), "");
+    }
+
+    #[test]
+    fn box_sets_list_every_format() {
+        let it = item(
+            r#"{"id": 1, "formats": [{"name": "Vinyl", "descriptions": ["LP"]}, {"name": "CD"}]}"#,
+        );
+        assert_eq!(it.format_display(), "Vinyl, LP | CD");
     }
 }

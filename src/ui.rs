@@ -16,6 +16,7 @@ use crate::decks;
 use crate::decks_bridge::{self, Bridge, DecksPage};
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
+    format_line,
 };
 use crate::worker::{Request, Response, Worker};
 use eframe::egui::{self, Color32, RichText};
@@ -651,7 +652,14 @@ impl RecordShelfApp {
                         item.label_display(),
                         item.year.map(|y| y.to_string()).unwrap_or_default(),
                         item.country.clone().unwrap_or_default(),
-                        item.format_display(),
+                        // Prefer the full release data once loaded: it always has the
+                        // free-text part (colour etc.) that tells pressings apart.
+                        item.id
+                            .and_then(|id| self.releases.get(&id))
+                            .and_then(|r| r.formats.as_deref())
+                            .map(format_line)
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| item.format_display()),
                     ]
                     .into_iter()
                     .filter(|p| !p.is_empty())
@@ -1324,21 +1332,9 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
     if let Some(formats) = &release.formats
         && !formats.is_empty()
     {
-        let formats_str = formats
-            .iter()
-            .map(|f| {
-                let name = f.name.as_deref().unwrap_or("").to_string();
-                match f.descriptions.as_ref() {
-                    Some(descs) if !descs.is_empty() => {
-                        format!("{name} ({})", descs.join(", "))
-                    }
-                    _ => name,
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+        let formats_str = format_line(formats);
         if !formats_str.is_empty() {
-            ui.label(RichText::new(format!("Format: {formats_str}")).small());
+            ui.label(RichText::new(format!("Format: {formats_str}")).strong());
         }
     }
     if let Some(genres) = &release.genres
