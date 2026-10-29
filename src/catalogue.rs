@@ -72,6 +72,16 @@ pub struct CatalogueRelease {
     pub credits: Vec<CreditRow>,
 }
 
+/// What goes between an artist and the next one: a comma, ";" or the join
+/// text of the sleeve ("&", "feat.", ...) with spaces around it.
+pub fn join_separator(join: Option<&str>) -> String {
+    match join.map(str::trim).filter(|j| !j.is_empty()) {
+        None => ", ".to_string(),
+        Some(j) if matches!(j, "," | ";") => format!("{j} "),
+        Some(j) => format!(" {j} "),
+    }
+}
+
 /// Artists as printed on the sleeve: each name followed by what the sleeve
 /// puts before the next one ("A feat. B", "A & B", "A, B"). `None` joins as a comma.
 pub fn join_artists<'a>(artists: impl IntoIterator<Item = (&'a str, Option<&'a str>)>) -> String {
@@ -79,18 +89,7 @@ pub fn join_artists<'a>(artists: impl IntoIterator<Item = (&'a str, Option<&'a s
     let mut pending_join: Option<Option<&str>> = None;
     for (name, join) in artists {
         if let Some(previous) = pending_join {
-            match previous.map(str::trim).filter(|j| !j.is_empty()) {
-                None => out.push_str(", "),
-                Some(j) if matches!(j, "," | ";") => {
-                    out.push_str(j);
-                    out.push(' ');
-                }
-                Some(j) => {
-                    out.push(' ');
-                    out.push_str(j);
-                    out.push(' ');
-                }
-            }
+            out.push_str(&join_separator(previous));
         }
         out.push_str(name);
         pending_join = Some(join);
@@ -785,5 +784,15 @@ mod tests {
         assert_eq!(fold("Dub Techno 12\""), "dub techno 12\"");
         assert_eq!(fold(""), "");
         assert_eq!(fold("ÉÈÊË éèêë"), "eeee eeee");
+    }
+
+    #[test]
+    fn separators_between_artists() {
+        assert_eq!(join_separator(None), ", ");
+        assert_eq!(join_separator(Some(" ")), ", ");
+        assert_eq!(join_separator(Some(",")), ", ");
+        assert_eq!(join_separator(Some(";")), "; ");
+        assert_eq!(join_separator(Some("&")), " & ");
+        assert_eq!(join_separator(Some(" feat. ")), " feat. ");
     }
 }

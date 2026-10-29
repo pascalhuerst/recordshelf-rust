@@ -78,18 +78,12 @@ pub struct StoredFormat {
 }
 
 impl StoredFormat {
-    /// `12", 33 RPM, 180 g, EP, X-ray Colour` (and "2 x" for several discs).
-    pub fn summary(&self) -> String {
+    /// The single values of the format: `12"`, `33 RPM`, `180 g`, `Mono`, the
+    /// tags (`EP`) and the free text (`X-ray Colour`). Without the disc count.
+    pub fn parts(&self) -> Vec<String> {
         let mut parts: Vec<String> = Vec::new();
-        if self.qty > 1 {
-            parts.push(format!("{} x", self.qty));
-        }
-        let mut first = String::new();
         if let Some(size) = self.size {
-            first.push_str(&format!("{size}\""));
-        }
-        if !first.is_empty() {
-            parts.push(first);
+            parts.push(format!("{size}\""));
         }
         if let Some(rpm) = self.rpm {
             parts.push(format!("{rpm} RPM"));
@@ -108,13 +102,18 @@ impl StoredFormat {
         if let Some(text) = &self.text {
             parts.push(text.clone());
         }
-        // "2 x 12"" reads better than "2 x, 12\""
-        match parts.first() {
-            Some(first) if first.ends_with(" x") && parts.len() > 1 => {
-                let merged = format!("{first} {}", parts[1]);
-                parts.splice(0..2, [merged]);
+        parts
+    }
+
+    /// `12", 33 RPM, 180 g, EP, X-ray Colour` (and "2 x 12"" for several discs).
+    pub fn summary(&self) -> String {
+        let mut parts = self.parts();
+        if self.qty > 1 {
+            // "2 x 12"" reads better than "2 x, 12\""
+            match parts.first_mut() {
+                Some(first) => *first = format!("{} x {first}", self.qty),
+                None => parts.push(format!("{} x", self.qty)),
             }
-            _ => {}
         }
         parts.join(", ")
     }
@@ -160,6 +159,7 @@ impl StoredRelease {
         join_artists(self.artists.iter().map(|(n, j)| (n.as_str(), j.as_deref())))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn format_display(&self) -> String {
         self.formats
             .iter()
@@ -499,6 +499,14 @@ impl Library {
                 descriptions: row.get(7),
             });
         }
+        let mut credits: BTreeMap<i32, String> = BTreeMap::new();
+        for row in self.client.query(
+            "SELECT rc.release_id, string_agg(DISTINCT a.name, ' ') FROM release_credits rc
+               JOIN artists a ON a.id = rc.artist_id GROUP BY rc.release_id",
+            &[],
+        )? {
+            credits.insert(row.get(0), row.get(1));
+        }
         let mut tracks: BTreeMap<i32, String> = BTreeMap::new();
         for row in self.client.query(
             "SELECT release_id, string_agg(title, ' ' ORDER BY track_index) FROM tracks GROUP BY release_id",
@@ -532,13 +540,14 @@ impl Library {
                     })
                     .unwrap_or_default();
                 let haystack = fold(&format!(
-                    "{title} {artists_text} {labels_text} {} {} {} {} {format} {} {}",
+                    "{title} {artists_text} {labels_text} {} {} {} {} {format} {} {} {}",
                     year.map(|y| y.to_string()).unwrap_or_default(),
                     country.unwrap_or_default(),
                     genres.join(" "),
                     styles.join(" "),
                     tracks.get(&id).cloned().unwrap_or_default(),
                     my_notes.unwrap_or_default(),
+                    credits.get(&id).cloned().unwrap_or_default(),
                 ));
                 RecordRow {
                     id: id as u32,
@@ -1642,6 +1651,41 @@ mod tests {
             library.get_release(9).unwrap().unwrap().my_notes,
             None,
             "a record stored again starts without notes"
+        );
+    }
+
+    #[test]
+    fn format_parts_are_the_single_values() {
+        let f = StoredFormat {
+            qty: 2,
+            size: Some(12),
+            rpm: Some(33),
+            channels: "mono".into(),
+            weight_g: Some(180),
+            text: Some("Green Marble".into()),
+            descriptions: vec!["EP".into()],
+        };
+        assert_eq!(
+            f.parts(),
+            ["12\"", "33 RPM", "180 g", "Mono", "EP", "Green Marble"]
+        );
+        assert_eq!(
+            f.summary(),
+            "2 x 12\", 33 RPM, 180 g, Mono, EP, Green Marble"
+        );
+    }
+
+    #[test]
+    fn credit_names_can_be_searched() {
+        let Some((mut library, _)) = library("t_credit_search") else {
+            return;
+        };
+        library.save_release(&mapped(FULL, 1)).unwrap();
+        let rows = library.list().unwrap();
+        assert!(
+            rows[0].haystack.contains("producer pete"),
+            "{}",
+            rows[0].haystack
         );
     }
 }

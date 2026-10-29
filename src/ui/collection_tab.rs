@@ -2,6 +2,7 @@
 //! database, and look up a scanned sticker there (never on Discogs).
 
 use super::*;
+use crate::catalogue::join_separator;
 use crate::collection::{ListState, NotesEditor};
 use crate::library::StoredRelease;
 use crate::worker::ScanCode;
@@ -613,6 +614,7 @@ impl RecordShelfApp {
             self.ask_delete();
         }
         let selected = self.collection.selected_id;
+        let mut sink = LinkSink::default();
         egui::ScrollArea::vertical()
             .id_source("collection-details")
             .auto_shrink([false, false])
@@ -637,43 +639,108 @@ impl RecordShelfApp {
                     } else {
                         draw_placeholder(ui, COVER_SIZE);
                     }
-                    ui.vertical(|ui| render_stored(ui, record));
+                    ui.vertical(|ui| render_stored(ui, record, &mut sink));
                 });
             });
+        #[cfg(test)]
+        {
+            self.collection.test_links = std::mem::take(&mut sink.seen);
+        }
+        if let Some(value) = sink.clicked {
+            self.collection.search_for(&value);
+            self.collection.focus_search = false;
+        }
     }
 }
 
-/// The details of a record from our database.
-fn render_stored(ui: &mut egui::Ui, record: &StoredRelease) {
+/// Collects what was clicked while the details are drawn (and, in tests, where
+/// the links are).
+#[derive(Default)]
+struct LinkSink {
+    clicked: Option<String>,
+    #[cfg(test)]
+    seen: Vec<(String, egui::Rect)>,
+}
+
+impl LinkSink {
+    /// A value that searches the collection for `search` when clicked.
+    fn link(&mut self, ui: &mut egui::Ui, text: &str, search: &str) {
+        let response = ui
+            .link(text)
+            .on_hover_text(format!("Search the collection for {search}"));
+        #[cfg(test)]
+        self.seen.push((search.to_string(), response.rect));
+        if response.clicked() {
+            self.clicked = Some(search.to_string());
+        }
+    }
+}
+
+/// One line of the details: a bold caption followed by whatever `content` draws.
+fn detail_row(ui: &mut egui::Ui, caption: &str, content: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new(caption).strong());
+        content(ui);
+    });
+}
+
+/// The details of a record from our database. Names, labels, catalog numbers,
+/// the year, country, format parts, genres and styles are links that search the
+/// collection for that value.
+fn render_stored(ui: &mut egui::Ui, record: &StoredRelease, sink: &mut LinkSink) {
     ui.label(RichText::new(format!("Title: {}", record.title)).strong());
-    let artists = record.artist_display();
-    if !artists.is_empty() {
-        ui.label(RichText::new(format!("Artist: {artists}")).strong());
+    if !record.artists.is_empty() {
+        detail_row(ui, "Artist:", |ui| {
+            for (i, (name, join)) in record.artists.iter().enumerate() {
+                sink.link(ui, name, name);
+                if i + 1 < record.artists.len() {
+                    ui.label(join_separator(join.as_deref()).trim());
+                }
+            }
+        });
     }
     if !record.labels.is_empty() {
-        let labels = record
-            .labels
-            .iter()
-            .map(|(name, catno)| {
-                if catno.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{name} ({catno})")
+        detail_row(ui, "Label:", |ui| {
+            for (i, (name, catno)) in record.labels.iter().enumerate() {
+                if i > 0 {
+                    ui.label(";");
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        ui.label(RichText::new(format!("Label: {labels}")).strong());
+                sink.link(ui, name, name);
+                if !catno.is_empty() {
+                    ui.label("(");
+                    sink.link(ui, catno, catno);
+                    ui.label(")");
+                }
+            }
+        });
     }
     if let Some(date) = released_display(
         record.released_on.as_deref(),
         record.released_precision.as_deref(),
     ) {
-        ui.label(RichText::new(format!("Released: {date}")).strong());
+        detail_row(ui, "Released:", |ui| {
+            // the search knows the year, not the day
+            sink.link(ui, &date, &date[..4.min(date.len())]);
+        });
     }
-    let format = record.format_display();
-    if !format.is_empty() {
-        ui.label(RichText::new(format!("Format: {format}")).strong());
+    if !record.formats.is_empty() {
+        detail_row(ui, "Format:", |ui| {
+            for (i, format) in record.formats.iter().enumerate() {
+                if i > 0 {
+                    ui.label("|");
+                }
+                if format.qty > 1 {
+                    ui.label(format!("{} x", format.qty));
+                }
+                for (j, part) in format.parts().iter().enumerate() {
+                    if j > 0 {
+                        ui.label(",");
+                    }
+                    sink.link(ui, part, part);
+                }
+            }
+        });
     }
     ui.label(RichText::new(format!("Copies: {}", record.copies)).strong());
     if let Some(notes) = &record.my_notes {
@@ -681,13 +748,27 @@ fn render_stored(ui: &mut egui::Ui, record: &StoredRelease) {
     }
     ui.add_space(6.0);
     if let Some(country) = &record.country {
-        ui.label(RichText::new(format!("Country: {country}")).small());
+        detail_row(ui, "Country:", |ui| sink.link(ui, country, country));
     }
     if !record.genres.is_empty() {
-        ui.label(RichText::new(format!("Genres: {}", record.genres.join(", "))).small());
+        detail_row(ui, "Genres:", |ui| {
+            for (i, genre) in record.genres.iter().enumerate() {
+                if i > 0 {
+                    ui.label(",");
+                }
+                sink.link(ui, genre, genre);
+            }
+        });
     }
     if !record.styles.is_empty() {
-        ui.label(RichText::new(format!("Styles: {}", record.styles.join(", "))).small());
+        detail_row(ui, "Styles:", |ui| {
+            for (i, style) in record.styles.iter().enumerate() {
+                if i > 0 {
+                    ui.label(",");
+                }
+                sink.link(ui, style, style);
+            }
+        });
     }
     if let Some(notes) = &record.notes {
         ui.label(RichText::new(format!("Notes: {notes}")).small());
@@ -714,13 +795,18 @@ fn render_stored(ui: &mut egui::Ui, record: &StoredRelease) {
         ui.add_space(6.0);
         ui.label(RichText::new("Credits:").strong());
         for (role, name, tracks) in &record.credits {
-            let on = tracks
-                .as_deref()
-                .map(|t| format!(" ({t})"))
-                .unwrap_or_default();
-            ui.label(RichText::new(format!("  {role}: {name}{on}")).small());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(format!("  {role}:"));
+                sink.link(ui, name, name);
+                if let Some(tracks) = tracks {
+                    ui.label(format!("({tracks})"));
+                }
+            });
         }
     }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Click a value to search the collection for it.").small());
 }
 
 #[cfg(test)]
@@ -1628,5 +1714,162 @@ mod tests {
             Some(1),
             "the list stays where it is behind the dialog"
         );
+    }
+
+    // --- clickable values ------------------------------------------------------------
+
+    /// A frame in which the mouse clicks at `pos`.
+    fn click_at(app: &mut RecordShelfApp, pos: egui::Pos2) {
+        let raw = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let ctx = app.repaint.clone();
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_collection(ui));
+        });
+    }
+
+    fn app_showing_details() -> RecordShelfApp {
+        let mut app = loaded_app();
+        app.collection.details = Some(stored(1));
+        frame(&mut app, &[]);
+        frame(&mut app, &[]); // links get their final places
+        app
+    }
+
+    fn link_pos(app: &RecordShelfApp, search: &str) -> egui::Pos2 {
+        app.collection
+            .test_links
+            .iter()
+            .find(|(s, _)| s == search)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no link for {search:?} in {:?}",
+                    app.collection
+                        .test_links
+                        .iter()
+                        .map(|l| &l.0)
+                        .collect::<Vec<_>>()
+                )
+            })
+            .1
+            .center()
+    }
+
+    #[test]
+    fn the_values_of_a_record_are_links() {
+        let app = app_showing_details();
+        let searches: Vec<&str> = app
+            .collection
+            .test_links
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect();
+        for expected in [
+            "Altone",
+            "Björk",
+            "Label",
+            "CAT 1",
+            "2017",
+            "12\"",
+            "33 RPM",
+            "EP",
+            "DE",
+            "Electronic",
+            "Techno",
+            "Pete",
+        ] {
+            assert!(
+                searches.contains(&expected),
+                "{expected:?} should be a link, links: {searches:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_an_artist_searches_for_them() {
+        let mut app = app_showing_details();
+        let pos = link_pos(&app, "Altone");
+        click_at(&mut app, pos);
+        assert_eq!(app.collection.search, "Altone");
+        assert_eq!(
+            app.collection.filtered.len(),
+            1,
+            "only the record with Altone: {:?}",
+            app.collection.search
+        );
+        assert_eq!(app.collection.selected_id, Some(1));
+    }
+
+    #[test]
+    fn clicking_a_value_with_spaces_searches_for_the_phrase() {
+        let mut app = app_showing_details();
+        app.collection.details = Some({
+            let mut record = stored(1);
+            record.styles = vec!["Dub Techno".into()];
+            record
+        });
+        frame(&mut app, &[]);
+        frame(&mut app, &[]);
+        let pos = link_pos(&app, "Dub Techno");
+        click_at(&mut app, pos);
+        assert_eq!(app.collection.search, "\"Dub Techno\"");
+    }
+
+    #[test]
+    fn clicking_the_year_searches_the_year_not_the_date() {
+        let mut app = app_showing_details();
+        let pos = link_pos(&app, "2017");
+        click_at(&mut app, pos);
+        assert_eq!(app.collection.search, "2017");
+    }
+
+    #[test]
+    fn clicking_a_format_value_with_a_quote_in_it_works() {
+        let mut app = app_showing_details();
+        let pos = link_pos(&app, "12\"");
+        click_at(&mut app, pos);
+        assert_eq!(app.collection.search, "\"12\\\"\"");
+        assert_eq!(
+            crate::collection::search_terms(&app.collection.search),
+            vec!["12\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_click_leaves_the_scan_view_and_does_not_steal_the_focus() {
+        let mut app = app_showing_details();
+        app.collection.show_only(1);
+        frame(&mut app, &[]);
+        frame(&mut app, &[]);
+        let pos = link_pos(&app, "Altone");
+        click_at(&mut app, pos);
+        assert_eq!(app.collection.only, None);
+        assert!(
+            !app.collection.focus_search,
+            "the keyboard shortcuts keep working"
+        );
+    }
+
+    #[test]
+    fn nothing_is_searched_without_a_click() {
+        let app = app_showing_details();
+        assert_eq!(app.collection.search, "");
+        assert_eq!(app.collection.filtered.len(), 3);
     }
 }

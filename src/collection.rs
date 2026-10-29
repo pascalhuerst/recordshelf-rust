@@ -52,6 +52,9 @@ pub struct Collection {
     /// Waiting for a yes/no: delete this record (id, title) from the library.
     pub confirm_delete: Option<(u32, String)>,
     pub editor: Option<NotesEditor>,
+    /// Where the clickable values of the details were drawn (tests click on them).
+    #[cfg(test)]
+    pub test_links: Vec<(String, eframe::egui::Rect)>,
 }
 
 impl Default for Collection {
@@ -76,6 +79,8 @@ impl Default for Collection {
             reload_pending: false,
             confirm_delete: None,
             editor: None,
+            #[cfg(test)]
+            test_links: Vec::new(),
         }
     }
 }
@@ -86,11 +91,52 @@ pub fn matches(haystack: &str, terms: &[String]) -> bool {
     terms.iter().all(|t| haystack.contains(t.as_str()))
 }
 
+/// The words of a search. Several words all have to occur; a phrase in
+/// double quotes has to occur as it is (`"dub techno"`); `\"` is a quote
+/// character inside.
 pub fn search_terms(search: &str) -> Vec<String> {
-    fold(search)
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
+    let mut terms: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = search.chars().peekable();
+    let mut flush = |current: &mut String| {
+        let folded = fold(current)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !folded.is_empty() {
+            terms.push(folded);
+        }
+        current.clear();
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => {
+                // a quote ends the word before it, or ends the phrase
+                flush(&mut current);
+                in_quotes = !in_quotes;
+            }
+            c if c.is_whitespace() && !in_quotes => flush(&mut current),
+            c => current.push(c),
+        }
+    }
+    flush(&mut current);
+    terms
+}
+
+/// The text for the search field that finds exactly this value: quoted when it
+/// has spaces or quotes in it.
+pub fn quote_for_search(value: &str) -> String {
+    let value = value.trim();
+    if value.chars().any(|c| c.is_whitespace() || c == '"') {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
 }
 
 impl Collection {
@@ -183,6 +229,14 @@ impl Collection {
         } else {
             false
         }
+    }
+
+    /// Searches for a value that was clicked in the details (an artist, a label,
+    /// a genre...). Leaves the scan view if it was on.
+    pub fn search_for(&mut self, value: &str) {
+        self.only = None;
+        self.search = quote_for_search(value);
+        self.refilter();
     }
 
     /// Shows only this record (a scanned sticker).
@@ -453,5 +507,95 @@ mod tests {
             focus: true,
         });
         assert!(c.dialog_open());
+    }
+
+    #[test]
+    fn phrases_in_quotes_must_match_as_a_whole() {
+        assert_eq!(search_terms("dub techno"), ["dub", "techno"]);
+        assert_eq!(search_terms("\"dub techno\""), ["dub techno"]);
+        assert_eq!(
+            search_terms("altone \"dub techno\" 2024"),
+            ["altone", "dub techno", "2024"]
+        );
+        assert_eq!(
+            search_terms("\"  Dub   Techno \""),
+            ["dub techno"],
+            "spaces are tidied"
+        );
+        assert_eq!(
+            search_terms("\"Björk Guðmundsdóttir\""),
+            ["bjork gudmundsdottir"]
+        );
+        assert_eq!(
+            search_terms("\"unfinished phrase"),
+            ["unfinished phrase"],
+            "an open quote runs to the end"
+        );
+        assert_eq!(search_terms("abc\"def ghi\"jkl"), ["abc", "def ghi", "jkl"]);
+        assert_eq!(
+            search_terms("12\\\""),
+            ["12\""],
+            "an escaped quote is a character"
+        );
+        assert_eq!(search_terms("\"\" \"\""), Vec::<String>::new());
+        assert!(search_terms("").is_empty());
+        assert!(search_terms("   ").is_empty());
+    }
+
+    #[test]
+    fn values_are_quoted_for_the_search_field() {
+        assert_eq!(quote_for_search("Altone"), "Altone");
+        assert_eq!(quote_for_search("Dub Techno"), "\"Dub Techno\"");
+        assert_eq!(quote_for_search("  Dub Techno "), "\"Dub Techno\"");
+        assert_eq!(quote_for_search("12\""), "\"12\\\"\"");
+        assert_eq!(quote_for_search("33 RPM"), "\"33 RPM\"");
+        // what is put into the field finds the value again
+        for value in [
+            "Altone",
+            "Dub Techno",
+            "12\"",
+            "D'Angelo",
+            "Guns N' Roses",
+            "A \"quoted\" name",
+        ] {
+            assert_eq!(
+                search_terms(&quote_for_search(value)),
+                vec![fold(value)],
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clicked_phrase_finds_whole_phrases_only() {
+        let mut c = sample();
+        c.search_for("dub techno");
+        assert_eq!(ids(&c), [1, 4]);
+        c.search_for("techno dub");
+        assert!(
+            ids(&c).is_empty(),
+            "the words in another order are another phrase"
+        );
+        c.search_for("Altone");
+        assert_eq!(ids(&c), [1, 4]);
+        assert_eq!(c.search, "Altone");
+    }
+
+    #[test]
+    fn clicking_a_value_leaves_the_scan_view() {
+        let mut c = sample();
+        c.show_only(3);
+        c.search_for("Altone");
+        assert_eq!(c.only, None);
+        assert_eq!(ids(&c), [1, 4]);
+        assert_eq!(
+            c.selected_id,
+            Some(1),
+            "the scanned record is not in the result, the first is selected"
+        );
+        // the selection stays when it is still listed
+        c.selected_id = Some(4);
+        c.search_for("dub techno");
+        assert_eq!(c.selected_id, Some(4));
     }
 }
