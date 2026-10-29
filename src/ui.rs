@@ -387,8 +387,9 @@ impl RecordShelfApp {
 
     /// Persists the edited settings and applies them without a restart.
     fn save_settings(&mut self) {
-        let mut draft = self.settings_draft.clone();
-        // Zoom changes live (Ctrl +/-); do not let a stale copy in the draft undo it.
+        let mut draft = self.settings_draft.clone().normalized();
+        // Zoom (Ctrl +/-) and the target folder (F) change live and are saved
+        // as they change; the dialog does not edit them.
         draft.zoom_factor = self.settings.zoom_factor;
         draft.folder_id = self.settings.folder_id;
         if let Some(path) = &self.config_path
@@ -397,88 +398,283 @@ impl RecordShelfApp {
             self.set_error(format!("{err:#}"));
             return;
         }
-        self.settings = draft;
-        self.scanner_stop.store(true, Ordering::SeqCst);
-        let (stop, rx, status) = start_scanner(&self.settings, &self.repaint);
-        self.scanner_stop = stop;
-        self.scanner_rx = rx;
-        self.scanner_status = status;
-        self.folders.clear();
-        self.folder_selected = None;
-        self.ownership.clear();
-        self.images.clear();
-        self.releases.clear();
-        self.requested.clear();
-        self.failed.clear();
-        self.notice = None;
-        self.configure_worker();
+        let old = std::mem::replace(&mut self.settings, draft);
+        let new = &self.settings;
+
+        let scanner_changed =
+            (&old.device_name, &old.device_path) != (&new.device_name, &new.device_path);
+        let discogs_changed = (&old.token, &old.username, &old.currency, &old.user_agent)
+            != (&new.token, &new.username, &new.currency, &new.user_agent);
+
+        if scanner_changed {
+            self.scanner_stop.store(true, Ordering::SeqCst);
+            let (stop, rx, status) = start_scanner(&self.settings, &self.repaint);
+            self.scanner_stop = stop;
+            self.scanner_rx = rx;
+            self.scanner_status = status;
+        }
+        if discogs_changed {
+            // other credentials may mean another account: forget what we fetched
+            self.folders.clear();
+            self.folder_selected = None;
+            self.ownership.clear();
+            self.images.clear();
+            self.releases.clear();
+            self.requested.clear();
+            self.failed.clear();
+            self.notice = None;
+            self.configure_worker();
+        }
         if self.config_path.is_none() {
             self.set_info("Settings applied (no config path, not saved)".to_string());
+        } else {
+            self.set_info("Settings saved".to_string());
         }
     }
 
     fn show_settings(&mut self, ctx: &egui::Context) {
         let mut open = true;
         let (mut save, mut cancel) = (false, false);
+        let mut change_folder = false;
+        let devices = self.devices.clone();
+        let mut refresh_devices = false;
+        let folder_name = self.current_folder().map(|f| f.name.clone());
+        let config_path = self.config_path.clone();
+        let max_height = (ctx.screen_rect().height() * 0.8).max(200.0);
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
+            .default_width(520.0)
             .show(ctx, |ui| {
-                let draft = &mut self.settings_draft;
-                egui::Grid::new("settings-grid")
-                    .num_columns(2)
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
                     .show(ui, |ui| {
-                        ui.label("Discogs token:");
-                        ui.add(egui::TextEdit::singleline(&mut draft.token).password(true));
-                        ui.end_row();
-                        ui.label("Discogs username:");
-                        ui.text_edit_singleline(&mut draft.username);
-                        ui.end_row();
-                        ui.label("Currency:");
-                        ui.text_edit_singleline(&mut draft.currency);
-                        ui.end_row();
-                        ui.label("User agent:");
-                        ui.text_edit_singleline(&mut draft.user_agent);
-                        ui.end_row();
-                        ui.label("Scanner name:");
-                        ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut draft.device_name);
-                            egui::ComboBox::from_id_source("scanner-device")
-                                .selected_text("Pick...")
-                                .show_ui(ui, |ui| {
-                                    for dev in &self.devices {
-                                        let label =
-                                            format!("{} ({})", dev.name, dev.path.display());
-                                        if ui.selectable_label(false, label).clicked() {
-                                            draft.device_name = dev.name.clone();
-                                        }
+                        let draft = &mut self.settings_draft;
+
+                        ui.heading("Discogs");
+                        egui::Grid::new("settings-discogs")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Token:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.token)
+                                        .password(true)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+                                ui.label("Username:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.username)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+                                ui.label("Currency:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.currency)
+                                        .desired_width(80.0),
+                                );
+                                ui.end_row();
+                                ui.label("User agent:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.user_agent)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+                                ui.label("Add to folder:");
+                                ui.horizontal(|ui| {
+                                    ui.label(folder_name.as_deref().unwrap_or("(not loaded yet)"));
+                                    if ui.button("Change...").clicked() {
+                                        change_folder = true;
                                     }
                                 });
-                            if ui.button("Refresh").clicked() {
-                                self.devices = barcode_reader::list_devices();
+                                ui.end_row();
+                            });
+
+                        ui.add_space(8.0);
+                        ui.heading("Barcode scanner");
+                        egui::Grid::new("settings-scanner")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Name:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.device_name)
+                                            .desired_width(240.0),
+                                    );
+                                    egui::ComboBox::from_id_source("scanner-device")
+                                        .selected_text("Pick...")
+                                        .show_ui(ui, |ui| {
+                                            for dev in &devices {
+                                                let label = format!("{} ({})", dev.name, dev.path.display());
+                                                if ui.selectable_label(false, label).clicked() {
+                                                    draft.device_name = dev.name.clone();
+                                                }
+                                            }
+                                        });
+                                    if ui.button("Refresh").clicked() {
+                                        refresh_devices = true;
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label("Fallback path:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.device_path)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+                            });
+                        ui.label(
+                            RichText::new(
+                                "The scanner is found by name (substring match), so it keeps working \
+                                 when /dev/input numbering changes. The path is only a fallback.",
+                            )
+                            .small(),
+                        );
+
+                        ui.add_space(8.0);
+                        ui.heading("Display");
+                        ui.horizontal(|ui| {
+                            ui.label("Zoom:");
+                            // applied at once, like Ctrl +/-; saved as it changes
+                            let mut zoom = ctx.zoom_factor();
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut zoom)
+                                        .clamp_range(0.5..=4.0)
+                                        .speed(0.01)
+                                        .fixed_decimals(2)
+                                        .suffix("x"),
+                                )
+                                .changed()
+                            {
+                                ctx.set_zoom_factor(zoom);
                             }
+                            ui.label(RichText::new("(also Ctrl +/-, Ctrl 0)").small());
                         });
-                        ui.end_row();
-                        ui.label("Fallback device path:");
-                        ui.text_edit_singleline(&mut draft.device_path);
-                        ui.end_row();
+
+                        ui.add_space(8.0);
+                        ui.heading("Label printer");
+                        egui::Grid::new("settings-printer")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Host:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.printer_host)
+                                            .desired_width(200.0)
+                                            .hint_text("e.g. 192.168.4.55"),
+                                    );
+                                    ui.label("Port:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.printer_port)
+                                            .clamp_range(1..=65535),
+                                    );
+                                });
+                                ui.end_row();
+                                ui.label("Label size:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.label_width_mm)
+                                            .clamp_range(20.0..=56.0)
+                                            .speed(0.1)
+                                            .fixed_decimals(1)
+                                            .suffix(" mm"),
+                                    );
+                                    ui.label("x");
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.label_height_mm)
+                                            .clamp_range(20.0..=150.0)
+                                            .speed(0.1)
+                                            .fixed_decimals(1)
+                                            .suffix(" mm"),
+                                    );
+                                    ui.label(RichText::new("(52 x 39 real, 51 x 38 test labels)").small());
+                                });
+                                ui.end_row();
+                                ui.label("Top offset:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.label_top_mm)
+                                            .clamp_range(0.0..=10.0)
+                                            .speed(0.05)
+                                            .fixed_decimals(2)
+                                            .suffix(" mm"),
+                                    );
+                                    ui.label(RichText::new("(label edge below the print origin)").small());
+                                });
+                                ui.end_row();
+                                ui.label("Code:");
+                                egui::ComboBox::from_id_source("label-code")
+                                    .selected_text(if draft.label_code == "qr" {
+                                        "QR code"
+                                    } else {
+                                        "Barcode (Code 128)"
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut draft.label_code,
+                                            "barcode".to_string(),
+                                            "Barcode (Code 128)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut draft.label_code,
+                                            "qr".to_string(),
+                                            "QR code",
+                                        );
+                                    });
+                                ui.end_row();
+                                ui.label("Darkness:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.printer_darkness)
+                                            .clamp_range(-30..=30)
+                                            .prefix("+"),
+                                    );
+                                    ui.label(
+                                        RichText::new("(added to the printer's own setting, per label)").small(),
+                                    );
+                                });
+                                ui.end_row();
+                                ui.label("Speed:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.printer_speed_ips)
+                                            .clamp_range(0..=6)
+                                            .suffix(" ips"),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "(0 = the printer's own; slower prints darker. The printer keeps the last speed.)",
+                                        )
+                                        .small(),
+                                    );
+                                });
+                                ui.end_row();
+                            });
+                        ui.label(
+                            RichText::new("Printing is switched off while the host is empty.").small(),
+                        );
+
+                        ui.add_space(6.0);
+                        if let Some(path) = &config_path {
+                            ui.label(RichText::new(format!("Saved to {}", path.display())).small());
+                        }
                     });
-                ui.label(
-                    RichText::new(
-                        "The scanner is found by name (substring match), so it keeps working \
-                         when /dev/input numbering changes. The path is only a fallback.",
-                    )
-                    .small(),
-                );
-                if let Some(path) = &self.config_path {
-                    ui.label(RichText::new(format!("Saved to {}", path.display())).small());
-                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     save = ui.button("Save").clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
+        if refresh_devices {
+            self.devices = barcode_reader::list_devices();
+        }
+        if change_folder {
+            self.open_folder_picker();
+        }
         if save {
             self.save_settings();
         }
@@ -2432,5 +2628,100 @@ mod tests {
             result: Ok(()),
         });
         assert!(app.notice.as_ref().is_some_and(|n| !n.is_error));
+    }
+
+    fn settings_dialog_app(dir: &std::path::Path) -> RecordShelfApp {
+        let mut app = app_with_results(0);
+        app.config_path = Some(dir.join("config.toml"));
+        app.settings = Settings {
+            token: "tok".into(),
+            ..Settings::default()
+        };
+        app.open_settings();
+        app
+    }
+
+    #[test]
+    fn saving_the_dialog_stores_every_edited_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        {
+            let d = &mut app.settings_draft;
+            d.printer_host = "  192.168.4.55 ".into();
+            d.printer_port = 9101;
+            d.label_width_mm = 52.0;
+            d.label_height_mm = 39.0;
+            d.label_top_mm = 2.0;
+            d.label_code = "qr".into();
+            d.printer_darkness = 12;
+            d.printer_speed_ips = 4;
+        }
+        app.save_settings();
+        let saved = Settings::load(&dir.path().join("config.toml")).unwrap();
+        assert_eq!(saved.printer_host, "192.168.4.55");
+        assert_eq!(saved.printer_port, 9101);
+        assert_eq!((saved.label_width_mm, saved.label_height_mm), (52.0, 39.0));
+        assert_eq!(saved.label_top_mm, 2.0);
+        assert_eq!(saved.label_code, "qr");
+        assert_eq!((saved.printer_darkness, saved.printer_speed_ips), (12, 4));
+        assert_eq!(app.settings, saved, "the running app uses what was saved");
+    }
+
+    #[test]
+    fn out_of_range_values_are_corrected_before_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings_draft.printer_darkness = 99;
+        app.settings_draft.label_width_mm = 200.0;
+        app.save_settings();
+        assert_eq!(app.settings.printer_darkness, 30);
+        assert_eq!(app.settings.label_width_mm, 56.0);
+    }
+
+    #[test]
+    fn zoom_and_folder_are_not_overwritten_by_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings.zoom_factor = 1.5;
+        app.settings.folder_id = 7;
+        app.settings_draft.zoom_factor = 1.0; // stale copy from when the dialog opened
+        app.settings_draft.folder_id = 0;
+        app.save_settings();
+        assert_eq!((app.settings.zoom_factor, app.settings.folder_id), (1.5, 7));
+    }
+
+    #[test]
+    fn printer_changes_keep_what_was_fetched_but_account_changes_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.releases.insert(1, Release::default());
+        app.ownership.insert(1, Vec::new());
+
+        app.settings_draft.printer_host = "192.168.4.55".into();
+        app.save_settings();
+        assert!(app.releases.contains_key(&1) && app.ownership.contains_key(&1));
+
+        app.open_settings();
+        app.settings_draft.username = "someone-else".into();
+        app.save_settings();
+        assert!(app.releases.is_empty() && app.ownership.is_empty());
+    }
+
+    #[test]
+    fn a_new_printer_setting_is_used_by_the_next_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings_draft.printer_host = "127.0.0.1".into();
+        app.save_settings();
+        app.search_results = vec![SearchItem {
+            id: Some(1),
+            ..Default::default()
+        }];
+        app.selected_result = Some(0);
+        app.releases.insert(1, Release::default());
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        let before = app.worker.pending();
+        app.run_command(Command::Print);
+        assert_eq!(app.worker.pending(), before + 1);
     }
 }

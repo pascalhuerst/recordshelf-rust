@@ -65,6 +65,14 @@ impl Default for Settings {
     }
 }
 
+fn clamp_mm(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
 /// Zoom limits, kept sane in case the file is edited by hand.
 pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=4.0;
 
@@ -122,6 +130,37 @@ impl Settings {
                 .context("restrict settings file permissions")?;
         }
         Ok(())
+    }
+
+    /// The same settings with every value brought into its valid range and
+    /// trimmed, as typed into the settings dialog or edited by hand.
+    pub fn normalized(mut self) -> Self {
+        for text in [
+            &mut self.token,
+            &mut self.username,
+            &mut self.user_agent,
+            &mut self.currency,
+            &mut self.device_name,
+            &mut self.device_path,
+            &mut self.printer_host,
+        ] {
+            *text = text.trim().to_string();
+        }
+        self.zoom_factor = self.zoom();
+        if self.printer_port == 0 {
+            self.printer_port = crate::printer::DEFAULT_PORT;
+        }
+        self.printer_darkness = self.printer_darkness.clamp(-30, 30);
+        self.printer_speed_ips = self.printer_speed_ips.min(6);
+        // the print area is 56 mm wide; labels smaller than 20 mm make no sense
+        self.label_width_mm = clamp_mm(self.label_width_mm, 20.0, 56.0, 51.0);
+        self.label_height_mm = clamp_mm(self.label_height_mm, 20.0, 150.0, 38.0);
+        self.label_top_mm = clamp_mm(self.label_top_mm, 0.0, 10.0, 1.5);
+        self.label_code = match self.label_code.trim().to_lowercase().as_str() {
+            "qr" => "qr".to_string(),
+            _ => "barcode".to_string(),
+        };
+        self
     }
 
     /// Whether enough is configured to talk to Discogs.
@@ -277,5 +316,62 @@ mod printer_tests {
         };
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), s);
+    }
+
+    #[test]
+    fn normalized_trims_and_clamps() {
+        let s = Settings {
+            token: "  abc \n".into(),
+            printer_host: " 192.168.4.55 ".into(),
+            printer_port: 0,
+            printer_darkness: 90,
+            printer_speed_ips: 42,
+            label_width_mm: 80.0,
+            label_height_mm: 5.0,
+            label_top_mm: -3.0,
+            label_code: " QR ".into(),
+            zoom_factor: 10.0,
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(s.token, "abc");
+        assert_eq!(s.printer_host, "192.168.4.55");
+        assert_eq!(s.printer_port, 9100);
+        assert_eq!(s.printer_darkness, 30);
+        assert_eq!(s.printer_speed_ips, 6);
+        assert_eq!(
+            (s.label_width_mm, s.label_height_mm, s.label_top_mm),
+            (56.0, 20.0, 0.0)
+        );
+        assert_eq!(s.label_code, "qr");
+        assert_eq!(s.zoom_factor, 4.0);
+    }
+
+    #[test]
+    fn normalized_replaces_nonsense_and_keeps_good_values() {
+        let s = Settings {
+            label_width_mm: f32::NAN,
+            label_height_mm: f32::INFINITY,
+            label_code: "hologram".into(),
+            printer_darkness: -30,
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(s.label_width_mm, 51.0);
+        assert_eq!(s.label_height_mm, 38.0);
+        assert_eq!(s.label_code, "barcode");
+        assert_eq!(s.printer_darkness, -30);
+        let good = Settings::default();
+        assert_eq!(
+            good.clone().normalized(),
+            good,
+            "valid settings stay as they are"
+        );
+        let tuned = Settings {
+            label_width_mm: 52.0,
+            label_height_mm: 39.0,
+            ..Settings::default()
+        };
+        assert_eq!(tuned.clone().normalized(), tuned);
     }
 }
