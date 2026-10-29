@@ -94,6 +94,8 @@ pub struct RecordShelfApp {
     releases: HashMap<u32, Release>,
     /// Releases already requested (so each is fetched once per session).
     requested: HashSet<u32>,
+    /// Releases whose request failed; Enter retries these.
+    failed: HashSet<u32>,
     last_selected: Option<u32>,
     selection_changed: Instant,
     settings_open: bool,
@@ -139,6 +141,7 @@ impl RecordShelfApp {
             selected_result: None,
             releases: HashMap::new(),
             requested: HashSet::new(),
+            failed: HashSet::new(),
             last_selected: None,
             selection_changed: Instant::now(),
             settings_open: false,
@@ -358,6 +361,7 @@ impl RecordShelfApp {
         self.images.clear();
         self.releases.clear();
         self.requested.clear();
+        self.failed.clear();
         self.notice = None;
         self.configure_worker();
         if self.config_path.is_none() {
@@ -508,9 +512,13 @@ impl RecordShelfApp {
             Response::Search(Err(err)) => self.set_error(err),
             Response::Release { id, result } => match result {
                 Ok(release) => {
+                    self.failed.remove(&id);
                     self.releases.insert(id, release);
                 }
-                Err(err) => self.set_error(err),
+                Err(err) => {
+                    self.failed.insert(id);
+                    self.set_error(format!("{err} (press Enter to retry)"));
+                }
             },
             Response::Decks {
                 code,
@@ -775,7 +783,7 @@ impl RecordShelfApp {
             down,
         );
         if enter {
-            self.reload_selected_release();
+            self.retry_selected_release();
         }
         if esc {
             self.selected_result = None;
@@ -1054,14 +1062,14 @@ impl RecordShelfApp {
         self.search_barcode.clear();
     }
 
-    /// Forces a fresh fetch of the selected release (also retries a failed one).
-    fn reload_selected_release(&mut self) {
-        match self.selected_id() {
-            Some(id) => {
-                self.requested.remove(&id);
-                self.request_release(id);
-            }
-            None => self.set_error("Select a result first".to_string()),
+    /// Enter on a result whose release failed to load tries again. Releases
+    /// that are loaded or still loading are left alone, nothing is refetched.
+    fn retry_selected_release(&mut self) {
+        if let Some(id) = self.selected_id()
+            && self.failed.remove(&id)
+        {
+            self.requested.remove(&id);
+            self.request_release(id);
         }
     }
 }
@@ -1437,18 +1445,43 @@ mod tests {
     }
 
     #[test]
-    fn reload_refetches_a_release() {
+    fn enter_does_not_refetch_a_loaded_release() {
+        let mut app = app_with_results(2);
+        app.selected_result = Some(0);
+        app.prefetch_results();
+        app.releases.insert(1, Release::default());
+        let before = app.worker.pending();
+        app.retry_selected_release();
+        assert_eq!(app.worker.pending(), before);
+    }
+
+    #[test]
+    fn enter_does_not_duplicate_a_request_in_flight() {
+        let mut app = app_with_results(2);
+        app.selected_result = Some(0);
+        app.prefetch_results();
+        let before = app.worker.pending();
+        app.retry_selected_release();
+        assert_eq!(app.worker.pending(), before);
+    }
+
+    #[test]
+    fn enter_retries_a_failed_release() {
         let mut app = app_with_results(2);
         app.selected_result = Some(0);
         app.prefetch_results();
         app.ownership.insert(1, Vec::new());
+        app.handle_response(Response::Release {
+            id: 1,
+            result: Err("boom".into()),
+        });
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
         let before = app.worker.pending();
-        app.reload_selected_release();
-        assert_eq!(
-            app.worker.pending(),
-            before + 1,
-            "only the release, ownership is known"
-        );
+        app.retry_selected_release();
+        assert_eq!(app.worker.pending(), before + 1);
+        // a second Enter while the retry is running does nothing
+        app.retry_selected_release();
+        assert_eq!(app.worker.pending(), before + 1);
     }
 
     #[test]
