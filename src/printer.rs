@@ -263,15 +263,61 @@ pub fn calibration_zpl(width: u32, length: u32) -> String {
     zpl
 }
 
+/// Test helpers shared with other modules: a fake printer that answers `~HS`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
-    use image::Luma;
     use std::net::TcpListener;
     use std::thread;
 
     // as answered by the real ZD411
-    const STATUS_OK: &str = "\u{2}030,0,0,0310,000,0,0,0,000,0,0,0\u{3}\r\n\u{2}001,0,0,0,1,2,3,0,00000000,1,000\u{3}\r\n\u{2}0000,0\u{3}\r\n";
+    pub const STATUS_OK: &str = "\u{2}030,0,0,0310,000,0,0,0,000,0,0,0\u{3}\r\n\u{2}001,0,0,0,1,2,3,0,00000000,1,000\u{3}\r\n\u{2}0000,0\u{3}\r\n";
+
+    /// A fake printer: answers `~HS`, records anything else.
+    pub fn fake_printer(status: &'static str) -> (Printer, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut received = Vec::new();
+            // connections: status query (and print job if the status was fine)
+            listener.set_nonblocking(false).unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(600)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if data.starts_with(b"~HS") {
+                                stream.write_all(status.as_bytes()).unwrap();
+                                break;
+                            }
+                        }
+                    }
+                }
+                received.push(String::from_utf8_lossy(&data).to_string());
+            }
+            received
+        });
+        (Printer::new("127.0.0.1", port), handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use image::Luma;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn parses_the_real_status_answer() {
@@ -423,43 +469,6 @@ mod tests {
         assert!(zpl.contains("^FD5^FS") && zpl.contains("^FD50^FS"));
         assert!(zpl.contains("448x310 dots"));
         assert!(zpl.starts_with("^XA") && zpl.trim_end().ends_with("^XZ"));
-    }
-
-    /// A fake printer: answers `~HS`, records anything else.
-    fn fake_printer(status: &'static str) -> (Printer, thread::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            let mut received = Vec::new();
-            // connections: status query (and print job if the status was fine)
-            listener.set_nonblocking(false).unwrap();
-            for _ in 0..2 {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(c) => c,
-                    Err(_) => break,
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(600)))
-                    .unwrap();
-                let mut data = Vec::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            data.extend_from_slice(&buf[..n]);
-                            if data.starts_with(b"~HS") {
-                                stream.write_all(status.as_bytes()).unwrap();
-                                break;
-                            }
-                        }
-                    }
-                }
-                received.push(String::from_utf8_lossy(&data).to_string());
-            }
-            received
-        });
-        (Printer::new("127.0.0.1", port), handle)
     }
 
     #[test]

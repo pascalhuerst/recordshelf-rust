@@ -9,7 +9,45 @@ use eframe::egui;
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
+use crate::label::{self, CodeKind, LabelContent, LabelOptions, LabelSize};
+use crate::printer::{self, JobOptions, Printer};
 use crate::shops::{Shop, ShopEntry, search_plan};
+
+/// Everything needed to print one label (taken from the settings when the
+/// key is pressed).
+#[derive(Debug, Clone)]
+pub struct PrintJob {
+    pub content: LabelContent,
+    pub host: String,
+    pub port: u16,
+    pub width_mm: f32,
+    pub height_mm: f32,
+    pub top_mm: f32,
+    pub darkness: i8,
+    /// 0 keeps the printer's own speed.
+    pub speed_ips: u8,
+    pub code: CodeKind,
+}
+
+impl PrintJob {
+    /// Draws the label and sends it to the printer, if the printer is ready.
+    pub fn run(&self) -> Result<()> {
+        let size = LabelSize::from_mm(self.width_mm, self.height_mm);
+        let options = LabelOptions::new(self.code);
+        let img = label::render_with(&self.content, size, &options)?;
+        let job = JobOptions {
+            darkness: Some(self.darkness),
+            speed_ips: (self.speed_ips > 0).then_some(self.speed_ips),
+        };
+        let zpl = printer::bitmap_zpl(
+            &img,
+            printer::centred_x(size.width),
+            (self.top_mm * 8.0).round() as u32,
+            &job,
+        );
+        Printer::new(&self.host, self.port).print(&zpl)
+    }
+}
 
 /// Work for the background thread. Every request except `Configure` produces
 /// exactly one `Response`, in request order.
@@ -38,6 +76,8 @@ pub enum Request {
         release_id: u32,
         folder_id: u32,
     },
+    /// Draw a label and send it to the printer.
+    PrintLabel(Box<PrintJob>),
     /// Moves copies to another folder: `(current folder, instance id)` pairs.
     MoveCopies {
         release_id: u32,
@@ -83,6 +123,10 @@ pub enum Response {
         result: Result<(), String>,
     },
     Removed {
+        release_id: u32,
+        result: Result<(), String>,
+    },
+    Printed {
         release_id: u32,
         result: Result<(), String>,
     },
@@ -251,6 +295,10 @@ impl State {
                     result,
                 }
             }
+            Request::PrintLabel(job) => Response::Printed {
+                release_id: job.content.release_id,
+                result: job.run().map_err(|e| format!("{e:#}")),
+            },
             Request::MoveCopies {
                 release_id,
                 copies,
@@ -467,5 +515,70 @@ mod tests {
                 .any(|r| matches!(r, Response::Image { result: Err(_), .. }))
         );
         assert_eq!(worker.pending(), 0);
+    }
+
+    fn job(host: &str, port: u16) -> PrintJob {
+        PrintJob {
+            content: label::sample_content(),
+            host: host.to_string(),
+            port,
+            width_mm: 51.0,
+            height_mm: 38.0,
+            top_mm: 1.5,
+            darkness: 9,
+            speed_ips: 3,
+            code: CodeKind::Barcode,
+        }
+    }
+
+    #[test]
+    fn a_print_job_sends_the_label_with_the_configured_settings() {
+        let (printer, server) = printer::testing::fake_printer(printer::testing::STATUS_OK);
+        job(&printer.host, printer.port).run().unwrap();
+        let received = server.join().unwrap();
+        assert_eq!(received[0], "~HS");
+        let zpl = &received[1];
+        assert!(zpl.starts_with("^XA"), "{}", &zpl[..40.min(zpl.len())]);
+        // centred (51 mm in 56 mm) and 1.5 mm from the top
+        assert!(
+            zpl.contains("^MD9\n^PR3\n^FO20,12^GFA,"),
+            "{}",
+            &zpl[..80.min(zpl.len())]
+        );
+        assert!(zpl.contains(&format!("^GFA,{0},{0},51,", 51 * 304)));
+    }
+
+    #[test]
+    fn a_zero_speed_leaves_the_printer_speed_alone() {
+        let (printer, server) = printer::testing::fake_printer(printer::testing::STATUS_OK);
+        PrintJob {
+            speed_ips: 0,
+            ..job(&printer.host, printer.port)
+        }
+        .run()
+        .unwrap();
+        let zpl = server.join().unwrap().remove(1);
+        assert!(zpl.contains("^MD9\n^FO"));
+        assert!(!zpl.contains("^PR"));
+    }
+
+    #[test]
+    fn a_print_request_answers_with_the_outcome() {
+        let mut state = State {
+            client: None,
+            username: String::new(),
+        };
+        // nothing listens on this port
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        match state.handle(Request::PrintLabel(Box::new(job("127.0.0.1", port)))) {
+            Some(Response::Printed {
+                release_id: 32474433,
+                result: Err(msg),
+            }) => assert!(msg.contains("connect to printer"), "{msg}"),
+            _ => panic!("expected a failed print"),
+        }
     }
 }

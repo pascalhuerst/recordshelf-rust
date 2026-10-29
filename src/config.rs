@@ -33,8 +33,13 @@ pub struct Settings {
     pub label_top_mm: f32,
     /// Darkness adjustment per label, relative to the printer's own setting
     pub printer_darkness: i8,
-    /// Print speed in inches per second; 0 keeps the printer's own setting
+    /// Print speed in inches per second (slower prints darker); 0 keeps the printer's own setting
     pub printer_speed_ips: u8,
+    /// Size of the label stock in mm (the test labels are 51 x 38, the real ones 52 x 39)
+    pub label_width_mm: f32,
+    pub label_height_mm: f32,
+    /// Code on the label: "barcode" (Code 128) or "qr"
+    pub label_code: String,
 }
 
 impl Default for Settings {
@@ -52,7 +57,10 @@ impl Default for Settings {
             printer_port: crate::printer::DEFAULT_PORT,
             label_top_mm: 1.5,
             printer_darkness: 9,
-            printer_speed_ips: 0,
+            printer_speed_ips: 3,
+            label_width_mm: 51.0,
+            label_height_mm: 38.0,
+            label_code: "barcode".to_string(),
         }
     }
 }
@@ -251,7 +259,9 @@ mod printer_tests {
         let s = Settings::default();
         assert_eq!(s.printer_port, 9100);
         assert_eq!(s.printer_darkness, 9);
-        assert_eq!(s.printer_speed_ips, 0);
+        assert_eq!(s.printer_speed_ips, 3);
+        assert_eq!((s.label_width_mm, s.label_height_mm), (51.0, 38.0));
+        assert_eq!(s.label_code, "barcode");
         assert_eq!(s.label_top_mm, 1.5);
     }
 

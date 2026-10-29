@@ -16,9 +16,10 @@ use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
     format_line,
 };
+use crate::label::{CodeKind, LabelContent};
 use crate::shop_bridge::{self, Bridge, ShopPage};
 use crate::shops::{self, Route, Shop};
-use crate::worker::{Request, Response, Worker};
+use crate::worker::{PrintJob, Request, Response, Worker};
 use eframe::egui::{self, Color32, RichText};
 
 /// Download state of a cover picture, keyed by URL.
@@ -662,6 +663,12 @@ impl RecordShelfApp {
                 }
                 self.resync_collection(release_id);
             }
+            Response::Printed { release_id, result } => match result {
+                Ok(()) => self.set_info(format!(
+                    "Label for release {release_id} sent to the printer"
+                )),
+                Err(err) => self.set_error(format!("Printing failed: {err}")),
+            },
             Response::Removed { release_id, result } => {
                 match result {
                     Ok(()) => {
@@ -1113,6 +1120,7 @@ impl RecordShelfApp {
             Command::Remove => self.remove_release(id),
             Command::Move => self.move_release(id),
             Command::Open => self.open_release(id),
+            Command::Print => self.print_label(id),
             Command::ChooseFolder | Command::Quit => {}
         }
     }
@@ -1198,6 +1206,52 @@ impl RecordShelfApp {
         }
     }
 
+    /// Prints the sticker for a release we own.
+    fn print_label(&mut self, id: u32) {
+        match self.ownership.get(&id) {
+            None => {
+                self.worker.send(Request::CheckOwnership(id));
+                self.set_info("Checking your collection first; press P again".to_string());
+                return;
+            }
+            Some(copies) if copies.is_empty() => {
+                self.set_error(
+                    "Labels are only printed for releases in your collection".to_string(),
+                );
+                return;
+            }
+            Some(_) => {}
+        }
+        if self.settings.printer_host.trim().is_empty() {
+            self.set_error("No printer configured (printer_host in the settings file)".to_string());
+            return;
+        }
+        let Some(release) = self.releases.get(&id) else {
+            self.request_release(id);
+            self.set_info("The release is still loading; press P again".to_string());
+            return;
+        };
+        let content = LabelContent::from_release(id, release);
+        let settings = &self.settings;
+        let job = PrintJob {
+            content,
+            host: settings.printer_host.clone(),
+            port: settings.printer_port,
+            width_mm: settings.label_width_mm,
+            height_mm: settings.label_height_mm,
+            top_mm: settings.label_top_mm,
+            darkness: settings.printer_darkness,
+            speed_ips: settings.printer_speed_ips,
+            code: if settings.label_code == "qr" {
+                CodeKind::Qr
+            } else {
+                CodeKind::Barcode
+            },
+        };
+        self.worker.send(Request::PrintLabel(Box::new(job)));
+        self.set_info("Printing label...".to_string());
+    }
+
     fn open_release(&mut self, id: u32) {
         let uri = self
             .search_results
@@ -1252,14 +1306,23 @@ impl RecordShelfApp {
         let folder = self
             .current_folder()
             .map_or("?".to_string(), |f| f.name.clone());
+        let owned = self
+            .selected_id()
+            .and_then(|id| self.ownership.get(&id))
+            .is_some_and(|copies| !copies.is_empty());
         let mut clicked = None;
         ui.horizontal(|ui| {
             for cmd in Command::ALL {
+                // the label button only appears for records we own
+                if cmd.needs_ownership() && !owned {
+                    continue;
+                }
                 let label = match cmd {
                     Command::Add => format!("Add to {folder}"),
                     Command::Remove => "Remove".to_string(),
                     Command::Move => "Move".to_string(),
                     Command::Open => "Open in browser".to_string(),
+                    Command::Print => "Print label".to_string(),
                     Command::ChooseFolder => "Change folder".to_string(),
                     Command::Quit => "Quit".to_string(),
                 };
@@ -2291,5 +2354,83 @@ mod tests {
             Color32::PLACEHOLDER,
             "release text keeps its colour"
         );
+    }
+
+    fn app_ready_to_print(printer_host: &str) -> RecordShelfApp {
+        let mut app = app_ready_to_add();
+        app.settings.printer_host = printer_host.to_string();
+        app.releases.insert(1, Release::default());
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app
+    }
+
+    #[test]
+    fn p_sends_a_print_job_for_an_owned_release() {
+        let mut app = app_ready_to_print("127.0.0.1");
+        let before = app.worker.pending();
+        app.run_command(Command::Print);
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(app.notice.as_ref().is_some_and(|n| !n.is_error));
+    }
+
+    #[test]
+    fn p_needs_an_owned_release_a_printer_and_loaded_data() {
+        // not owned
+        let mut app = app_ready_to_print("127.0.0.1");
+        app.ownership.insert(1, Vec::new());
+        let before = app.worker.pending();
+        app.run_command(Command::Print);
+        assert_eq!(app.worker.pending(), before);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("collection"))
+        );
+
+        // ownership unknown: check first
+        let mut app = app_ready_to_print("127.0.0.1");
+        app.ownership.clear();
+        let before = app.worker.pending();
+        app.run_command(Command::Print);
+        assert_eq!(app.worker.pending(), before + 1, "only the ownership check");
+
+        // no printer
+        let mut app = app_ready_to_print("  ");
+        let before = app.worker.pending();
+        app.run_command(Command::Print);
+        assert_eq!(app.worker.pending(), before);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("printer"))
+        );
+
+        // release data not loaded yet
+        let mut app = app_ready_to_print("127.0.0.1");
+        app.releases.clear();
+        app.requested.clear();
+        let before = app.worker.pending();
+        app.run_command(Command::Print);
+        assert!(app.requested.contains(&1), "the release is requested");
+        assert!(app.worker.pending() > before);
+    }
+
+    #[test]
+    fn print_results_are_reported() {
+        let mut app = app_ready_to_print("127.0.0.1");
+        app.handle_response(Response::Printed {
+            release_id: 1,
+            result: Err("not printing: the printer is out of labels".into()),
+        });
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("out of labels"))
+        );
+        app.handle_response(Response::Printed {
+            release_id: 1,
+            result: Ok(()),
+        });
+        assert!(app.notice.as_ref().is_some_and(|n| !n.is_error));
     }
 }

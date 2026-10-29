@@ -12,16 +12,18 @@ pub enum Command {
     Remove,
     Move,
     Open,
+    Print,
     ChooseFolder,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 6] = [
+    pub const ALL: [Command; 7] = [
         Command::Add,
         Command::Remove,
         Command::Move,
         Command::Open,
+        Command::Print,
         Command::ChooseFolder,
         Command::Quit,
     ];
@@ -32,6 +34,7 @@ impl Command {
             Command::Remove => Key::R,
             Command::Move => Key::M,
             Command::Open => Key::O,
+            Command::Print => Key::P,
             Command::ChooseFolder => Key::F,
             Command::Quit => Key::Q,
         }
@@ -42,6 +45,12 @@ impl Command {
         !matches!(self, Command::ChooseFolder | Command::Quit)
     }
 
+    /// Whether the command is only offered for releases we own (a label can
+    /// only be printed for a record that is on the shelf).
+    pub fn needs_ownership(self) -> bool {
+        matches!(self, Command::Print)
+    }
+
     /// Key as shown to the user.
     pub fn key_label(self) -> &'static str {
         match self {
@@ -49,6 +58,7 @@ impl Command {
             Command::Remove => "R",
             Command::Move => "M",
             Command::Open => "O",
+            Command::Print => "P",
             Command::ChooseFolder => "F",
             Command::Quit => "Q",
         }
@@ -171,6 +181,10 @@ mod tests {
         assert_eq!(Command::Move.key(), Key::M);
         assert_eq!(Command::Move.key_label(), "M");
         assert!(Command::Move.needs_selection());
+        assert_eq!(Command::Print.key(), Key::P);
+        assert_eq!(Command::Print.key_label(), "P");
+        assert!(Command::Print.needs_selection() && Command::Print.needs_ownership());
+        assert!(!Command::Add.needs_ownership() && !Command::Open.needs_ownership());
         assert_eq!(Command::Quit.key(), Key::Q);
         assert_eq!(Command::Quit.key_label(), "Q");
         assert!(Command::Remove.needs_selection());
