@@ -12,7 +12,7 @@ use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
 use crate::label::{self, CodeKind, LabelContent, LabelOptions, LabelSize};
-use crate::library::{Entry, Library};
+use crate::library::{Entry, Library, RecordRow, StoredRelease};
 use crate::printer::{self, JobOptions, Printer};
 use crate::shops::{Shop, ShopEntry, search_plan};
 
@@ -27,6 +27,18 @@ pub enum LibraryRequest {
     /// Copies and cover state of these releases.
     Status(Vec<u32>),
     Sync(Box<SyncJob>),
+    /// All records, for the collection tab.
+    List,
+    /// One record with everything stored about it. `for_scan`: it was asked for
+    /// because its barcode was scanned.
+    Details {
+        id: u32,
+        for_scan: bool,
+    },
+    /// The stored cover image of a record. Not counted as pending work.
+    Image(u32),
+    /// Stored thumbnails for list rows. Not counted as pending work.
+    Thumbs(Vec<u32>),
     /// Store a downloaded cover for a release that is in the database.
     Cover {
         release_id: u32,
@@ -73,6 +85,45 @@ pub enum LibraryResponse {
         release_id: u32,
         result: Result<bool, String>,
     },
+    List(Result<Vec<RecordRow>, String>),
+    Details {
+        id: u32,
+        for_scan: bool,
+        result: Result<Option<Box<StoredRelease>>, String>,
+    },
+    Image {
+        id: u32,
+        result: Result<Option<Vec<u8>>, String>,
+    },
+    Thumbs {
+        ids: Vec<u32>,
+        result: Result<Vec<(u32, Vec<u8>)>, String>,
+    },
+}
+
+impl LibraryRequest {
+    /// Whether the spinner should show while this is being worked on. Connecting
+    /// has its own indicator, pictures arrive quietly in the background.
+    fn counts_as_pending(&self) -> bool {
+        !matches!(
+            self,
+            LibraryRequest::Configure { .. } | LibraryRequest::Image(_) | LibraryRequest::Thumbs(_)
+        )
+    }
+}
+
+impl LibraryResponse {
+    /// The counterpart of `LibraryRequest::counts_as_pending`.
+    fn counts_as_pending(&self) -> bool {
+        !matches!(
+            self,
+            LibraryResponse::Disabled
+                | LibraryResponse::Ready { .. }
+                | LibraryResponse::Failed(_)
+                | LibraryResponse::Image { .. }
+                | LibraryResponse::Thumbs { .. }
+        )
+    }
 }
 
 /// State of the database thread: the URL, and the connection if there is one.
@@ -150,6 +201,36 @@ impl LibraryState {
                         .map_err(|e| format!("{e:#}")),
                 });
                 LibraryResponse::Synced { release_id, result }
+            }
+            LibraryRequest::List => {
+                let result = self
+                    .connection()
+                    .and_then(|l| l.list().map_err(|e| format!("{e:#}")));
+                LibraryResponse::List(result)
+            }
+            LibraryRequest::Details { id, for_scan } => {
+                let result = self.connection().and_then(|l| {
+                    l.get_release(id)
+                        .map(|r| r.map(Box::new))
+                        .map_err(|e| format!("{e:#}"))
+                });
+                LibraryResponse::Details {
+                    id,
+                    for_scan,
+                    result,
+                }
+            }
+            LibraryRequest::Image(id) => {
+                let result = self
+                    .connection()
+                    .and_then(|l| l.get_image(id).map_err(|e| format!("{e:#}")));
+                LibraryResponse::Image { id, result }
+            }
+            LibraryRequest::Thumbs(ids) => {
+                let result = self
+                    .connection()
+                    .and_then(|l| l.get_thumbs(&ids).map_err(|e| format!("{e:#}")));
+                LibraryResponse::Thumbs { ids, result }
             }
             LibraryRequest::Cover {
                 release_id,
@@ -370,8 +451,7 @@ impl Worker {
     pub fn send(&mut self, req: Request) {
         match req {
             Request::Library(request) => {
-                // connecting is shown by the library indicator, not by the spinner
-                if !matches!(request, LibraryRequest::Configure { .. }) {
+                if request.counts_as_pending() {
                     self.pending += 1;
                 }
                 let _ = self.library_tx.send(request);
@@ -398,16 +478,10 @@ impl Worker {
         let out: Vec<Response> = self.rx.try_iter().collect();
         let answered = out
             .iter()
-            .filter(|r| {
-                !matches!(
-                    r,
-                    Response::Image { .. }
-                        | Response::Library(
-                            LibraryResponse::Disabled
-                                | LibraryResponse::Ready { .. }
-                                | LibraryResponse::Failed(_)
-                        )
-                )
+            .filter(|r| match r {
+                Response::Image { .. } => false,
+                Response::Library(response) => response.counts_as_pending(),
+                _ => true,
             })
             .count();
         self.pending = self.pending.saturating_sub(answered);
@@ -1022,5 +1096,127 @@ mod tests {
             responses[0],
             Response::Library(LibraryResponse::Ready { .. })
         ));
+    }
+
+    #[test]
+    fn the_library_thread_serves_the_collection_tab() {
+        let Some(server) = crate::library::testing::server() else {
+            return;
+        };
+        let mut state = LibraryState::default();
+        state.handle(LibraryRequest::Configure {
+            url: server.new_database("w_browse"),
+        });
+        state.handle(save_job(7, 2));
+        state.handle(save_job(8, 1));
+        state.handle(LibraryRequest::Cover {
+            release_id: 7,
+            image: png(),
+            source_url: String::new(),
+        });
+
+        match state.handle(LibraryRequest::List) {
+            LibraryResponse::List(rows) => {
+                let rows = rows.unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(
+                    rows.iter()
+                        .any(|r| r.id == 7 && r.copies == 2 && r.has_cover)
+                );
+                assert!(rows.iter().any(|r| r.id == 8 && !r.has_cover));
+            }
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Details {
+            id: 7,
+            for_scan: true,
+        }) {
+            LibraryResponse::Details {
+                id: 7,
+                for_scan: true,
+                result,
+            } => {
+                let record = result.unwrap().unwrap();
+                assert_eq!(record.title, "A Title");
+                assert_eq!(record.tracks.len(), 1);
+            }
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Details {
+            id: 404,
+            for_scan: false,
+        }) {
+            LibraryResponse::Details { result, .. } => assert!(result.unwrap().is_none()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Image(7)) {
+            LibraryResponse::Image { id: 7, result } => assert!(result.unwrap().is_some()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Image(8)) {
+            LibraryResponse::Image { result, .. } => assert!(result.unwrap().is_none()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Thumbs(vec![7, 8])) {
+            LibraryResponse::Thumbs { ids, result } => {
+                assert_eq!(ids, vec![7, 8]);
+                let found = result.unwrap();
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].0, 7);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn browsing_requests_without_a_database_fail_with_a_message() {
+        let mut state = LibraryState::default();
+        match state.handle(LibraryRequest::List) {
+            LibraryResponse::List(r) => assert!(r.unwrap_err().contains("no database configured")),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Details {
+            id: 1,
+            for_scan: false,
+        }) {
+            LibraryResponse::Details { result, .. } => assert!(result.is_err()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Image(1)) {
+            LibraryResponse::Image { result, .. } => assert!(result.is_err()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Thumbs(vec![1])) {
+            LibraryResponse::Thumbs { result, .. } => assert!(result.is_err()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn pictures_do_not_show_the_spinner_but_the_list_does() {
+        let mut worker = Worker::spawn(egui::Context::default());
+        worker.send(Request::Library(LibraryRequest::Thumbs(vec![1])));
+        worker.send(Request::Library(LibraryRequest::Image(1)));
+        assert_eq!(worker.pending(), 0);
+        worker.send(Request::Library(LibraryRequest::List));
+        worker.send(Request::Library(LibraryRequest::Details {
+            id: 1,
+            for_scan: false,
+        }));
+        assert_eq!(worker.pending(), 2);
+        let mut responses = Vec::new();
+        for _ in 0..300 {
+            responses.extend(worker.poll());
+            if responses.len() >= 4 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(responses.len(), 4);
+        assert_eq!(
+            worker.pending(),
+            0,
+            "only the counted requests were subtracted"
+        );
     }
 }

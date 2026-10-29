@@ -25,6 +25,7 @@ ab_glyph = "0.2"
 barcoders = { version = "2", default-features = false, features = ["std"] }
 postgres = "0.19"
 sha2 = "0.10"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 libc = "0.2.191"

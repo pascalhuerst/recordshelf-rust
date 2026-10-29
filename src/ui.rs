@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
+use crate::collection::Collection;
 use crate::config::Settings;
 use crate::controls::{
     self, AddDecision, Command, MoveDecision, PENDING_INSTANCE, RemoveDecision, SyncDecision,
@@ -26,6 +27,17 @@ use crate::worker::{
     LibraryRequest, LibraryResponse, PrintJob, Request, Response, SyncJob, SyncOutcome, Worker,
 };
 use eframe::egui::{self, Color32, RichText};
+
+mod collection_tab;
+
+/// The two tabs of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    /// Scan or search Discogs and add records to the collection.
+    Add,
+    /// Browse and search the records in our own database.
+    Collection,
+}
 
 /// How far the connection to our own database is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +151,8 @@ pub struct RecordShelfApp {
     selection_changed: Instant,
     settings_open: bool,
     images: HashMap<String, ImageState>,
+    tab: Tab,
+    collection: Collection,
     library_link: LibraryLink,
     /// What our database has, per release (copies 0 = not in it).
     library: HashMap<u32, LibraryEntry>,
@@ -198,6 +212,8 @@ impl RecordShelfApp {
             selection_changed: Instant::now(),
             settings_open: false,
             images: HashMap::new(),
+            tab: Tab::Add,
+            collection: Collection::default(),
             library_link: LibraryLink::Off,
             library: HashMap::new(),
             library_status_requested: HashSet::new(),
@@ -263,6 +279,8 @@ impl RecordShelfApp {
         self.library_busy.clear();
         self.pending_forced.clear();
         self.cover_wanted.clear();
+        self.collection = Collection::default();
+        self.images.retain(|key, _| !key.starts_with("db:"));
         self.library_link = if url.is_empty() {
             LibraryLink::Off
         } else {
@@ -455,6 +473,9 @@ impl RecordShelfApp {
             }
             LibraryResponse::Ready { migrated } => {
                 self.library_link = LibraryLink::Ready;
+                if self.tab == Tab::Collection {
+                    self.load_collection_if_needed();
+                }
                 if migrated > 0 {
                     self.set_info(format!(
                         "Database brought up to date ({migrated} migration(s))"
@@ -488,6 +509,9 @@ impl RecordShelfApp {
             },
             LibraryResponse::Synced { release_id, result } => {
                 self.library_busy.remove(&release_id);
+                if result.is_ok() {
+                    self.collection_changed();
+                }
                 match result {
                     Ok(SyncOutcome::Saved { created, copies }) => {
                         let has_cover = self.library.get(&release_id).is_some_and(|e| e.has_cover);
@@ -526,6 +550,10 @@ impl RecordShelfApp {
                 // the collection may have changed while this was running
                 self.after_data(release_id);
             }
+            response @ (LibraryResponse::List(_)
+            | LibraryResponse::Details { .. }
+            | LibraryResponse::Image { .. }
+            | LibraryResponse::Thumbs { .. }) => self.handle_collection_response(response),
             LibraryResponse::Cover { release_id, result } => match result {
                 Ok(true) => {
                     if let Some(entry) = self.library.get_mut(&release_id) {
@@ -1090,7 +1118,10 @@ impl RecordShelfApp {
                 ScanEvent::Info(msg) => self.scanner_status = msg,
                 ScanEvent::Code(code) => {
                     self.scanner_status = format!("Scanned {code}");
-                    self.route_scan(code);
+                    match self.tab {
+                        Tab::Add => self.route_scan(code),
+                        Tab::Collection => self.scan_in_collection(code),
+                    }
                 }
             }
         }
@@ -1807,6 +1838,26 @@ impl RecordShelfApp {
         }
     }
 
+    /// A print job for this label content, with the printer settings.
+    fn print_job(&self, content: LabelContent) -> PrintJob {
+        let settings = &self.settings;
+        PrintJob {
+            content,
+            host: settings.printer_host.clone(),
+            port: settings.printer_port,
+            width_mm: settings.label_width_mm,
+            height_mm: settings.label_height_mm,
+            top_mm: settings.label_top_mm,
+            darkness: settings.printer_darkness,
+            speed_ips: settings.printer_speed_ips,
+            code: if settings.label_code == "qr" {
+                CodeKind::Qr
+            } else {
+                CodeKind::Barcode
+            },
+        }
+    }
+
     /// Prints the sticker for a release we own.
     fn print_label(&mut self, id: u32) {
         match self.ownership.get(&id) {
@@ -1833,22 +1884,7 @@ impl RecordShelfApp {
             return;
         };
         let content = LabelContent::from_release(id, release);
-        let settings = &self.settings;
-        let job = PrintJob {
-            content,
-            host: settings.printer_host.clone(),
-            port: settings.printer_port,
-            width_mm: settings.label_width_mm,
-            height_mm: settings.label_height_mm,
-            top_mm: settings.label_top_mm,
-            darkness: settings.printer_darkness,
-            speed_ips: settings.printer_speed_ips,
-            code: if settings.label_code == "qr" {
-                CodeKind::Qr
-            } else {
-                CodeKind::Barcode
-            },
-        };
+        let job = self.print_job(content);
         self.worker.send(Request::PrintLabel(Box::new(job)));
         self.set_info("Printing label...".to_string());
     }
@@ -1991,6 +2027,21 @@ impl eframe::App for RecordShelfApp {
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
+        if !self.settings_open {
+            let (f1, f2) =
+                ctx.input(|i| (i.key_pressed(egui::Key::F1), i.key_pressed(egui::Key::F2)));
+            let wanted = if f1 {
+                Some(Tab::Add)
+            } else if f2 {
+                Some(Tab::Collection)
+            } else {
+                None
+            };
+            if let Some(tab) = wanted.filter(|t| *t != self.tab) {
+                self.tab = tab;
+                self.on_tab_changed();
+            }
+        }
         if self.bridge.is_some() {
             // Keeps the "browser connected" indicators fresh.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -2000,6 +2051,12 @@ impl eframe::App for RecordShelfApp {
             ui.horizontal(|ui| {
                 ui.heading("RecordShelf");
                 ui.separator();
+                let before = self.tab;
+                ui.selectable_value(&mut self.tab, Tab::Add, "Add records  [F1]");
+                ui.selectable_value(&mut self.tab, Tab::Collection, "Search Collection  [F2]");
+                if self.tab != before {
+                    self.on_tab_changed();
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::widgets::global_dark_light_mode_switch(ui);
                     if ui.button("Settings").clicked() {
@@ -2052,7 +2109,10 @@ impl eframe::App for RecordShelfApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| self.ui_main(ui));
+        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+            Tab::Add => self.ui_main(ui),
+            Tab::Collection => self.ui_collection(ui),
+        });
 
         if self.settings_open {
             self.show_settings(ctx);
@@ -2365,7 +2425,7 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
 mod tests {
     use super::*;
 
-    fn app_with_results(n: u32) -> RecordShelfApp {
+    pub(super) fn app_with_results(n: u32) -> RecordShelfApp {
         let mut app =
             RecordShelfApp::new(egui::Context::default(), Settings::default(), None, None);
         app.search_results = (1..=n)

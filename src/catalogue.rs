@@ -72,6 +72,54 @@ pub struct CatalogueRelease {
     pub credits: Vec<CreditRow>,
 }
 
+/// Artists as printed on the sleeve: each name followed by what the sleeve
+/// puts before the next one ("A feat. B", "A & B", "A, B"). `None` joins as a comma.
+pub fn join_artists<'a>(artists: impl IntoIterator<Item = (&'a str, Option<&'a str>)>) -> String {
+    let mut out = String::new();
+    let mut pending_join: Option<Option<&str>> = None;
+    for (name, join) in artists {
+        if let Some(previous) = pending_join {
+            match previous.map(str::trim).filter(|j| !j.is_empty()) {
+                None => out.push_str(", "),
+                Some(j) if matches!(j, "," | ";") => {
+                    out.push_str(j);
+                    out.push(' ');
+                }
+                Some(j) => {
+                    out.push(' ');
+                    out.push_str(j);
+                    out.push(' ');
+                }
+            }
+        }
+        out.push_str(name);
+        pending_join = Some(join);
+    }
+    out
+}
+
+/// Lower case without accents, for searching: "Björk" and "bjork" agree.
+pub fn fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let mut out = String::with_capacity(text.len());
+    for c in text
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+    {
+        match c {
+            'ß' => out.push_str("ss"),
+            'æ' | 'Æ' => out.push_str("ae"),
+            'œ' | 'Œ' => out.push_str("oe"),
+            'ø' | 'Ø' => out.push('o'),
+            'ł' | 'Ł' => out.push('l'),
+            'đ' | 'Đ' => out.push('d'),
+            'ð' | 'Ð' => out.push('d'),
+            _ => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
 fn non_empty(text: Option<&str>) -> Option<String> {
     text.map(str::trim)
         .filter(|t| !t.is_empty())
@@ -693,5 +741,49 @@ mod tests {
         assert!(c.artists.is_empty() && c.labels.is_empty() && c.formats.is_empty());
         assert!(c.tracks.is_empty() && c.credits.is_empty());
         assert_eq!((c.released_on, c.released_precision), (None, None));
+    }
+
+    #[test]
+    fn artists_are_joined_as_on_the_sleeve() {
+        assert_eq!(
+            join_artists([("Alexander Kowalski", Some("&")), ("Rebar", None)]),
+            "Alexander Kowalski & Rebar"
+        );
+        assert_eq!(
+            join_artists([("A", Some("feat.")), ("B", None)]),
+            "A feat. B"
+        );
+        assert_eq!(
+            join_artists([("A", Some(",")), ("B", Some(",")), ("C", None)]),
+            "A, B, C"
+        );
+        assert_eq!(
+            join_artists([("A", None), ("B", None)]),
+            "A, B",
+            "no join text: a comma"
+        );
+        assert_eq!(
+            join_artists([("A", Some(" ")), ("B", None)]),
+            "A, B",
+            "blank join text: a comma"
+        );
+        assert_eq!(join_artists([("Solo", None)]), "Solo");
+        assert_eq!(
+            join_artists([("A", Some("vs.")), ("B", Some("/")), ("C", None)]),
+            "A vs. B / C"
+        );
+        assert_eq!(join_artists(std::iter::empty()), "");
+    }
+
+    #[test]
+    fn folding_ignores_case_and_accents() {
+        assert_eq!(fold("Björk Guðmundsdóttir"), "bjork gudmundsdottir");
+        assert_eq!(fold("KULØR"), "kulor");
+        assert_eq!(fold("Müller / Mueller"), "muller / mueller");
+        assert_eq!(fold("Straße"), "strasse");
+        assert_eq!(fold("Æon Œuvre Łódź"), "aeon oeuvre lodz");
+        assert_eq!(fold("Dub Techno 12\""), "dub techno 12\"");
+        assert_eq!(fold(""), "");
+        assert_eq!(fold("ÉÈÊË éèêë"), "eeee eeee");
     }
 }

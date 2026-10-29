@@ -96,13 +96,13 @@ impl LabelContent {
                 .and_then(|l| l.catno.clone())
                 .filter(|c| !c.eq_ignore_ascii_case("none"))
                 .unwrap_or_default(),
-            artist: release
-                .artists
-                .iter()
-                .flatten()
-                .filter_map(|a| a.name.as_deref())
-                .collect::<Vec<_>>()
-                .join(", "),
+            artist: crate::catalogue::join_artists(
+                release
+                    .artists
+                    .iter()
+                    .flatten()
+                    .filter_map(|a| Some((a.name.as_deref()?, a.join.as_deref()))),
+            ),
             title: release.title.clone().unwrap_or_default(),
             tracks: release
                 .tracklist
@@ -112,6 +112,32 @@ impl LabelContent {
                 .map(|t| LabelTrack {
                     position: t.position.clone().unwrap_or_default(),
                     title: t.title.clone().unwrap_or_default(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl LabelContent {
+    /// The label of a record that is in our database.
+    pub fn from_stored(record: &crate::library::StoredRelease) -> Self {
+        let (label, catno) = record.labels.first().cloned().unwrap_or_default();
+        Self {
+            release_id: record.id,
+            size_inch: record
+                .formats
+                .iter()
+                .find_map(|f| f.size.and_then(|s| u8::try_from(s).ok())),
+            label,
+            catno,
+            artist: record.artist_display(),
+            title: record.title.clone(),
+            tracks: record
+                .tracks
+                .iter()
+                .map(|t| LabelTrack {
+                    position: t.position.clone().unwrap_or_default(),
+                    title: t.title.clone(),
                 })
                 .collect(),
         }
@@ -984,5 +1010,23 @@ mod tests {
             "caption must stay in its corner"
         );
         assert_eq!(decode(&captioned).as_deref(), Some("32474433"));
+    }
+
+    #[test]
+    fn a_stored_record_gives_the_same_label_as_the_release_it_came_from() {
+        let json = r#"{"id": 9, "title": "Wonderscape", "released": "2024", "artists": [{"id": 1, "name": "Alexander Kowalski", "join": "&"}, {"id": 2, "name": "Rebar"}],
+            "labels": [{"id": 5, "name": "Made Of Concrete", "catno": "MOC040"}],
+            "formats": [{"name": "Vinyl", "descriptions": ["12\""]}],
+            "tracklist": [{"position": "A1", "title": "Dawns Embrace"}, {"position": "A2", "title": "Radiant Resurgence"}]}"#;
+        let release: Release = serde_json::from_str(json).unwrap();
+        let from_discogs = LabelContent::from_release(9, &release);
+        assert_eq!(
+            from_discogs.artist, "Alexander Kowalski & Rebar",
+            "joined as on the sleeve"
+        );
+        let stored = crate::library::StoredRelease::from_catalogue(
+            &crate::catalogue::CatalogueRelease::from_release(9, &release, 1).unwrap(),
+        );
+        assert_eq!(LabelContent::from_stored(&stored), from_discogs);
     }
 }

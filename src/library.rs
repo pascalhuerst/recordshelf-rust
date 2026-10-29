@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use postgres::{Client, NoTls};
 use sha2::{Digest, Sha256};
 
-use crate::catalogue::CatalogueRelease;
+use crate::catalogue::{CatalogueRelease, fold, join_artists};
 
 /// Longest side of the stored thumbnail in pixels.
 pub const THUMB_SIZE: u32 = 150;
@@ -39,6 +39,194 @@ pub struct Entry {
 pub struct SaveOutcome {
     /// The release was not in the database before.
     pub created: bool,
+}
+
+/// One line of the list of all records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordRow {
+    pub id: u32,
+    pub title: String,
+    /// Artists as on the sleeve ("A feat. B").
+    pub artists: String,
+    /// "Label (CAT 1), Other Label".
+    pub labels: String,
+    pub year: Option<i16>,
+    /// "12", 33 RPM, 180 g, EP, X-ray Colour"
+    pub format: String,
+    pub copies: i16,
+    pub has_cover: bool,
+    /// Everything searchable about the record, lower case without accents.
+    pub haystack: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFormat {
+    pub qty: i16,
+    pub size: Option<i16>,
+    pub rpm: Option<i16>,
+    pub channels: String,
+    pub weight_g: Option<i16>,
+    pub text: Option<String>,
+    pub descriptions: Vec<String>,
+}
+
+impl StoredFormat {
+    /// `12", 33 RPM, 180 g, EP, X-ray Colour` (and "2 x" for several discs).
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.qty > 1 {
+            parts.push(format!("{} x", self.qty));
+        }
+        let mut first = String::new();
+        if let Some(size) = self.size {
+            first.push_str(&format!("{size}\""));
+        }
+        if !first.is_empty() {
+            parts.push(first);
+        }
+        if let Some(rpm) = self.rpm {
+            parts.push(format!("{rpm} RPM"));
+        }
+        if let Some(weight) = self.weight_g {
+            parts.push(format!("{weight} g"));
+        }
+        if self.channels != "stereo" {
+            let mut channels = self.channels.clone();
+            if let Some(c) = channels.get_mut(0..1) {
+                c.make_ascii_uppercase();
+            }
+            parts.push(channels);
+        }
+        parts.extend(self.descriptions.iter().cloned());
+        if let Some(text) = &self.text {
+            parts.push(text.clone());
+        }
+        // "2 x 12"" reads better than "2 x, 12\""
+        match parts.first() {
+            Some(first) if first.ends_with(" x") && parts.len() > 1 => {
+                let merged = format!("{first} {}", parts[1]);
+                parts.splice(0..2, [merged]);
+            }
+            _ => {}
+        }
+        parts.join(", ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTrack {
+    pub position: Option<String>,
+    pub title: String,
+    pub duration_seconds: Option<i32>,
+}
+
+/// A record as stored in our database, with everything needed to show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRelease {
+    pub id: u32,
+    pub master_id: Option<i32>,
+    pub title: String,
+    pub released_on: Option<String>,
+    pub released_precision: Option<String>,
+    pub year: Option<i16>,
+    pub country: Option<String>,
+    pub genres: Vec<String>,
+    pub styles: Vec<String>,
+    pub notes: Option<String>,
+    pub discogs_uri: Option<String>,
+    pub copies: i16,
+    /// (name, what the sleeve puts after the name)
+    pub artists: Vec<(String, Option<String>)>,
+    /// (label, catalog number)
+    pub labels: Vec<(String, String)>,
+    pub formats: Vec<StoredFormat>,
+    pub tracks: Vec<StoredTrack>,
+    /// (role, name, tracks)
+    pub credits: Vec<(String, String, Option<String>)>,
+}
+
+impl StoredRelease {
+    pub fn artist_display(&self) -> String {
+        join_artists(self.artists.iter().map(|(n, j)| (n.as_str(), j.as_deref())))
+    }
+
+    pub fn format_display(&self) -> String {
+        self.formats
+            .iter()
+            .map(StoredFormat::summary)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
+#[cfg(test)]
+impl StoredRelease {
+    /// What reading a stored `CatalogueRelease` back gives (for tests that need a
+    /// record without a database).
+    pub fn from_catalogue(c: &CatalogueRelease) -> Self {
+        Self {
+            id: c.id as u32,
+            master_id: c.master_id,
+            title: c.title.clone(),
+            released_on: c.released_on.clone(),
+            released_precision: c.released_precision.map(str::to_string),
+            year: c.released_on.as_ref().and_then(|d| d[..4].parse().ok()),
+            country: c.country.clone(),
+            genres: c.genres.clone(),
+            styles: c.styles.clone(),
+            notes: c.notes.clone(),
+            discogs_uri: c.discogs_uri.clone(),
+            copies: c.copies,
+            artists: c
+                .artists
+                .iter()
+                .map(|a| (a.name.clone(), a.join_text.clone()))
+                .collect(),
+            labels: c
+                .labels
+                .iter()
+                .map(|l| (l.name.clone(), l.catalog_number.clone()))
+                .collect(),
+            formats: c
+                .formats
+                .iter()
+                .map(|f| StoredFormat {
+                    qty: f.qty,
+                    size: f.size,
+                    rpm: f.rpm,
+                    channels: f.channels.to_string(),
+                    weight_g: f.weight_g,
+                    text: f.text.clone(),
+                    descriptions: f.descriptions.clone(),
+                })
+                .collect(),
+            tracks: c
+                .tracks
+                .iter()
+                .map(|t| StoredTrack {
+                    position: t.position.clone(),
+                    title: t.title.clone(),
+                    duration_seconds: t.duration_seconds,
+                })
+                .collect(),
+            credits: Vec::new(),
+        }
+    }
+}
+
+/// "Label (CAT 1), Other Label" from (label, catalog number) pairs.
+fn labels_display(labels: &[(String, String)]) -> String {
+    labels
+        .iter()
+        .map(|(name, catno)| {
+            if catno.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} ({catno})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub struct Library {
@@ -254,6 +442,229 @@ impl Library {
         }
         tx.commit()?;
         Ok(SaveOutcome { created })
+    }
+
+    /// All records, for browsing and searching. Everything is loaded at once
+    /// (a few thousand records are a few megabytes) so that searching is instant.
+    pub fn list(&mut self) -> Result<Vec<RecordRow>> {
+        use std::collections::BTreeMap;
+        let base = self.client.query(
+            "SELECT r.id, r.title, r.year, r.country, r.genres, r.styles, r.copies, (c.release_id IS NOT NULL)
+               FROM releases r LEFT JOIN release_covers c ON c.release_id = r.id",
+            &[],
+        )?;
+        let mut artists: BTreeMap<i32, Vec<(String, Option<String>)>> = BTreeMap::new();
+        for row in self.client.query(
+            "SELECT ra.release_id, a.name, ra.join_text FROM release_artists ra
+               JOIN artists a ON a.id = ra.artist_id ORDER BY ra.release_id, ra.position",
+            &[],
+        )? {
+            artists
+                .entry(row.get(0))
+                .or_default()
+                .push((row.get(1), row.get(2)));
+        }
+        let mut labels: BTreeMap<i32, Vec<(String, String)>> = BTreeMap::new();
+        for row in self.client.query(
+            "SELECT rl.release_id, l.name, rl.catalog_number FROM release_labels rl
+               JOIN labels l ON l.id = rl.label_id ORDER BY rl.release_id, l.name, rl.catalog_number",
+            &[],
+        )? {
+            labels.entry(row.get(0)).or_default().push((row.get(1), row.get(2)));
+        }
+        let mut formats: BTreeMap<i32, Vec<StoredFormat>> = BTreeMap::new();
+        for row in self.client.query(
+            "SELECT release_id, qty, size, rpm, channels::text, weight_g, text, descriptions
+               FROM release_formats ORDER BY release_id, position",
+            &[],
+        )? {
+            formats.entry(row.get(0)).or_default().push(StoredFormat {
+                qty: row.get(1),
+                size: row.get(2),
+                rpm: row.get(3),
+                channels: row.get(4),
+                weight_g: row.get(5),
+                text: row.get(6),
+                descriptions: row.get(7),
+            });
+        }
+        let mut tracks: BTreeMap<i32, String> = BTreeMap::new();
+        for row in self.client.query(
+            "SELECT release_id, string_agg(title, ' ' ORDER BY track_index) FROM tracks GROUP BY release_id",
+            &[],
+        )? {
+            tracks.insert(row.get(0), row.get(1));
+        }
+
+        let mut rows: Vec<RecordRow> = base
+            .iter()
+            .map(|row| {
+                let id: i32 = row.get(0);
+                let title: String = row.get(1);
+                let year: Option<i16> = row.get(2);
+                let country: Option<String> = row.get(3);
+                let genres: Vec<String> = row.get(4);
+                let styles: Vec<String> = row.get(5);
+                let artist_list = artists.get(&id).cloned().unwrap_or_default();
+                let label_list = labels.get(&id).cloned().unwrap_or_default();
+                let artists_text =
+                    join_artists(artist_list.iter().map(|(n, j)| (n.as_str(), j.as_deref())));
+                let labels_text = labels_display(&label_list);
+                let format = formats
+                    .get(&id)
+                    .map(|f| {
+                        f.iter()
+                            .map(StoredFormat::summary)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    })
+                    .unwrap_or_default();
+                let haystack = fold(&format!(
+                    "{title} {artists_text} {labels_text} {} {} {} {} {format} {}",
+                    year.map(|y| y.to_string()).unwrap_or_default(),
+                    country.unwrap_or_default(),
+                    genres.join(" "),
+                    styles.join(" "),
+                    tracks.get(&id).cloned().unwrap_or_default(),
+                ));
+                RecordRow {
+                    id: id as u32,
+                    title,
+                    artists: artists_text,
+                    labels: labels_text,
+                    year,
+                    format,
+                    copies: row.get(6),
+                    has_cover: row.get(7),
+                    haystack,
+                }
+            })
+            .collect();
+        rows.sort_by_cached_key(|r| (fold(&r.artists), fold(&r.title), r.id));
+        Ok(rows)
+    }
+
+    /// One record with everything stored about it; `None` if it is not in the database.
+    pub fn get_release(&mut self, id: u32) -> Result<Option<StoredRelease>> {
+        let db_id = i32::try_from(id).context("release id out of range")?;
+        let Some(base) = self.client.query_opt(
+            "SELECT title, master_id, released_on::text, released_precision::text, year, country,
+                    genres, styles, notes, discogs_uri, copies
+               FROM releases WHERE id = $1",
+            &[&db_id],
+        )?
+        else {
+            return Ok(None);
+        };
+        let artists = self
+            .client
+            .query(
+                "SELECT a.name, ra.join_text FROM release_artists ra JOIN artists a ON a.id = ra.artist_id
+                  WHERE ra.release_id = $1 ORDER BY ra.position",
+                &[&db_id],
+            )?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        let labels = self
+            .client
+            .query(
+                "SELECT l.name, rl.catalog_number FROM release_labels rl JOIN labels l ON l.id = rl.label_id
+                  WHERE rl.release_id = $1 ORDER BY l.name, rl.catalog_number",
+                &[&db_id],
+            )?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        let formats = self
+            .client
+            .query(
+                "SELECT qty, size, rpm, channels::text, weight_g, text, descriptions
+                   FROM release_formats WHERE release_id = $1 ORDER BY position",
+                &[&db_id],
+            )?
+            .iter()
+            .map(|r| StoredFormat {
+                qty: r.get(0),
+                size: r.get(1),
+                rpm: r.get(2),
+                channels: r.get(3),
+                weight_g: r.get(4),
+                text: r.get(5),
+                descriptions: r.get(6),
+            })
+            .collect();
+        let tracks = self
+            .client
+            .query(
+                "SELECT position, title, duration_seconds FROM tracks WHERE release_id = $1 ORDER BY track_index",
+                &[&db_id],
+            )?
+            .iter()
+            .map(|r| StoredTrack {
+                position: r.get(0),
+                title: r.get(1),
+                duration_seconds: r.get(2),
+            })
+            .collect();
+        let credits = self
+            .client
+            .query(
+                "SELECT rc.role, a.name, rc.tracks FROM release_credits rc JOIN artists a ON a.id = rc.artist_id
+                  WHERE rc.release_id = $1 ORDER BY rc.id",
+                &[&db_id],
+            )?
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect();
+        Ok(Some(StoredRelease {
+            id,
+            master_id: base.get(1),
+            title: base.get(0),
+            released_on: base.get(2),
+            released_precision: base.get(3),
+            year: base.get(4),
+            country: base.get(5),
+            genres: base.get(6),
+            styles: base.get(7),
+            notes: base.get(8),
+            discogs_uri: base.get(9),
+            copies: base.get(10),
+            artists,
+            labels,
+            formats,
+            tracks,
+            credits,
+        }))
+    }
+
+    /// The stored cover image as downloaded, if there is one.
+    pub fn get_image(&mut self, id: u32) -> Result<Option<Vec<u8>>> {
+        let id = i32::try_from(id).context("release id out of range")?;
+        Ok(self
+            .client
+            .query_opt(
+                "SELECT image FROM release_covers WHERE release_id = $1",
+                &[&id],
+            )?
+            .map(|row| row.get(0)))
+    }
+
+    /// Thumbnails of the given releases (those that have a cover).
+    pub fn get_thumbs(&mut self, ids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>> {
+        let ids: Vec<i32> = ids
+            .iter()
+            .filter_map(|id| i32::try_from(*id).ok())
+            .collect();
+        Ok(self
+            .client
+            .query(
+                "SELECT release_id, thumb FROM release_covers WHERE release_id = ANY($1)",
+                &[&ids],
+            )?
+            .iter()
+            .map(|row| (row.get::<_, i32>(0) as u32, row.get(1)))
+            .collect())
     }
 
     /// Removes a release and everything that belongs to it. False if it was not there.
@@ -943,5 +1354,189 @@ mod tests {
         let mut library = library;
         let _ = library.status(&[1]); // the next use finds out
         assert!(library.is_closed());
+    }
+
+    // --- browsing ---------------------------------------------------------------
+
+    fn two_records() -> (CatalogueRelease, CatalogueRelease) {
+        (
+            mapped(FULL, 2),
+            mapped(
+                r#"{"id": 20, "title": "Wonderscape Numinous", "released": "2024-11-22", "country": "AU",
+                    "genres": ["Electronic"], "styles": ["Dub Techno"],
+                    "artists": [{"id": 30, "name": "Altone", "join": "&"}, {"id": 31, "name": "Björk"}],
+                    "labels": [{"id": 6, "name": "Primary Colours", "catno": "PCSS09"}],
+                    "formats": [{"name": "Vinyl", "qty": "2", "descriptions": ["12\"", "33 ⅓ RPM", "Mono", "EP"], "text": "Green Marble"}],
+                    "tracklist": [{"position": "A1", "title": "Self Replication"}, {"position": "B1", "title": "Adaptive Swarm", "duration": "5:10"}]}"#,
+                1,
+            ),
+        )
+    }
+
+    #[test]
+    fn lists_all_records_sorted_by_artist_and_title() {
+        let Some((mut library, _)) = library("t_list") else {
+            return;
+        };
+        let (garnier, altone) = two_records();
+        library.save_release(&garnier).unwrap();
+        library.save_release(&altone).unwrap();
+        library.save_cover(20, &png(30, 30), None).unwrap();
+        let rows = library.list().unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [20, 9],
+            "Altone before Laurent Garnier"
+        );
+        let r = &rows[0];
+        assert_eq!(r.title, "Wonderscape Numinous");
+        assert_eq!(r.artists, "Altone & Björk");
+        assert_eq!(r.labels, "Primary Colours (PCSS09)");
+        assert_eq!(r.year, Some(2024));
+        assert_eq!(r.format, "2 x 12\", 33 RPM, Mono, EP, Green Marble");
+        assert_eq!((r.copies, r.has_cover), (1, true));
+        assert!(!rows[1].has_cover);
+        assert_eq!(rows[1].artists, "Laurent Garnier feat. Someone");
+        assert_eq!(rows[1].copies, 2);
+        // everything is searchable, without accents or case
+        for word in [
+            "wonderscape",
+            "bjork",
+            "pcss09",
+            "dub techno",
+            "adaptive swarm",
+            "2024",
+            "au",
+            "green marble",
+            "primary colours",
+        ] {
+            assert!(r.haystack.contains(word), "{word} in {}", r.haystack);
+        }
+        assert!(!r.haystack.contains("Björk"), "the haystack is folded");
+    }
+
+    #[test]
+    fn an_empty_library_lists_nothing() {
+        let Some((mut library, _)) = library("t_list_empty") else {
+            return;
+        };
+        assert!(library.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_record_without_artists_labels_or_tracks_is_listed() {
+        let Some((mut library, _)) = library("t_list_sparse") else {
+            return;
+        };
+        library
+            .save_release(&mapped(r#"{"id": 5, "title": "Only A Title"}"#, 1))
+            .unwrap();
+        let rows = library.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (
+                rows[0].artists.as_str(),
+                rows[0].labels.as_str(),
+                rows[0].format.as_str()
+            ),
+            ("", "", "")
+        );
+        assert_eq!(rows[0].year, None);
+    }
+
+    #[test]
+    fn a_record_can_be_read_back_completely() {
+        let Some((mut library, _)) = library("t_get") else {
+            return;
+        };
+        library.save_release(&mapped(FULL, 2)).unwrap();
+        let r = library.get_release(9).unwrap().unwrap();
+        assert_eq!(
+            (r.id, r.title.as_str(), r.copies, r.master_id),
+            (9, "Speicher 95 Tribute EP", 2, Some(77))
+        );
+        assert_eq!(r.released_on.as_deref(), Some("2017-03-01"));
+        assert_eq!(r.released_precision.as_deref(), Some("month"));
+        assert_eq!(r.year, Some(2017));
+        assert_eq!(r.artist_display(), "Laurent Garnier feat. Someone");
+        assert_eq!(
+            r.labels,
+            [("Kompakt Extra".to_string(), "Kompakt Ex 095".to_string())]
+        );
+        assert_eq!(r.format_display(), "12\", 33 RPM, 180 g, EP, X-ray Colour");
+        assert_eq!(r.tracks.len(), 2);
+        assert_eq!(
+            (
+                r.tracks[0].position.as_deref(),
+                r.tracks[0].duration_seconds
+            ),
+            (Some("A"), Some(380))
+        );
+        assert_eq!(
+            r.credits,
+            [(
+                "Producer".to_string(),
+                "Producer Pete".to_string(),
+                Some("A".to_string())
+            )]
+        );
+        assert_eq!(r.genres, ["Electronic"]);
+        assert_eq!(r.notes.as_deref(), Some("Pressed in DE"));
+        assert!(library.get_release(404).unwrap().is_none());
+    }
+
+    #[test]
+    fn covers_and_thumbnails_can_be_read_back() {
+        let Some((mut library, _)) = library("t_get_cover") else {
+            return;
+        };
+        let (a, b) = two_records();
+        library.save_release(&a).unwrap();
+        library.save_release(&b).unwrap();
+        let original = png(60, 40);
+        library.save_cover(20, &original, None).unwrap();
+        assert_eq!(library.get_image(20).unwrap(), Some(original));
+        assert_eq!(library.get_image(9).unwrap(), None, "no cover stored");
+        assert_eq!(library.get_image(404).unwrap(), None);
+        let thumbs = library.get_thumbs(&[9, 20, 404]).unwrap();
+        assert_eq!(thumbs.len(), 1, "only releases with a cover");
+        assert_eq!(thumbs[0].0, 20);
+        assert!(image::load_from_memory(&thumbs[0].1).is_ok());
+        assert!(library.get_thumbs(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn format_summaries_read_naturally() {
+        let f =
+            |qty, size, rpm, channels: &str, weight, text: Option<&str>, d: &[&str]| StoredFormat {
+                qty,
+                size,
+                rpm,
+                channels: channels.into(),
+                weight_g: weight,
+                text: text.map(str::to_string),
+                descriptions: d.iter().map(|s| s.to_string()).collect(),
+            };
+        assert_eq!(
+            f(1, Some(12), Some(33), "stereo", None, None, &["EP"]).summary(),
+            "12\", 33 RPM, EP"
+        );
+        assert_eq!(
+            f(2, Some(12), None, "stereo", Some(180), Some("Green"), &[]).summary(),
+            "2 x 12\", 180 g, Green"
+        );
+        assert_eq!(
+            f(1, None, None, "mono", None, None, &["Single"]).summary(),
+            "Mono, Single"
+        );
+        assert_eq!(
+            f(1, None, None, "quadraphonic", None, None, &[]).summary(),
+            "Quadraphonic"
+        );
+        assert_eq!(f(1, None, None, "stereo", None, None, &[]).summary(), "");
+        assert_eq!(
+            f(3, None, None, "stereo", None, None, &["LP"]).summary(),
+            "3 x LP"
+        );
     }
 }

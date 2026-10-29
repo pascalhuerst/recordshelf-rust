@@ -4259,6 +4259,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "toml",
+ "unicode-normalization",
  "url",
 ]
 
