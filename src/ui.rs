@@ -1107,9 +1107,16 @@ impl RecordShelfApp {
             self.retry_selected_release();
         }
         if esc {
-            self.selected_result = None;
-            self.search_focus = true;
+            self.start_new_search();
         }
+    }
+
+    /// Esc: leave the current result and go to the search fields. The note
+    /// about the shop lookup that produced the results goes away with it.
+    fn start_new_search(&mut self) {
+        self.selected_result = None;
+        self.search_focus = true;
+        self.shop_info = None;
     }
 
     fn show_folder_picker(&mut self, ctx: &egui::Context) {
@@ -1564,6 +1571,8 @@ impl RecordShelfApp {
             per_page: Some(25),
         };
         self.worker.send(Request::Search(query));
+        // a manual search replaces whatever the shop lookup showed
+        self.shop_info = None;
         self.search_q.clear();
         self.search_artist.clear();
         self.search_title.clear();
@@ -2771,6 +2780,46 @@ mod tests {
             std::fs::read_to_string(&path)
                 .unwrap()
                 .contains("future_setting = 42")
+        );
+    }
+
+    #[test]
+    fn escape_clears_the_selection_and_the_shop_note() {
+        let mut app = app_with_results(2);
+        app.selected_result = Some(1);
+        app.shop_info = Some(
+            "decks.de CNF/O1: Altone - WONDERSCAPE NUMINOUS | PCSS09 | Primary colours".into(),
+        );
+        app.start_new_search();
+        assert_eq!(app.selected_result, None);
+        assert!(app.search_focus);
+        assert_eq!(app.shop_info, None);
+        assert_eq!(app.search_results.len(), 2, "the list itself stays");
+    }
+
+    #[test]
+    fn a_manual_search_clears_the_shop_note() {
+        let mut app = app_with_results(0);
+        app.shop_info = Some("hhv.de 525768: ...".into());
+        app.search_q = "garnier".into();
+        app.perform_search();
+        assert_eq!(app.shop_info, None);
+    }
+
+    #[test]
+    fn a_new_scan_replaces_the_shop_note() {
+        let mut app = app_with_results(0);
+        app.shop_info = Some("old note".into());
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Hhv,
+            code: "525768".into(),
+            status: Some(200),
+            entries: vec![hhv_entry()],
+        });
+        assert!(
+            app.shop_info
+                .as_ref()
+                .is_some_and(|i| i.contains("525768") && !i.contains("old"))
         );
     }
 }
