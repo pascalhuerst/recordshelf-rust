@@ -10,15 +10,17 @@ use crate::discogs::CollectionInstance;
 pub enum Command {
     Add,
     Remove,
+    Move,
     Open,
     ChooseFolder,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 5] = [
+    pub const ALL: [Command; 6] = [
         Command::Add,
         Command::Remove,
+        Command::Move,
         Command::Open,
         Command::ChooseFolder,
         Command::Quit,
@@ -28,6 +30,7 @@ impl Command {
         match self {
             Command::Add => Key::A,
             Command::Remove => Key::R,
+            Command::Move => Key::M,
             Command::Open => Key::O,
             Command::ChooseFolder => Key::F,
             Command::Quit => Key::Q,
@@ -44,6 +47,7 @@ impl Command {
         match self {
             Command::Add => "A",
             Command::Remove => "R",
+            Command::Move => "M",
             Command::Open => "O",
             Command::ChooseFolder => "F",
             Command::Quit => "Q",
@@ -96,6 +100,44 @@ pub fn decide_remove(owned: Option<&[CollectionInstance]>) -> RemoveDecision {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum MoveDecision {
+    /// The confirmed copies that could be moved.
+    Pick(Vec<CollectionInstance>),
+    NotOwned,
+    /// Collection status unknown or still changing; try again in a moment.
+    NeedsCheck,
+}
+
+pub fn decide_move(owned: Option<&[CollectionInstance]>) -> MoveDecision {
+    match owned {
+        None => MoveDecision::NeedsCheck,
+        Some([]) => MoveDecision::NotOwned,
+        Some(copies) => {
+            let confirmed: Vec<_> = copies
+                .iter()
+                .filter(|c| c.instance_id != PENDING_INSTANCE)
+                .cloned()
+                .collect();
+            if confirmed.is_empty() {
+                MoveDecision::NeedsCheck
+            } else {
+                MoveDecision::Pick(confirmed)
+            }
+        }
+    }
+}
+
+/// The copies that actually have to change folder (those already in `to_folder`
+/// stay where they are).
+pub fn plan_move(copies: &[CollectionInstance], to_folder: u32) -> Vec<CollectionInstance> {
+    copies
+        .iter()
+        .filter(|c| c.folder_id != to_folder)
+        .cloned()
+        .collect()
+}
+
 /// Web page of a release: the search result's uri (relative or absolute), or
 /// the generic release URL.
 pub fn release_url(uri: Option<&str>, id: u32) -> String {
@@ -126,6 +168,9 @@ mod tests {
         assert_eq!(Command::Add.key(), Key::A);
         assert_eq!(Command::Remove.key_label(), "R");
         assert_eq!(Command::Open.key_label(), "O");
+        assert_eq!(Command::Move.key(), Key::M);
+        assert_eq!(Command::Move.key_label(), "M");
+        assert!(Command::Move.needs_selection());
         assert_eq!(Command::Quit.key(), Key::Q);
         assert_eq!(Command::Quit.key_label(), "Q");
         assert!(Command::Remove.needs_selection());
@@ -189,5 +234,27 @@ mod tests {
             release_url(Some(""), 5),
             "https://www.discogs.com/release/5"
         );
+    }
+
+    #[test]
+    fn move_offers_only_confirmed_copies() {
+        assert_eq!(decide_move(None), MoveDecision::NeedsCheck);
+        assert_eq!(decide_move(Some(&[])), MoveDecision::NotOwned);
+        assert_eq!(
+            decide_move(Some(&[copy(5, 1), copy(PENDING_INSTANCE, 2)])),
+            MoveDecision::Pick(vec![copy(5, 1)])
+        );
+        assert_eq!(
+            decide_move(Some(&[copy(PENDING_INSTANCE, 2)])),
+            MoveDecision::NeedsCheck
+        );
+    }
+
+    #[test]
+    fn plan_move_skips_copies_already_in_the_target() {
+        let copies = [copy(1, 4), copy(2, 7), copy(3, 4)];
+        assert_eq!(plan_move(&copies, 4), vec![copy(2, 7)]);
+        assert_eq!(plan_move(&copies, 9), copies.to_vec());
+        assert!(plan_move(&[copy(1, 4)], 4).is_empty());
     }
 }

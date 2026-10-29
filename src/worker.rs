@@ -36,6 +36,12 @@ pub enum Request {
         release_id: u32,
         folder_id: u32,
     },
+    /// Moves copies to another folder: `(current folder, instance id)` pairs.
+    MoveCopies {
+        release_id: u32,
+        copies: Vec<(u32, u32)>,
+        to_folder: u32,
+    },
     RemoveFromCollection {
         release_id: u32,
         folder_id: u32,
@@ -76,6 +82,12 @@ pub enum Response {
     Removed {
         release_id: u32,
         result: Result<(), String>,
+    },
+    Moved {
+        release_id: u32,
+        to_folder: u32,
+        /// Number of copies moved.
+        result: Result<usize, String>,
     },
 }
 
@@ -235,6 +247,17 @@ impl State {
                     result,
                 }
             }
+            Request::MoveCopies {
+                release_id,
+                copies,
+                to_folder,
+            } => Response::Moved {
+                release_id,
+                to_folder,
+                result: self
+                    .move_copies(release_id, &copies, to_folder)
+                    .map_err(|e| format!("{e:#}")),
+            },
             Request::RemoveFromCollection {
                 release_id,
                 folder_id,
@@ -261,6 +284,17 @@ impl State {
                     .map_err(|e| format!("{e:#}")),
             },
         })
+    }
+
+    fn move_copies(&self, release_id: u32, copies: &[(u32, u32)], to_folder: u32) -> Result<usize> {
+        let username = self.username()?;
+        let client = self.client()?;
+        for (done, &(folder_id, instance_id)) in copies.iter().enumerate() {
+            client
+                .move_instance(username, folder_id, release_id, instance_id, to_folder)
+                .with_context(|| format!("moved {done} of {} copies", copies.len()))?;
+        }
+        Ok(copies.len())
     }
 
     /// Runs the search plan and returns the first non-empty result list.

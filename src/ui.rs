@@ -11,7 +11,7 @@ use std::{
 
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
 use crate::config::Settings;
-use crate::controls::{self, AddDecision, Command, PENDING_INSTANCE, RemoveDecision};
+use crate::controls::{self, AddDecision, Command, MoveDecision, PENDING_INSTANCE, RemoveDecision};
 use crate::decks;
 use crate::decks_bridge::{self, Bridge, DecksPage};
 use crate::discogs::{
@@ -36,6 +36,26 @@ const SELECTION_DEBOUNCE: Duration = Duration::from_millis(250);
 
 const THUMB_SIZE: f32 = 56.0;
 const COVER_SIZE: f32 = 220.0;
+
+/// What choosing a folder in the folder picker does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerPurpose {
+    /// Set the folder that new releases are added to.
+    SetTarget,
+    /// Move these copies of a release to the chosen folder.
+    Move {
+        release_id: u32,
+        copies: Vec<CollectionInstance>,
+    },
+}
+
+/// Popup to choose which copies of a release to move (when there are several).
+struct CopyPicker {
+    release_id: u32,
+    copies: Vec<CollectionInstance>,
+    /// 0 = all copies, i = copy i-1.
+    cursor: usize,
+}
 
 /// A destructive or unusual action waiting for Enter (yes) or Esc (no).
 enum Confirm {
@@ -81,6 +101,8 @@ pub struct RecordShelfApp {
     /// Folder that releases are added to.
     folder_selected: Option<usize>,
     confirm: Option<Confirm>,
+    picker_purpose: PickerPurpose,
+    copy_picker: Option<CopyPicker>,
     /// Known copies in the collection per release id (empty = checked, not owned).
     ownership: HashMap<u32, Vec<CollectionInstance>>,
     search_focus: bool,
@@ -131,6 +153,8 @@ impl RecordShelfApp {
             picker_cursor: None,
             folder_selected: None,
             confirm: None,
+            picker_purpose: PickerPurpose::SetTarget,
+            copy_picker: None,
             ownership: HashMap::new(),
             search_focus: false,
             search_q: String::new(),
@@ -258,7 +282,8 @@ impl RecordShelfApp {
             return;
         }
         self.notice = None;
-        self.folder_picker_open = false;
+        self.close_folder_picker();
+        self.copy_picker = None;
         self.confirm = None;
         self.search_results = items;
         self.selected_result = Some(0);
@@ -582,6 +607,25 @@ impl RecordShelfApp {
                 }
                 self.resync_collection(release_id);
             }
+            Response::Moved {
+                release_id,
+                to_folder,
+                result,
+            } => {
+                match result {
+                    Ok(count) => {
+                        let folder = self
+                            .folders
+                            .iter()
+                            .find(|f| f.id == to_folder)
+                            .map_or_else(|| format!("#{to_folder}"), |f| f.name.clone());
+                        let copies = if count == 1 { "copy" } else { "copies" };
+                        self.set_info(format!("Moved {count} {copies} to {folder}"));
+                    }
+                    Err(err) => self.set_error(err),
+                }
+                self.resync_collection(release_id);
+            }
             Response::Removed { release_id, result } => {
                 match result {
                     Ok(()) => {
@@ -713,6 +757,7 @@ impl RecordShelfApp {
         if self.folder_picker_open {
             self.show_folder_picker(ui.ctx());
         }
+        self.show_copy_picker(ui.ctx());
         self.show_confirm(ui.ctx());
 
         ui.separator();
@@ -769,13 +814,25 @@ impl RecordShelfApp {
             return;
         }
 
+        if let Some(picker) = &mut self.copy_picker {
+            let mut cursor = Some(picker.cursor);
+            step(&mut cursor, picker.copies.len() + 1, up, down);
+            picker.cursor = cursor.unwrap_or(0);
+            if enter {
+                self.choose_copies();
+            } else if esc {
+                self.copy_picker = None;
+            }
+            return;
+        }
+
         if self.folder_picker_open {
             step(&mut self.picker_cursor, self.folders.len(), up, down);
             if enter && let Some(idx) = self.picker_cursor {
                 self.choose_folder(idx);
             }
             if esc {
-                self.folder_picker_open = false;
+                self.close_folder_picker();
             }
             return;
         }
@@ -802,7 +859,11 @@ impl RecordShelfApp {
     fn show_folder_picker(&mut self, ctx: &egui::Context) {
         let mut open = true;
         let mut chosen = None;
-        egui::Window::new("Choose folder")
+        let title = match self.picker_purpose {
+            PickerPurpose::SetTarget => "Choose folder",
+            PickerPurpose::Move { .. } => "Move to folder",
+        };
+        egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .show(ctx, |ui| {
@@ -825,9 +886,116 @@ impl RecordShelfApp {
             });
         if let Some(idx) = chosen {
             self.choose_folder(idx);
-        } else {
-            self.folder_picker_open = open;
+        } else if !open {
+            self.close_folder_picker();
         }
+    }
+
+    fn close_folder_picker(&mut self) {
+        self.folder_picker_open = false;
+        self.picker_purpose = PickerPurpose::SetTarget;
+    }
+
+    fn show_copy_picker(&mut self, ctx: &egui::Context) {
+        let Some(picker) = &self.copy_picker else {
+            return;
+        };
+        let mut open = true;
+        let mut chosen = None;
+        egui::Window::new("Move which copies?")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                for idx in 0..=picker.copies.len() {
+                    let label = if idx == 0 {
+                        format!("All {} copies", picker.copies.len())
+                    } else {
+                        let copy = &picker.copies[idx - 1];
+                        format!("Copy {idx}: in {}", self.folder_name(copy.folder_id))
+                    };
+                    if ui.selectable_label(picker.cursor == idx, label).clicked() {
+                        chosen = Some(idx);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Up/Down: select   Enter: continue   Esc: cancel").small());
+            });
+        if let Some(idx) = chosen
+            && let Some(picker) = &mut self.copy_picker
+        {
+            picker.cursor = idx;
+            self.choose_copies();
+        } else if !open {
+            self.copy_picker = None;
+        }
+    }
+
+    fn folder_name(&self, id: u32) -> String {
+        self.folders
+            .iter()
+            .find(|f| f.id == id)
+            .map_or_else(|| format!("#{id}"), |f| f.name.clone())
+    }
+
+    /// Second step of a move: the copies are chosen, now pick the folder.
+    fn choose_copies(&mut self) {
+        let Some(picker) = self.copy_picker.take() else {
+            return;
+        };
+        let copies = match picker.cursor {
+            0 => picker.copies,
+            i => picker.copies.get(i - 1).cloned().into_iter().collect(),
+        };
+        self.start_move_to_folder(picker.release_id, copies);
+    }
+
+    fn start_move_to_folder(&mut self, release_id: u32, copies: Vec<CollectionInstance>) {
+        self.picker_purpose = PickerPurpose::Move { release_id, copies };
+        self.open_folder_picker_for_current();
+    }
+
+    fn move_release(&mut self, id: u32) {
+        match controls::decide_move(self.ownership.get(&id).map(Vec::as_slice)) {
+            MoveDecision::Pick(copies) if copies.len() == 1 => {
+                self.start_move_to_folder(id, copies);
+            }
+            MoveDecision::Pick(copies) => {
+                self.copy_picker = Some(CopyPicker {
+                    release_id: id,
+                    copies,
+                    cursor: 0,
+                });
+            }
+            MoveDecision::NotOwned => self.set_error("Not in your collection".to_string()),
+            MoveDecision::NeedsCheck => {
+                self.worker.send(Request::CheckOwnership(id));
+                self.set_info("Checking your collection first; press M again".to_string());
+            }
+        }
+    }
+
+    fn perform_move(&mut self, release_id: u32, copies: Vec<CollectionInstance>, to_folder: u32) {
+        let todo = controls::plan_move(&copies, to_folder);
+        if todo.is_empty() {
+            let name = self.folder_name(to_folder);
+            self.set_info(format!("Already in {name}; nothing to move"));
+            return;
+        }
+        // Optimistic: show the new folders now; the resync after the request corrects it.
+        if let Some(owned) = self.ownership.get_mut(&release_id) {
+            for copy in owned
+                .iter_mut()
+                .filter(|c| todo.iter().any(|t| t.instance_id == c.instance_id))
+            {
+                copy.folder_id = to_folder;
+            }
+        }
+        self.worker.send(Request::MoveCopies {
+            release_id,
+            copies: todo.iter().map(|c| (c.folder_id, c.instance_id)).collect(),
+            to_folder,
+        });
+        self.set_info("Moving...".to_string());
     }
 
     fn show_confirm(&mut self, ctx: &egui::Context) {
@@ -908,6 +1076,7 @@ impl RecordShelfApp {
         match cmd {
             Command::Add => self.add_release(id),
             Command::Remove => self.remove_release(id),
+            Command::Move => self.move_release(id),
             Command::Open => self.open_release(id),
             Command::ChooseFolder | Command::Quit => {}
         }
@@ -1006,7 +1175,13 @@ impl RecordShelfApp {
         }
     }
 
+    /// The folder picker for `F`: sets where new releases go.
     fn open_folder_picker(&mut self) {
+        self.picker_purpose = PickerPurpose::SetTarget;
+        self.open_folder_picker_for_current();
+    }
+
+    fn open_folder_picker_for_current(&mut self) {
         if self.folders.is_empty() {
             self.worker.send(Request::LoadFolders);
         }
@@ -1019,8 +1194,13 @@ impl RecordShelfApp {
             return;
         };
         let (id, name) = (folder.id, folder.name.clone());
+        if let PickerPurpose::Move { release_id, copies } = self.picker_purpose.clone() {
+            self.close_folder_picker();
+            self.perform_move(release_id, copies, id);
+            return;
+        }
         self.folder_selected = Some(idx);
-        self.folder_picker_open = false;
+        self.close_folder_picker();
         self.settings.folder_id = id;
         if let Some(path) = &self.config_path
             && let Err(err) = Settings::update_on_disk(path, |s| s.folder_id = id)
@@ -1043,6 +1223,7 @@ impl RecordShelfApp {
                 let label = match cmd {
                     Command::Add => format!("Add to {folder}"),
                     Command::Remove => "Remove".to_string(),
+                    Command::Move => "Move".to_string(),
                     Command::Open => "Open in browser".to_string(),
                     Command::ChooseFolder => "Change folder".to_string(),
                     Command::Quit => "Quit".to_string(),
@@ -1762,6 +1943,129 @@ mod tests {
                 "3x in your collection: Techno, Uncategorized, #9".to_string(),
                 true
             ))
+        );
+    }
+
+    #[test]
+    fn moving_a_single_copy_goes_straight_to_the_folder_picker() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        let before = app.worker.pending();
+        app.run_command(Command::Move);
+        assert!(app.folder_picker_open);
+        assert!(app.copy_picker.is_none());
+        assert_eq!(
+            app.worker.pending(),
+            before,
+            "nothing sent until a folder is chosen"
+        );
+
+        app.choose_folder(1); // Techno, id 5
+        assert!(!app.folder_picker_open);
+        assert_eq!(app.picker_purpose, PickerPurpose::SetTarget);
+        assert_eq!(app.worker.pending(), before + 1);
+        assert_eq!(app.ownership[&1], vec![copy(10, 5)]);
+        assert_eq!(
+            app.settings.folder_id, 0,
+            "moving must not change the target folder"
+        );
+    }
+
+    #[test]
+    fn moving_into_the_current_folder_does_nothing() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 5)]);
+        app.run_command(Command::Move);
+        let before = app.worker.pending();
+        app.choose_folder(1);
+        assert_eq!(app.worker.pending(), before);
+        assert_eq!(app.ownership[&1], vec![copy(10, 5)]);
+    }
+
+    #[test]
+    fn several_copies_ask_which_to_move() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1), copy(11, 1)]);
+        app.run_command(Command::Move);
+        assert!(!app.folder_picker_open);
+        assert_eq!(app.copy_picker.as_ref().map(|p| p.cursor), Some(0));
+
+        // "All copies" moves both
+        app.choose_copies();
+        assert!(app.folder_picker_open);
+        let before = app.worker.pending();
+        app.choose_folder(1);
+        assert_eq!(app.worker.pending(), before + 1);
+        assert_eq!(app.ownership[&1], vec![copy(10, 5), copy(11, 5)]);
+    }
+
+    #[test]
+    fn a_single_copy_can_be_picked_from_several() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1), copy(11, 1)]);
+        app.run_command(Command::Move);
+        app.copy_picker.as_mut().unwrap().cursor = 2; // second copy
+        app.choose_copies();
+        app.choose_folder(1);
+        assert_eq!(app.ownership[&1], vec![copy(10, 1), copy(11, 5)]);
+    }
+
+    #[test]
+    fn cancelling_the_move_picker_resets_the_purpose() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.run_command(Command::Move);
+        app.close_folder_picker();
+        assert_eq!(app.picker_purpose, PickerPurpose::SetTarget);
+        // F afterwards sets the target folder again, not a move
+        app.run_command(Command::ChooseFolder);
+        let before = app.worker.pending();
+        app.choose_folder(1);
+        assert_eq!(app.worker.pending(), before);
+        assert_eq!(app.settings.folder_id, 5);
+    }
+
+    #[test]
+    fn move_needs_an_owned_release() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, Vec::new());
+        app.run_command(Command::Move);
+        assert!(app.copy_picker.is_none() && !app.folder_picker_open);
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
+
+        let mut app = app_ready_to_add();
+        let before = app.worker.pending();
+        app.run_command(Command::Move);
+        assert_eq!(
+            app.worker.pending(),
+            before + 1,
+            "unknown status: check first"
+        );
+        assert!(!app.folder_picker_open);
+
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(PENDING_INSTANCE, 1)]);
+        app.run_command(Command::Move);
+        assert!(
+            !app.folder_picker_open,
+            "a copy still being added cannot be moved"
+        );
+    }
+
+    #[test]
+    fn finished_move_resyncs_the_collection() {
+        let mut app = app_ready_to_add();
+        let before = app.worker.pending();
+        app.handle_response(Response::Moved {
+            release_id: 1,
+            to_folder: 5,
+            result: Ok(2),
+        });
+        assert_eq!(app.worker.pending(), before + 2);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| !n.is_error && n.text.contains("2 copies"))
         );
     }
 }

@@ -94,6 +94,29 @@ impl DiscogsClient {
         Ok(())
     }
 
+    /// Moves one copy (`instance_id`) from `folder_id` to `new_folder_id`.
+    pub fn move_instance(
+        &self,
+        username: &str,
+        folder_id: u32,
+        release_id: u32,
+        instance_id: u32,
+        new_folder_id: u32,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/users/{}/collection/folders/{}/releases/{}/instances/{}",
+            self.base, username, folder_id, release_id, instance_id
+        );
+        self.http
+            .post(url)
+            .json(&serde_json::json!({ "folder_id": new_folder_id }))
+            .send()
+            .context("send move request")?
+            .error_for_status()
+            .context("Discogs collection error response")?;
+        Ok(())
+    }
+
     pub fn collection_folders(&self, username: &str) -> Result<Vec<CollectionFolder>> {
         let url = format!("{}/users/{}/collection/folders", self.base, username);
         let resp: CollectionFoldersResponse = self.get(&url, &[], "collection folders")?;
@@ -490,10 +513,29 @@ mod tests {
         );
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let n = stream.read(&mut buf).unwrap();
+            // Read headers, then as much body as Content-Length announces.
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                data.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&data).to_lowercase();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if data.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
             stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&buf[..n]).to_string()
+            String::from_utf8_lossy(&data).to_string()
         });
         (base, handle)
     }
@@ -811,5 +853,23 @@ mod tests {
             r#"{"id": 1, "formats": [{"name": "Vinyl", "descriptions": ["LP"]}, {"name": "CD"}]}"#,
         );
         assert_eq!(it.format_display(), "Vinyl, LP | CD");
+    }
+
+    #[test]
+    fn move_instance_posts_the_new_folder() {
+        let (base, server) = serve_once("204 No Content", "");
+        client(&base).move_instance("me", 3, 99, 1234, 8).unwrap();
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /users/me/collection/folders/3/releases/99/instances/1234 "),
+            "{req}"
+        );
+        assert!(req.trim_end().ends_with(r#"{"folder_id":8}"#), "{req}");
+    }
+
+    #[test]
+    fn move_instance_reports_http_errors() {
+        let (base, _server) = serve_once("404 Not Found", r#"{"message": "nope"}"#);
+        assert!(client(&base).move_instance("me", 3, 99, 1, 8).is_err());
     }
 }
