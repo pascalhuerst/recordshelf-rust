@@ -1,5 +1,6 @@
 use std::{
     io::ErrorKind,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -36,11 +37,51 @@ pub enum ScanEvent {
     Result(ScanResult),
 }
 
+/// An input device that could be a barcode scanner (it reports digit keys and Enter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputDevice {
+    pub path: PathBuf,
+    pub name: String,
+}
+
+/// Lists keyboard-like input devices. Event node numbers change between
+/// boots and USB ports, so devices are identified by name instead.
+pub fn list_devices() -> Vec<InputDevice> {
+    let mut out: Vec<InputDevice> = evdev::enumerate()
+        .filter(|(_, dev)| {
+            dev.supported_keys()
+                .is_some_and(|k| k.contains(KeyCode::KEY_ENTER) && k.contains(KeyCode::KEY_1))
+        })
+        .map(|(path, dev)| InputDevice {
+            path,
+            name: dev.name().unwrap_or_default().to_string(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Chooses the device to open: the first whose name contains `name`
+/// (case-insensitive), otherwise `fallback_path` if set.
+pub fn pick_device(devices: &[InputDevice], name: &str, fallback_path: &str) -> Option<PathBuf> {
+    let name = name.trim().to_lowercase();
+    if !name.is_empty() {
+        if let Some(dev) = devices
+            .iter()
+            .find(|d| d.name.to_lowercase().contains(&name))
+        {
+            return Some(dev.path.clone());
+        }
+    }
+    let fallback = fallback_path.trim();
+    (!fallback.is_empty()).then(|| PathBuf::from(fallback))
+}
+
 pub struct BarcodeReader;
 
 impl BarcodeReader {
     pub fn spawn(
-        device_path: String,
+        device_path: PathBuf,
         discogs: DiscogsClient,
         stop: Arc<AtomicBool>,
         tx: Sender<ScanEvent>,
@@ -55,7 +96,7 @@ impl BarcodeReader {
 }
 
 fn scanner_loop(
-    device_path: String,
+    device_path: PathBuf,
     discogs: DiscogsClient,
     stop: Arc<AtomicBool>,
     tx: Sender<ScanEvent>,
@@ -67,16 +108,28 @@ fn scanner_loop(
             emit(
                 &tx,
                 &repaint,
-                ScanEvent::Info(format!("Failed to open device {}: {err}", device_path)),
+                ScanEvent::Info(format!(
+                    "Failed to open device {}: {err}",
+                    device_path.display()
+                )),
             );
             return;
         }
     };
+    // Non-blocking so the loop can notice `stop` (e.g. when settings change).
+    if let Err(err) = device.set_nonblocking(true) {
+        emit(
+            &tx,
+            &repaint,
+            ScanEvent::Info(format!("Failed to set device non-blocking: {err}")),
+        );
+        return;
+    }
 
     emit(
         &tx,
         &repaint,
-        ScanEvent::Info(format!("Listening for scans on {}", device_path)),
+        ScanEvent::Info(format!("Listening for scans on {}", device_path.display())),
     );
 
     let mut buffer = String::new();
@@ -136,7 +189,7 @@ fn scanner_loop(
                 emit(
                     &tx,
                     &repaint,
-                    ScanEvent::Info(format!("Read error on {}: {err}", device_path)),
+                    ScanEvent::Info(format!("Read error on {}: {err}", device_path.display())),
                 );
                 thread::sleep(Duration::from_millis(25));
             }

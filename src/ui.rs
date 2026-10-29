@@ -4,8 +4,11 @@ use std::sync::{
     mpsc::Receiver,
 };
 
-use crate::Args;
+use std::path::PathBuf;
+
+use crate::barcode_reader::{self, BarcodeReader};
 use crate::barcode_reader::{ScanEvent, ScanResult};
+use crate::config::Settings;
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
@@ -18,13 +21,15 @@ pub enum Tab {
 }
 
 pub struct RecordShelfApp {
-    _args: Args,
+    settings: Settings,
+    config_path: Option<PathBuf>,
+    repaint: egui::Context,
+    scanner_stop: Arc<AtomicBool>,
     discogs: DiscogsClient,
     rx: Receiver<ScanEvent>,
     scan_results: Vec<ScanResult>,
     status: String,
     tab: Tab,
-    stop: Arc<AtomicBool>,
     username: String,
     folders: Vec<CollectionFolder>,
     folder_picker_open: bool,
@@ -43,21 +48,21 @@ pub struct RecordShelfApp {
 }
 
 impl RecordShelfApp {
-    pub fn new(
-        args: Args,
-        discogs: DiscogsClient,
-        rx: Receiver<ScanEvent>,
-        stop: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(repaint: egui::Context, settings: Settings, config_path: Option<PathBuf>) -> Self {
+        let discogs = DiscogsClient::new(&settings.user_agent, &settings.token, &settings.currency)
+            .expect("build Discogs client");
+        let (scanner_stop, rx, status) = start_scanner(&settings, &discogs, &repaint);
         Self {
-            _args: args.clone(),
+            username: settings.username.clone(),
+            settings,
+            config_path,
+            repaint,
+            scanner_stop,
             discogs,
             rx,
             scan_results: Vec::new(),
-            status: "Waiting for scans...".to_string(),
+            status,
             tab: Tab::Scan,
-            stop,
-            username: args.username.clone(),
             folders: Vec::new(),
             folder_picker_open: false,
             folder_selected: None,
@@ -331,7 +336,7 @@ impl eframe::App for RecordShelfApp {
 
 impl Drop for RecordShelfApp {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.scanner_stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -662,4 +667,33 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
             ui.hyperlink(uri);
         }
     }
+}
+
+/// Starts the scanner thread for the configured device. Returns its stop flag,
+/// the event receiver and an initial status line.
+fn start_scanner(
+    settings: &Settings,
+    discogs: &DiscogsClient,
+    repaint: &egui::Context,
+) -> (Arc<AtomicBool>, Receiver<ScanEvent>, String) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let devices = barcode_reader::list_devices();
+    let status =
+        match barcode_reader::pick_device(&devices, &settings.device_name, &settings.device_path) {
+            Some(path) => {
+                match BarcodeReader::spawn(
+                    path,
+                    discogs.clone(),
+                    stop.clone(),
+                    tx,
+                    Some(repaint.clone()),
+                ) {
+                    Ok(()) => "Waiting for scans...".to_string(),
+                    Err(err) => format!("Scanner not started: {err}"),
+                }
+            }
+            None => "No scanner configured (set device_name in the settings file)".to_string(),
+        };
+    (stop, rx, status)
 }
