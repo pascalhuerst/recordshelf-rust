@@ -10,19 +10,13 @@ use std::{
 
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
 use crate::config::Settings;
-use crate::decks::{self, DecksEntry};
+use crate::decks;
 use crate::decks_bridge::{self, Bridge, DecksPage};
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
-use crate::worker::{Request, Response, ScanResult, Worker};
+use crate::worker::{Request, Response, Worker};
 use eframe::egui::{self, Color32, RichText};
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Scan,
-    Search,
-}
 
 /// Download state of a cover picture, keyed by URL.
 enum ImageState {
@@ -55,13 +49,11 @@ pub struct RecordShelfApp {
     scanner_rx: Receiver<ScanEvent>,
     scanner_status: String,
     notice: Option<Notice>,
-    tab: Tab,
     folders: Vec<CollectionFolder>,
     folder_picker_open: bool,
     folder_selected: Option<usize>,
     /// Known copies in the collection per release id (empty = checked, not owned).
     ownership: HashMap<u32, Vec<CollectionInstance>>,
-    scan_result: Option<ScanResult>,
     search_focus: bool,
     search_q: String,
     search_artist: String,
@@ -97,12 +89,10 @@ impl RecordShelfApp {
             scanner_rx,
             scanner_status,
             notice: None,
-            tab: Tab::Scan,
             folders: Vec::new(),
             folder_picker_open: false,
             folder_selected: None,
             ownership: HashMap::new(),
-            scan_result: None,
             search_focus: false,
             search_q: String::new(),
             search_artist: String::new(),
@@ -218,13 +208,10 @@ impl RecordShelfApp {
         }
     }
 
-    /// Shows Discogs candidates for a decks entry in the Search tab and loads the first.
-    fn show_decks_candidates(&mut self, code: &str, entry: &DecksEntry, items: Vec<SearchItem>) {
+    /// Shows releases found for a scan in the results list and loads the first.
+    fn show_candidates(&mut self, items: Vec<SearchItem>, none_found: String) {
         if items.is_empty() {
-            self.set_error(format!(
-                "No Discogs release found for {code} ({} / {})",
-                entry.catno, entry.label
-            ));
+            self.set_error(none_found);
             return;
         }
         self.notice = None;
@@ -232,7 +219,6 @@ impl RecordShelfApp {
         self.search_results = items;
         self.selected_result = Some(0);
         self.selected_release = None;
-        self.tab = Tab::Search;
         self.load_selected_release();
     }
 
@@ -402,15 +388,13 @@ impl RecordShelfApp {
 
     fn handle_response(&mut self, resp: Response) {
         match resp {
-            Response::Scan(res) => {
-                if let (Some(id), Some(owned)) =
-                    (res.release.as_ref().and_then(|r| r.id), &res.owned)
-                {
-                    self.ownership.insert(id, owned.clone());
+            Response::Scan { code, result } => match result {
+                Ok(items) => {
+                    let msg = format!("No release found for {code}");
+                    self.show_candidates(items, msg);
                 }
-                self.scanner_status = format!("Last scan {} ({:.0?})", res.barcode, res.elapsed);
-                self.scan_result = Some(res);
-            }
+                Err(err) => self.set_error(err),
+            },
             Response::Search(Ok(items)) => {
                 self.selected_result = if items.is_empty() { None } else { Some(0) };
                 self.search_focus = items.is_empty();
@@ -434,7 +418,13 @@ impl RecordShelfApp {
                 entry,
                 result,
             } => match result {
-                Ok(items) => self.show_decks_candidates(&code, &entry, items),
+                Ok(items) => self.show_candidates(
+                    items,
+                    format!(
+                        "No Discogs release found for {code} ({} / {})",
+                        entry.catno, entry.label
+                    ),
+                ),
                 Err(err) => self.set_error(err),
             },
             Response::Image { url, result } => {
@@ -480,51 +470,7 @@ impl RecordShelfApp {
         }
     }
 
-    fn ui_scan(&mut self, ui: &mut egui::Ui) {
-        let cover = self
-            .scan_result
-            .as_ref()
-            .and_then(|r| r.release.as_ref()?.cover_url())
-            .map(str::to_string);
-        if let Some(url) = &cover {
-            self.ensure_image(url);
-        }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let Some(result) = &self.scan_result else {
-                    return;
-                };
-                ui.group(|ui| {
-                    if let Some(err) = &result.error {
-                        ui.colored_label(Color32::RED, format!("Error: {err}"));
-                    } else if let Some(release) = &result.release {
-                        if result.matches > 1 {
-                            ui.colored_label(
-                                Color32::LIGHT_BLUE,
-                                format!(
-                                    "{} releases share this barcode; showing the first. Use Search > Barcode to see all.",
-                                    result.matches
-                                ),
-                            );
-                        }
-                        ui.horizontal_top(|ui| {
-                            if let Some(url) = &cover {
-                                draw_image(ui, &self.images, url, COVER_SIZE);
-                            }
-                            ui.vertical(|ui| {
-                                render_ownership(ui, result.owned.as_deref(), &self.folders);
-                                render_release(ui, release);
-                            });
-                        });
-                    } else {
-                        ui.label("No data");
-                    }
-                });
-            });
-    }
-
-    fn ui_search(&mut self, ui: &mut egui::Ui) {
+    fn ui_main(&mut self, ui: &mut egui::Ui) {
         let mut trigger_search = false;
         let mut search_fields_active = false;
         if let Some(info) = &self.decks_info {
@@ -808,8 +754,6 @@ impl eframe::App for RecordShelfApp {
             ui.horizontal(|ui| {
                 ui.heading("RecordShelf");
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Scan, "Scan");
-                ui.selectable_value(&mut self.tab, Tab::Search, "Search");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::widgets::global_dark_light_mode_switch(ui);
                     if ui.button("Settings").clicked() {
@@ -848,10 +792,7 @@ impl eframe::App for RecordShelfApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Scan => self.ui_scan(ui),
-            Tab::Search => self.ui_search(ui),
-        });
+        egui::CentralPanel::default().show(ctx, |ui| self.ui_main(ui));
 
         if self.settings_open {
             self.show_settings(ctx);

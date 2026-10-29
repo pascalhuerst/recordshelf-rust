@@ -1,7 +1,6 @@
 use std::{
     sync::mpsc::{Receiver, Sender, channel},
     thread,
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -40,7 +39,11 @@ pub enum Request {
 }
 
 pub enum Response {
-    Scan(ScanResult),
+    /// Releases found for a scanned code (one for a release id, any number for a barcode).
+    Scan {
+        code: String,
+        result: Result<Vec<SearchItem>, String>,
+    },
     Search(Result<Vec<SearchItem>, String>),
     Release {
         id: u32,
@@ -65,18 +68,6 @@ pub enum Response {
         folder_id: u32,
         result: Result<(), String>,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct ScanResult {
-    pub barcode: String,
-    pub release: Option<Release>,
-    /// Copies already in the collection; `None` if unknown (no username, or the check failed).
-    pub owned: Option<Vec<CollectionInstance>>,
-    /// How many releases Discogs knows for a scanned barcode (1 for a release id).
-    pub matches: usize,
-    pub error: Option<String>,
-    pub elapsed: Duration,
 }
 
 /// Handle to the background threads that talk to Discogs, so the UI thread
@@ -191,7 +182,10 @@ impl State {
                 self.username = username;
                 return None;
             }
-            Request::Scan(code) => Response::Scan(self.scan(code)),
+            Request::Scan(code) => {
+                let result = self.scan(&code).map_err(|e| format!("{e:#}"));
+                Response::Scan { code, result }
+            }
             Request::Search(query) => Response::Search(
                 self.client()
                     .and_then(|c| c.search(&query))
@@ -258,56 +252,22 @@ impl State {
         Ok(Vec::new())
     }
 
-    fn scan(&self, code: String) -> ScanResult {
-        let start = Instant::now();
-        let lookup = self.lookup_scan(&code);
-        let elapsed = start.elapsed();
-        match lookup {
-            Ok((release, owned, matches)) => ScanResult {
-                barcode: code,
-                release: Some(release),
-                owned,
-                matches,
-                error: None,
-                elapsed,
-            },
-            Err(err) => ScanResult {
-                barcode: code,
-                release: None,
-                owned: None,
-                matches: 0,
-                error: Some(format!("{err:#}")),
-                elapsed,
-            },
-        }
-    }
-
-    fn lookup_scan(&self, code: &str) -> Result<(Release, Option<Vec<CollectionInstance>>, usize)> {
+    fn scan(&self, code: &str) -> Result<Vec<SearchItem>> {
         let client = self.client()?;
-        let (id, matches) = match ScanCode::classify(code)? {
-            ScanCode::ReleaseId(id) => (id, 1),
-            ScanCode::Barcode(barcode) => {
-                let found = client.search(&SearchQuery {
-                    barcode: Some(barcode.clone()),
-                    kind: Some("release".to_string()),
-                    per_page: Some(10),
-                    ..Default::default()
-                })?;
-                let id = found
-                    .results
-                    .iter()
-                    .find_map(|item| item.id)
-                    .with_context(|| format!("no release found for barcode {barcode}"))?;
-                (id, found.results.len())
+        match ScanCode::classify(code)? {
+            ScanCode::ReleaseId(id) => {
+                let release = client.release(id)?;
+                Ok(vec![SearchItem::from_release(id, &release)])
             }
-        };
-        let release = client.release(id)?;
-        // Ownership is best effort: a failed check must not hide the release.
-        let owned = self
-            .username()
-            .and_then(|u| client.collection_instances(u, id))
-            .ok();
-        Ok((release, owned, matches))
+            ScanCode::Barcode(barcode) => Ok(client
+                .search(&SearchQuery {
+                    barcode: Some(barcode),
+                    kind: Some("release".to_string()),
+                    per_page: Some(25),
+                    ..Default::default()
+                })?
+                .results),
+        }
     }
 }
 
@@ -338,6 +298,7 @@ impl ScanCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn short_numbers_are_release_ids() {

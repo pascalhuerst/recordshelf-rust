@@ -14,7 +14,7 @@ Records bought at decks.de carry a label barcode with the shop's internal code (
    1. catalog number + label
    2. catalog number only
    3. artist + title (remarks in parentheses removed)
-6. The candidates appear in the Search tab, the first is loaded with the collection check. `A` adds it to a folder.
+6. The candidates fill the results list, the first is loaded with the collection check. `A` adds it to a folder.
 
 ## Result page structure (as of Oct 2026)
 Server-rendered HTML, `iso-8859-1`, one block per release:

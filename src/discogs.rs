@@ -216,6 +216,55 @@ pub struct SearchItem {
     pub thumb: Option<String>,
 }
 impl SearchItem {
+    /// Builds a result row from a full release, e.g. after looking one up by id.
+    pub fn from_release(id: u32, release: &Release) -> Self {
+        let names = |f: fn(&Label) -> Option<&String>| -> Vec<String> {
+            release
+                .labels
+                .iter()
+                .flatten()
+                .filter_map(f)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect()
+        };
+        let artists = release
+            .artists
+            .iter()
+            .flatten()
+            .filter_map(|a| a.name.as_deref())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let title = release.title.clone().unwrap_or_default();
+        let formats: Vec<String> = release
+            .formats
+            .iter()
+            .flatten()
+            .flat_map(|f| f.name.iter().chain(f.descriptions.iter().flatten()))
+            .cloned()
+            .collect();
+        Self {
+            id: Some(id),
+            title: Some(if artists.is_empty() {
+                title
+            } else {
+                format!("{artists} - {title}")
+            }),
+            artist: (!artists.is_empty()).then_some(artists),
+            year: release.year,
+            country: release.country.clone(),
+            label: Some(names(|l| l.name.as_ref())),
+            catno: names(|l| l.catno.as_ref()).into_iter().next(),
+            format_descriptions: Some(formats),
+            uri: release.uri.clone(),
+            thumb: release
+                .images
+                .iter()
+                .flatten()
+                .find_map(|i| i.uri150.clone().filter(|u| !u.is_empty())),
+        }
+    }
+
     pub fn title_display(&self) -> String {
         self.title.clone().unwrap_or_default()
     }
@@ -608,5 +657,33 @@ mod tests {
         ] {
             assert!(c.image(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn search_item_from_release_collects_display_fields() {
+        let r: Release = serde_json::from_str(
+            r#"{"title": "Blue", "artists": [{"name": "Joni Mitchell"}], "year": 1971, "country": "US",
+                "labels": [{"name": "Reprise", "catno": "MS 2038"}],
+                "formats": [{"name": "Vinyl", "descriptions": ["LP", "Album"]}],
+                "images": [{"type": "primary", "uri": "https://i.discogs.com/a.jpg", "uri150": "https://i.discogs.com/t.jpg"}],
+                "uri": "https://www.discogs.com/release/1"}"#,
+        )
+        .unwrap();
+        let it = SearchItem::from_release(1, &r);
+        assert_eq!(it.id, Some(1));
+        assert_eq!(it.title_display(), "Joni Mitchell - Blue");
+        assert_eq!(it.label_display(), "Reprise (MS 2038)");
+        assert_eq!(it.format_display(), "Vinyl, LP, Album");
+        assert_eq!(it.year, Some(1971));
+        assert_eq!(it.thumb.as_deref(), Some("https://i.discogs.com/t.jpg"));
+    }
+
+    #[test]
+    fn search_item_from_sparse_release_does_not_panic() {
+        let r: Release = serde_json::from_str("{}").unwrap();
+        let it = SearchItem::from_release(5, &r);
+        assert_eq!(it.id, Some(5));
+        assert_eq!(it.title_display(), "");
+        assert_eq!(it.label_display(), "");
     }
 }
