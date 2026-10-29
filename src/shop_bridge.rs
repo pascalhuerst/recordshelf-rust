@@ -1,9 +1,10 @@
-//! Temporary localhost bridge between the app and a browser userscript.
+//! Localhost bridge between the app and a browser userscript.
 //!
-//! decks.de sits behind a bot check that only a real browser passes, so the
-//! browser does the shop lookup: the userscript polls `/pending` for scanned
-//! codes, runs the shop search on a decks.de tab and posts the result page
-//! back to `/result`. The app then parses it (see `decks`).
+//! The shops (decks.de, hhv.de) sit behind bot checks that only a real browser
+//! passes, so the browser does the shop lookup: the userscript polls
+//! `/pending?shop=...` for scanned codes, runs the shop's search on an open tab
+//! of that shop and posts the result page back to `/result`. The app then
+//! parses it (see `decks` and `hhv`).
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -18,7 +19,8 @@ use std::{
 use anyhow::{Context, Result};
 use eframe::egui;
 
-use crate::decks::{DecksEntry, parse_results};
+use crate::shops::{Shop, ShopEntry};
+use crate::{decks, hhv};
 
 pub const DEFAULT_PORT: u16 = 47321;
 const MAX_BODY: u64 = 5 * 1024 * 1024;
@@ -26,24 +28,25 @@ const CONNECTED_WITHIN: Duration = Duration::from_secs(5);
 
 /// Result of one shop lookup, as reported by the browser.
 #[derive(Debug)]
-pub struct DecksPage {
+pub struct ShopPage {
+    pub shop: Shop,
     pub code: String,
     /// HTTP status the browser saw, if it reported one.
     pub status: Option<u16>,
-    pub entries: Vec<DecksEntry>,
+    pub entries: Vec<ShopEntry>,
 }
 
 #[derive(Default)]
 struct Shared {
-    pending: Mutex<VecDeque<String>>,
-    last_poll: Mutex<Option<Instant>>,
+    pending: Mutex<VecDeque<(Shop, String)>>,
+    last_poll: Mutex<HashMap<Shop, Instant>>,
 }
 
 #[derive(Clone)]
 pub struct Bridge {
     shared: Arc<Shared>,
     token: String,
-    tx: Sender<DecksPage>,
+    tx: Sender<ShopPage>,
 }
 
 impl Bridge {
@@ -51,7 +54,7 @@ impl Bridge {
     pub fn spawn(
         port: u16,
         token: String,
-        tx: Sender<DecksPage>,
+        tx: Sender<ShopPage>,
         repaint: egui::Context,
     ) -> Result<Self> {
         let server = tiny_http::Server::http(("127.0.0.1", port))
@@ -81,22 +84,23 @@ impl Bridge {
         Ok(bridge)
     }
 
-    /// Queues a scanned code for the browser to look up.
-    pub fn enqueue(&self, code: String) {
-        self.shared.pending.lock().unwrap().push_back(code);
+    /// Queues a scanned code for the browser to look up in `shop`.
+    pub fn enqueue(&self, shop: Shop, code: String) {
+        self.shared.pending.lock().unwrap().push_back((shop, code));
     }
 
-    /// Whether the userscript has polled recently.
-    pub fn connected(&self) -> bool {
+    /// Whether a tab of `shop` has polled recently.
+    pub fn connected(&self, shop: Shop) -> bool {
         self.shared
             .last_poll
             .lock()
             .unwrap()
+            .get(&shop)
             .is_some_and(|t| t.elapsed() < CONNECTED_WITHIN)
     }
 
     /// Routes one request. Returns the status code and response body.
-    fn handle(&self, method: &str, url: &str, body: &str) -> (u16, String) {
+    pub(crate) fn handle(&self, method: &str, url: &str, body: &str) -> (u16, String) {
         let Ok(parsed) = url::Url::parse(&format!("http://localhost{url}")) else {
             return (400, "bad url".into());
         };
@@ -104,10 +108,26 @@ impl Bridge {
         if query.get("token") != Some(&self.token) {
             return (403, "bad token".into());
         }
+        // Scripts from before hhv.de support do not send `shop`; they are decks.de only.
+        let shop = match query.get("shop") {
+            None => Shop::Decks,
+            Some(key) => match Shop::from_key(key) {
+                Some(shop) => shop,
+                None => return (400, "unknown shop".into()),
+            },
+        };
         match (method, parsed.path()) {
             ("GET", "/pending") => {
-                *self.shared.last_poll.lock().unwrap() = Some(Instant::now());
-                let codes: Vec<String> = self.shared.pending.lock().unwrap().drain(..).collect();
+                self.shared
+                    .last_poll
+                    .lock()
+                    .unwrap()
+                    .insert(shop, Instant::now());
+                let mut pending = self.shared.pending.lock().unwrap();
+                let (mine, others): (VecDeque<_>, VecDeque<_>) =
+                    pending.drain(..).partition(|(s, _)| *s == shop);
+                *pending = others;
+                let codes: Vec<String> = mine.into_iter().map(|(_, code)| code).collect();
                 (
                     200,
                     serde_json::to_string(&codes).unwrap_or_else(|_| "[]".into()),
@@ -117,10 +137,15 @@ impl Bridge {
                 let Some(code) = query.get("code") else {
                     return (400, "missing code".into());
                 };
-                let _ = self.tx.send(DecksPage {
+                let entries = match shop {
+                    Shop::Decks => decks::parse_results(body),
+                    Shop::Hhv => hhv::parse_results(body),
+                };
+                let _ = self.tx.send(ShopPage {
+                    shop,
                     code: code.clone(),
                     status: query.get("status").and_then(|s| s.parse().ok()),
-                    entries: parse_results(body),
+                    entries,
                 });
                 (200, "ok".into())
             }
@@ -153,15 +178,19 @@ pub fn load_or_create_token(dir: &Path) -> Result<String> {
     Ok(token)
 }
 
-/// Userscript (Tampermonkey/Violentmonkey) for the decks.de tab.
+/// Version of the userscript; bump when it changes so that it is clear it must be reinstalled.
+pub const USERSCRIPT_VERSION: u32 = 2;
+
+/// Userscript (Tampermonkey/Violentmonkey) for the shop tabs.
 pub fn userscript(port: u16, token: &str) -> String {
     format!(
         r#"// ==UserScript==
-// @name         RecordShelf decks.de bridge
+// @name         RecordShelf shop bridge
 // @namespace    recordshelf
-// @version      1
-// @description  Looks up scanned decks.de codes for the RecordShelf app
+// @version      {version}
+// @description  Looks up scanned decks.de / hhv.de codes for the RecordShelf app
 // @match        https://www.decks.de/*
+// @match        https://www.hhv.de/*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
 // @run-at       document-idle
@@ -172,11 +201,31 @@ pub fn userscript(port: u16, token: &str) -> String {
   const BASE = 'http://127.0.0.1:{port}';
   const TOKEN = '{token}';
 
+  // Each shop: its name for the app, how to build the search request, and the
+  // page's character set.
+  const SHOPS = {{
+    'www.decks.de': {{
+      key: 'decks',
+      charset: 'iso-8859-1',
+      url: (code) => '/decks/workfloor/search_db.php?' + new URLSearchParams({{
+        such: code.replace('/', ' '), wosuch: 'all', wassuch: 'atl', where: '',
+      }}),
+    }},
+    'www.hhv.de': {{
+      key: 'hhv',
+      charset: 'utf-8',
+      // redirects to the article page when the number is an article number
+      url: (code) => '/katalog/filter/suche-S11?' + new URLSearchParams({{ af: 'true', term: code }}),
+    }},
+  }};
+  const shop = SHOPS[location.hostname];
+  if (!shop) return;
+
   const app = (method, path, params, data) =>
     new Promise((resolve, reject) =>
       GM_xmlhttpRequest({{
         method,
-        url: BASE + path + '?' + new URLSearchParams({{ token: TOKEN, ...params }}),
+        url: BASE + path + '?' + new URLSearchParams({{ token: TOKEN, shop: shop.key, ...params }}),
         data,
         headers: {{ 'Content-Type': 'text/html; charset=utf-8' }},
         onload: resolve,
@@ -185,14 +234,11 @@ pub fn userscript(port: u16, token: &str) -> String {
       }}));
 
   async function lookup(code) {{
-    const term = code.replace('/', ' ');
-    const url = '/decks/workfloor/search_db.php?' +
-      new URLSearchParams({{ such: term, wosuch: 'all', wassuch: 'atl', where: '' }});
     let status = 0, html = '';
     try {{
-      const resp = await fetch(url, {{ credentials: 'same-origin' }});
+      const resp = await fetch(shop.url(code), {{ credentials: 'same-origin' }});
       status = resp.status;
-      html = new TextDecoder('iso-8859-1').decode(await resp.arrayBuffer());
+      html = new TextDecoder(shop.charset).decode(await resp.arrayBuffer());
     }} catch (e) {{ /* reported as status 0 */ }}
     await app('POST', '/result', {{ code, status }}, html);
   }}
@@ -206,7 +252,8 @@ pub fn userscript(port: u16, token: &str) -> String {
   }}
   tick();
 }})();
-"#
+"#,
+        version = USERSCRIPT_VERSION
     )
 }
 
@@ -215,7 +262,10 @@ mod tests {
     use super::*;
     use std::sync::mpsc::{Receiver, channel};
 
-    fn bridge() -> (Bridge, Receiver<DecksPage>) {
+    const DECKS_PAGE: &str = include_str!("../tests/fixtures/decks_search_cnf_o1.html");
+    const HHV_PAGE: &str = include_str!("../tests/fixtures/hhv_product_525768.html");
+
+    fn bridge() -> (Bridge, Receiver<ShopPage>) {
         let (tx, rx) = channel();
         let bridge = Bridge {
             shared: Arc::new(Shared::default()),
@@ -230,36 +280,100 @@ mod tests {
         let (b, _rx) = bridge();
         assert_eq!(b.handle("GET", "/pending", "").0, 403);
         assert_eq!(b.handle("GET", "/pending?token=nope", "").0, 403);
-        assert!(!b.connected(), "unauthenticated polls must not count");
+        assert!(
+            !b.connected(Shop::Decks),
+            "unauthenticated polls must not count"
+        );
     }
 
     #[test]
     fn pending_codes_are_handed_out_once() {
         let (b, _rx) = bridge();
-        assert!(!b.connected());
-        b.enqueue("CNF/O1".into());
-        b.enqueue("CN9/FV".into());
-        let (status, body) = b.handle("GET", "/pending?token=secret", "");
+        assert!(!b.connected(Shop::Decks));
+        b.enqueue(Shop::Decks, "CNF/O1".into());
+        b.enqueue(Shop::Decks, "CN9/FV".into());
+        let (status, body) = b.handle("GET", "/pending?token=secret&shop=decks", "");
         assert_eq!(status, 200);
         assert_eq!(body, r#"["CNF/O1","CN9/FV"]"#);
-        assert_eq!(b.handle("GET", "/pending?token=secret", "").1, "[]");
-        assert!(b.connected());
+        assert_eq!(
+            b.handle("GET", "/pending?token=secret&shop=decks", "").1,
+            "[]"
+        );
+        assert!(b.connected(Shop::Decks));
     }
 
     #[test]
-    fn result_is_parsed_and_forwarded() {
+    fn each_shop_only_gets_its_own_codes() {
+        let (b, _rx) = bridge();
+        b.enqueue(Shop::Decks, "CNF/O1".into());
+        b.enqueue(Shop::Hhv, "525768".into());
+        assert_eq!(
+            b.handle("GET", "/pending?token=secret&shop=hhv", "").1,
+            r#"["525768"]"#
+        );
+        assert!(b.connected(Shop::Hhv));
+        assert!(!b.connected(Shop::Decks), "the decks tab has not polled");
+        assert_eq!(
+            b.handle("GET", "/pending?token=secret&shop=decks", "").1,
+            r#"["CNF/O1"]"#
+        );
+        assert!(b.connected(Shop::Decks));
+    }
+
+    #[test]
+    fn scripts_without_a_shop_are_treated_as_decks() {
         let (b, rx) = bridge();
-        let html = include_str!("../tests/fixtures/decks_search_cnf_o1.html");
-        let (status, _) = b.handle(
+        b.enqueue(Shop::Decks, "CNF/O1".into());
+        assert_eq!(
+            b.handle("GET", "/pending?token=secret", "").1,
+            r#"["CNF/O1"]"#
+        );
+        assert!(b.connected(Shop::Decks));
+        b.handle(
             "POST",
             "/result?token=secret&code=CNF%2FO1&status=200",
-            html,
+            DECKS_PAGE,
+        );
+        assert_eq!(rx.try_recv().unwrap().shop, Shop::Decks);
+    }
+
+    #[test]
+    fn unknown_shops_are_rejected() {
+        let (b, _rx) = bridge();
+        assert_eq!(
+            b.handle("GET", "/pending?token=secret&shop=nope", "").0,
+            400
+        );
+    }
+
+    #[test]
+    fn decks_result_is_parsed_and_forwarded() {
+        let (b, rx) = bridge();
+        let (status, _) = b.handle(
+            "POST",
+            "/result?token=secret&shop=decks&code=CNF%2FO1&status=200",
+            DECKS_PAGE,
         );
         assert_eq!(status, 200);
         let page = rx.try_recv().unwrap();
+        assert_eq!(page.shop, Shop::Decks);
         assert_eq!(page.code, "CNF/O1");
         assert_eq!(page.status, Some(200));
         assert_eq!(page.entries.len(), 2);
+    }
+
+    #[test]
+    fn hhv_result_is_parsed_with_the_hhv_parser() {
+        let (b, rx) = bridge();
+        b.handle(
+            "POST",
+            "/result?token=secret&shop=hhv&code=525768&status=200",
+            HHV_PAGE,
+        );
+        let page = rx.try_recv().unwrap();
+        assert_eq!(page.shop, Shop::Hhv);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].catno, "Kompakt Ex 095");
     }
 
     #[test]
@@ -267,8 +381,8 @@ mod tests {
         let (b, rx) = bridge();
         b.handle(
             "POST",
-            "/result?token=secret&code=A%2FB&status=403",
-            "Just a moment...",
+            "/result?token=secret&shop=hhv&code=525768&status=403",
+            "<html>bot check</html>",
         );
         let page = rx.try_recv().unwrap();
         assert_eq!(page.status, Some(403));
@@ -302,11 +416,15 @@ mod tests {
     }
 
     #[test]
-    fn userscript_embeds_port_and_token() {
+    fn userscript_embeds_port_token_and_both_shops() {
         let script = userscript(4711, "abc123");
         assert!(script.contains("http://127.0.0.1:4711"));
         assert!(script.contains("'abc123'"));
         assert!(script.contains("@grant        GM_xmlhttpRequest"));
+        assert!(script.contains("// @match        https://www.decks.de/*"));
+        assert!(script.contains("// @match        https://www.hhv.de/*"));
+        assert!(script.contains(&format!("@version      {USERSCRIPT_VERSION}")));
+        assert!(script.contains("/katalog/filter/suche-S11"));
     }
 
     #[test]
@@ -317,11 +435,13 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         let b = Bridge::spawn(port, "tok".into(), tx, egui::Context::default()).unwrap();
-        b.enqueue("CNF/O1".into());
-        let body = reqwest::blocking::get(format!("http://127.0.0.1:{port}/pending?token=tok"))
-            .unwrap()
-            .text()
-            .unwrap();
-        assert_eq!(body, r#"["CNF/O1"]"#);
+        b.enqueue(Shop::Hhv, "525768".into());
+        let body = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{port}/pending?token=tok&shop=hhv"
+        ))
+        .unwrap()
+        .text()
+        .unwrap();
+        assert_eq!(body, r#"["525768"]"#);
     }
 }

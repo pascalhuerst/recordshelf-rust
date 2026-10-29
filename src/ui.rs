@@ -12,12 +12,12 @@ use std::{
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
 use crate::config::Settings;
 use crate::controls::{self, AddDecision, Command, MoveDecision, PENDING_INSTANCE, RemoveDecision};
-use crate::decks;
-use crate::decks_bridge::{self, Bridge, DecksPage};
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
     format_line,
 };
+use crate::shop_bridge::{self, Bridge, ShopPage};
+use crate::shops::{self, Route, Shop};
 use crate::worker::{Request, Response, Worker};
 use eframe::egui::{self, Color32, RichText};
 
@@ -73,10 +73,10 @@ enum Confirm {
     },
 }
 
-/// The decks.de bridge: localhost server plus the channel for its results.
-struct DecksState {
+/// The shop bridge: localhost server plus the channel for its results.
+struct BridgeState {
     bridge: Bridge,
-    rx: Receiver<DecksPage>,
+    rx: Receiver<ShopPage>,
 }
 
 /// One-line message for the status bar.
@@ -123,8 +123,8 @@ pub struct RecordShelfApp {
     selection_changed: Instant,
     settings_open: bool,
     images: HashMap<String, ImageState>,
-    decks: Option<DecksState>,
-    decks_info: Option<String>,
+    bridge: Option<BridgeState>,
+    shop_info: Option<String>,
     settings_draft: Settings,
     devices: Vec<InputDevice>,
 }
@@ -134,7 +134,7 @@ impl RecordShelfApp {
         repaint: egui::Context,
         settings: Settings,
         config_path: Option<PathBuf>,
-        decks_port: Option<u16>,
+        bridge_port: Option<u16>,
     ) -> Self {
         egui_extras::install_image_loaders(&repaint);
         repaint.set_zoom_factor(settings.zoom());
@@ -171,14 +171,14 @@ impl RecordShelfApp {
             selection_changed: Instant::now(),
             settings_open: false,
             images: HashMap::new(),
-            decks: None,
-            decks_info: None,
+            bridge: None,
+            shop_info: None,
             settings_draft: Settings::default(),
             devices: Vec::new(),
         };
         app.configure_worker();
-        if let Some(port) = decks_port {
-            app.start_decks_bridge(port);
+        if let Some(port) = bridge_port {
+            app.start_bridge(port);
         }
         if !app.settings.has_token() {
             app.open_settings();
@@ -218,58 +218,79 @@ impl RecordShelfApp {
     }
 
     /// Starts the localhost bridge and writes the userscript next to the settings file.
-    fn start_decks_bridge(&mut self, port: u16) {
+    fn start_bridge(&mut self, port: u16) {
         let Some(dir) = self.config_path.as_ref().and_then(|p| p.parent()) else {
-            self.set_error("decks bridge needs a config directory".to_string());
+            self.set_error("shop bridge needs a config directory".to_string());
             return;
         };
-        let script_path = dir.join("decks.user.js");
-        let result = decks_bridge::load_or_create_token(dir).and_then(|token| {
-            std::fs::write(&script_path, decks_bridge::userscript(port, &token))?;
+        let script_path = dir.join("recordshelf.user.js");
+        let result = shop_bridge::load_or_create_token(dir).and_then(|token| {
+            std::fs::write(&script_path, shop_bridge::userscript(port, &token))?;
             let (tx, rx) = std::sync::mpsc::channel();
             let bridge = Bridge::spawn(port, token, tx, self.repaint.clone())?;
-            Ok(DecksState { bridge, rx })
+            Ok(BridgeState { bridge, rx })
         });
         match result {
             Ok(state) => {
-                self.decks = Some(state);
+                self.bridge = Some(state);
                 self.set_info(format!(
-                    "decks bridge on 127.0.0.1:{port}; install userscript {}",
+                    "shop bridge on 127.0.0.1:{port}; install userscript {}",
                     script_path.display()
                 ));
             }
-            Err(err) => self.set_error(format!("decks bridge: {err:#}")),
+            Err(err) => self.set_error(format!("shop bridge: {err:#}")),
         }
     }
 
-    fn handle_decks_page(&mut self, page: DecksPage) {
-        let code = page.code;
-        if page.status != Some(200) {
-            let status = page
-                .status
-                .map_or("no reply".to_string(), |s| s.to_string());
-            self.decks_info = None;
+    /// Sends a scanned code to the browser tab of its shop.
+    fn lookup_in_shop(&mut self, shop: Shop, code: String) {
+        if let Some(state) = &self.bridge {
+            self.shop_info = Some(format!(
+                "{} {code}: waiting for the browser...",
+                shop.name()
+            ));
+            state.bridge.enqueue(shop, code);
+        }
+    }
+
+    fn handle_shop_page(&mut self, page: ShopPage) {
+        let ShopPage {
+            shop,
+            code,
+            status,
+            entries,
+        } = page;
+        let name = shop.name();
+        if status != Some(200) {
+            let status = status.map_or("no reply".to_string(), |s| s.to_string());
+            self.shop_info = None;
             self.set_error(format!(
-                "decks.de lookup for {code} failed ({status}); reload the decks.de tab"
+                "{name} lookup for {code} failed ({status}); reload the {name} tab"
             ));
             return;
         }
-        match decks::find_entry(&code, &page.entries) {
+        match shops::find_entry(shop, &code, &entries) {
             Some(entry) => {
-                self.decks_info = Some(format!(
-                    "decks {code}: {} - {} | {} | {}",
+                self.shop_info = Some(format!(
+                    "{name} {code}: {} - {} | {} | {}",
                     entry.artist, entry.title, entry.catno, entry.label
                 ));
-                self.worker.send(Request::DecksLookup {
+                self.worker.send(Request::ShopLookup {
+                    shop,
                     code,
                     entry: entry.clone(),
                 });
             }
             None => {
-                self.decks_info = None;
+                self.shop_info = None;
+                let hint = if entries.is_empty() {
+                    format!("; if you are sure it exists, reload the {name} tab")
+                } else {
+                    String::new()
+                };
                 self.set_error(format!(
-                    "decks.de has no exact match for {code} ({} results)",
-                    page.entries.len()
+                    "{name} has no exact match for {code} ({} results){hint}",
+                    entries.len()
                 ));
             }
         }
@@ -483,36 +504,48 @@ impl RecordShelfApp {
             .and_then(|item| item.id)
     }
 
+    /// Sends a scanned code to the shop browser tab or to Discogs.
+    fn route_scan(&mut self, code: String) {
+        let route = shops::route_scan(&code, self.bridge.is_some(), |shop| {
+            self.bridge
+                .as_ref()
+                .is_some_and(|b| b.bridge.connected(shop))
+        });
+        match route {
+            Route::Shop(shop) => self.lookup_in_shop(shop, code),
+            Route::ShopUnavailable(shop) if self.bridge.is_none() => {
+                self.set_error(format!(
+                    "{code} looks like a {} code; start with --shop-bridge",
+                    shop.name()
+                ));
+            }
+            Route::ShopUnavailable(shop) => {
+                let name = shop.name();
+                self.set_error(format!(
+                    "{code} looks like a {name} code, but no {name} tab is connected (open {name} with the userscript installed)"
+                ));
+            }
+            Route::Discogs => self.worker.send(Request::Scan(code)),
+        }
+    }
+
     fn drain_events(&mut self) {
         while let Ok(ev) = self.scanner_rx.try_recv() {
             match ev {
                 ScanEvent::Info(msg) => self.scanner_status = msg,
                 ScanEvent::Code(code) => {
                     self.scanner_status = format!("Scanned {code}");
-                    if decks::is_decks_code(&code) {
-                        match &self.decks {
-                            Some(state) => {
-                                self.decks_info =
-                                    Some(format!("decks {code}: waiting for the browser..."));
-                                state.bridge.enqueue(code);
-                            }
-                            None => self.set_error(format!(
-                                "{code} looks like a decks.de code; start with --decks-bridge"
-                            )),
-                        }
-                    } else {
-                        self.worker.send(Request::Scan(code));
-                    }
+                    self.route_scan(code);
                 }
             }
         }
-        let pages: Vec<DecksPage> = self
-            .decks
+        let pages: Vec<ShopPage> = self
+            .bridge
             .as_ref()
-            .map(|d| d.rx.try_iter().collect())
+            .map(|b| b.rx.try_iter().collect())
             .unwrap_or_default();
         for page in pages {
-            self.handle_decks_page(page);
+            self.handle_shop_page(page);
         }
         for resp in self.worker.poll() {
             self.handle_response(resp);
@@ -546,7 +579,8 @@ impl RecordShelfApp {
                     self.set_error(format!("{err} (press Enter to retry)"));
                 }
             },
-            Response::Decks {
+            Response::Shop {
+                shop,
                 code,
                 entry,
                 result,
@@ -554,8 +588,10 @@ impl RecordShelfApp {
                 Ok(items) => self.show_candidates(
                     items,
                     format!(
-                        "No Discogs release found for {code} ({} / {})",
-                        entry.catno, entry.label
+                        "No Discogs release found for {} {code} ({} / {})",
+                        shop.name(),
+                        entry.catno,
+                        entry.label
                     ),
                 ),
                 Err(err) => self.set_error(err),
@@ -648,7 +684,7 @@ impl RecordShelfApp {
     fn ui_main(&mut self, ui: &mut egui::Ui) {
         let mut trigger_search = false;
         let mut search_fields_active = false;
-        if let Some(info) = &self.decks_info {
+        if let Some(info) = &self.shop_info {
             ui.colored_label(Color32::LIGHT_BLUE, info);
         }
         let focus = std::mem::take(&mut self.search_focus);
@@ -1280,8 +1316,8 @@ impl eframe::App for RecordShelfApp {
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
-        if self.decks.is_some() {
-            // Keeps the "browser connected" indicator fresh.
+        if self.bridge.is_some() {
+            // Keeps the "browser connected" indicators fresh.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
 
@@ -1301,12 +1337,20 @@ impl eframe::App for RecordShelfApp {
         egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.scanner_status);
-                if let Some(state) = &self.decks {
-                    ui.separator();
-                    if state.bridge.connected() {
-                        ui.colored_label(Color32::LIGHT_GREEN, "decks: browser connected");
-                    } else {
-                        ui.colored_label(Color32::YELLOW, "decks: browser not connected");
+                if let Some(state) = &self.bridge {
+                    for shop in Shop::ALL {
+                        ui.separator();
+                        if state.bridge.connected(shop) {
+                            ui.colored_label(
+                                Color32::LIGHT_GREEN,
+                                format!("{}: connected", shop.name()),
+                            );
+                        } else {
+                            ui.colored_label(
+                                Color32::YELLOW,
+                                format!("{}: not connected", shop.name()),
+                            );
+                        }
                     }
                 }
                 if let Some(notice) = &self.notice {
@@ -2067,5 +2111,142 @@ mod tests {
                 .as_ref()
                 .is_some_and(|n| !n.is_error && n.text.contains("2 copies"))
         );
+    }
+
+    fn app_with_bridge() -> RecordShelfApp {
+        let mut app = app_with_results(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bridge = Bridge::spawn(0, "t".into(), tx, egui::Context::default()).unwrap();
+        app.bridge = Some(BridgeState { bridge, rx });
+        app
+    }
+
+    fn connect(app: &RecordShelfApp, shop: Shop) {
+        let path = format!("/pending?token=t&shop={}", shop.key());
+        app.bridge.as_ref().unwrap().bridge.handle("GET", &path, "");
+    }
+
+    fn hhv_entry() -> shops::ShopEntry {
+        shops::ShopEntry {
+            code: "525768".into(),
+            artist: "Laurent Garnier".into(),
+            title: "Speicher 95 Tribute EP".into(),
+            catno: "Kompakt Ex 095".into(),
+            label: "Kompakt Extra".into(),
+            barcode: Some("00880319822216".into()),
+        }
+    }
+
+    #[test]
+    fn six_digit_numbers_stay_discogs_ids_without_the_bridge() {
+        let mut app = app_with_results(0);
+        let before = app.worker.pending();
+        app.route_scan("525768".into());
+        assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    #[test]
+    fn decks_codes_without_the_bridge_explain_what_to_do() {
+        let mut app = app_with_results(0);
+        let before = app.worker.pending();
+        app.route_scan("CNF/O1".into());
+        assert_eq!(app.worker.pending(), before);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("--shop-bridge"))
+        );
+    }
+
+    #[test]
+    fn hhv_numbers_need_a_connected_hhv_tab() {
+        let mut app = app_with_bridge();
+        let before = app.worker.pending();
+        app.route_scan("525768".into());
+        assert_eq!(
+            app.worker.pending(),
+            before,
+            "must not be looked up as a Discogs id"
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("hhv.de"))
+        );
+
+        connect(&app, Shop::Hhv);
+        app.route_scan("525768".into());
+        assert_eq!(
+            app.worker.pending(),
+            before,
+            "goes to the browser, not to Discogs"
+        );
+        assert!(
+            app.shop_info
+                .as_ref()
+                .is_some_and(|i| i.contains("waiting"))
+        );
+        let queued =
+            app.bridge
+                .as_ref()
+                .unwrap()
+                .bridge
+                .handle("GET", "/pending?token=t&shop=hhv", "");
+        assert_eq!(queued.1, r#"["525768"]"#);
+    }
+
+    #[test]
+    fn other_numbers_still_go_to_discogs_with_the_bridge_on() {
+        let mut app = app_with_bridge();
+        let before = app.worker.pending();
+        app.route_scan("5012345678900".into());
+        assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    #[test]
+    fn a_shop_page_with_the_article_starts_the_discogs_lookup() {
+        let mut app = app_with_results(0);
+        let before = app.worker.pending();
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Hhv,
+            code: "525768".into(),
+            status: Some(200),
+            entries: vec![hhv_entry()],
+        });
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(
+            app.shop_info
+                .as_ref()
+                .is_some_and(|i| i.contains("Kompakt Ex 095"))
+        );
+    }
+
+    #[test]
+    fn failed_or_unmatched_shop_pages_are_reported() {
+        let mut app = app_with_results(0);
+        let before = app.worker.pending();
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Hhv,
+            code: "525768".into(),
+            status: Some(403),
+            entries: Vec::new(),
+        });
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("403"))
+        );
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Hhv,
+            code: "999999".into(),
+            status: Some(200),
+            entries: vec![hhv_entry()],
+        });
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("no exact match"))
+        );
+        assert_eq!(app.worker.pending(), before);
     }
 }

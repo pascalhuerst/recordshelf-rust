@@ -6,8 +6,10 @@ mod barcode_reader;
 mod config;
 mod controls;
 mod decks;
-mod decks_bridge;
 mod discogs;
+mod hhv;
+mod shop_bridge;
+mod shops;
 mod ui;
 mod worker;
 
@@ -51,13 +53,13 @@ pub struct Args {
     #[arg(long)]
     pub windowed: bool,
 
-    /// Enable the decks.de browser bridge (localhost server for the userscript)
-    #[arg(long)]
-    pub decks_bridge: bool,
+    /// Enable the shop browser bridge for decks.de and hhv.de (localhost server for the userscript)
+    #[arg(long, visible_alias = "decks-bridge")]
+    pub shop_bridge: bool,
 
-    /// Port of the decks.de bridge
-    #[arg(long, default_value_t = decks_bridge::DEFAULT_PORT)]
-    pub decks_port: u16,
+    /// Port of the shop bridge
+    #[arg(long, visible_alias = "decks-port", default_value_t = shop_bridge::DEFAULT_PORT)]
+    pub shop_port: u16,
 }
 
 impl Args {
@@ -89,7 +91,7 @@ fn main() -> Result<()> {
     };
     args.apply_to(&mut settings);
 
-    let decks_port = args.decks_bridge.then_some(args.decks_port);
+    let bridge_port = args.shop_bridge.then_some(args.shop_port);
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_fullscreen(!args.windowed),
         ..Default::default()
@@ -102,7 +104,7 @@ fn main() -> Result<()> {
                 cc.egui_ctx.clone(),
                 settings,
                 config_path,
-                decks_port,
+                bridge_port,
             ))
         }),
     )

@@ -6,10 +6,10 @@ use std::{
 use anyhow::{Context, Result};
 use eframe::egui;
 
-use crate::decks::{DecksEntry, search_plan};
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
+use crate::shops::{Shop, ShopEntry, search_plan};
 
 /// Work for the background thread. Every request except `Configure` produces
 /// exactly one `Response`, in request order.
@@ -27,10 +27,12 @@ pub enum Request {
     /// Download a cover image. Handled by a separate thread and not counted in
     /// `pending()`, so pictures never delay or flag normal requests.
     FetchImage(String),
-    /// Find Discogs releases for a decks.de entry (by catalog number etc.).
-    DecksLookup {
+    /// Find Discogs releases for what a shop knows about a scanned code
+    /// (barcode, catalog number, artist/title).
+    ShopLookup {
+        shop: Shop,
         code: String,
-        entry: DecksEntry,
+        entry: ShopEntry,
     },
     AddToCollection {
         release_id: u32,
@@ -65,9 +67,10 @@ pub enum Response {
         release_id: u32,
         result: Result<Vec<CollectionInstance>, String>,
     },
-    Decks {
+    Shop {
+        shop: Shop,
         code: String,
-        entry: DecksEntry,
+        entry: ShopEntry,
         result: Result<Vec<SearchItem>, String>,
     },
     Image {
@@ -239,9 +242,10 @@ impl State {
                     .map_err(|e| format!("{e:#}"));
                 Response::Image { url, result }
             }
-            Request::DecksLookup { code, entry } => {
-                let result = self.decks_lookup(&entry).map_err(|e| format!("{e:#}"));
-                Response::Decks {
+            Request::ShopLookup { shop, code, entry } => {
+                let result = self.shop_lookup(&entry).map_err(|e| format!("{e:#}"));
+                Response::Shop {
+                    shop,
                     code,
                     entry,
                     result,
@@ -298,7 +302,7 @@ impl State {
     }
 
     /// Runs the search plan and returns the first non-empty result list.
-    fn decks_lookup(&self, entry: &DecksEntry) -> Result<Vec<SearchItem>> {
+    fn shop_lookup(&self, entry: &ShopEntry) -> Result<Vec<SearchItem>> {
         let client = self.client()?;
         for query in search_plan(entry) {
             let found = client.search(&query)?.results;

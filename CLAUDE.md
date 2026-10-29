@@ -22,7 +22,7 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 - Cover pictures: scans and searches share one results list; rows show `thumb`, details show the release `images` primary cover. Fetched lazily (only visible rows) by a separate image thread in `worker.rs` (not counted in `pending()`), only from discogs.com hosts, cached by URL in `ui.rs`, drawn via egui_extras image loaders.
 - `ui.rs` – `RecordShelfApp`: single main view (search fields, results list, release details; keys: Up/Down browse, `A` add to the current folder, `R` remove, `M` move to another folder (asks which copies if there are several), `O` open in browser, `F` change folder, `Q` quit, Enter retries a failed load, Esc new search; the same commands are buttons showing their keys; logic in `controls.rs`), folder picker window, Settings window, bottom status bar. Never do network I/O on the UI thread; send a `Request`.
 
-- `decks.rs`, `decks_bridge.rs` – decks.de catalog-number lookup via a browser userscript (`--decks-bridge`); see `decks.md`. Personal tool, never to be published.
+- `shops.rs`, `decks.rs`, `hhv.rs`, `shop_bridge.rs` – lookups of decks.de / hhv.de label codes via a browser userscript (`--shop-bridge`); `ShopEntry` → Discogs search plan (barcode, catno+label, catno, artist+title). 6-7 digit numbers are treated as hhv article numbers while the bridge runs. See `shops.md`. Personal tool, never to be published.
 
 ## Conventions
 - All Discogs searches are restricted to `format=Vinyl` (only vinyl is of interest); this is applied in `SearchQuery::params`.
