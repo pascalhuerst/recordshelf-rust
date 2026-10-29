@@ -26,6 +26,9 @@ pub struct Settings {
     pub zoom_factor: f32,
     /// Discogs collection folder that new releases are added to (0 = not chosen yet)
     pub folder_id: u32,
+    /// Label printer (Zebra, raw ZPL on TCP): host name or IP address
+    pub printer_host: String,
+    pub printer_port: u16,
 }
 
 impl Default for Settings {
@@ -39,6 +42,8 @@ impl Default for Settings {
             device_path: String::new(),
             zoom_factor: 1.0,
             folder_id: 0,
+            printer_host: String::new(),
+            printer_port: crate::printer::DEFAULT_PORT,
         }
     }
 }

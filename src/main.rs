@@ -9,6 +9,7 @@ mod decks;
 mod discogs;
 mod hhv;
 mod label;
+mod printer;
 mod shop_bridge;
 mod shops;
 mod ui;
@@ -58,6 +59,22 @@ pub struct Args {
     #[arg(long, value_name = "ID", requires = "label_preview")]
     pub label_release: Option<u32>,
 
+    /// Label printer host name or IP address
+    #[arg(long)]
+    pub printer_host: Option<String>,
+
+    /// Label printer port (raw ZPL)
+    #[arg(long)]
+    pub printer_port: Option<u16>,
+
+    /// Print one calibration label (frame and ruler) to see how the stock sits, then exit
+    #[arg(long)]
+    pub print_calibration: bool,
+
+    /// Print test labels with barcodes of these heights in mm (e.g. 5,4,3), then exit
+    #[arg(long, value_name = "MM,MM,...", value_delimiter = ',')]
+    pub print_barcode_test: Vec<f32>,
+
     /// Start in a normal window instead of fullscreen (F11 toggles at runtime)
     #[arg(long)]
     pub windowed: bool,
@@ -81,6 +98,7 @@ impl Args {
             (&self.token, &mut settings.token),
             (&self.currency, &mut settings.currency),
             (&self.username, &mut settings.username),
+            (&self.printer_host, &mut settings.printer_host),
         ];
         for (value, target) in overrides {
             if let Some(v) = value {
@@ -88,6 +106,48 @@ impl Args {
             }
         }
     }
+}
+
+/// Prints calibration / barcode test labels on the configured printer.
+fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
+    anyhow::ensure!(
+        !settings.printer_host.trim().is_empty(),
+        "no printer configured: use --printer-host or printer_host in the settings file"
+    );
+    let printer = printer::Printer::new(&settings.printer_host, settings.printer_port);
+    let status = printer.status()?;
+    println!(
+        "printer {}:{} ready: label length {} dots, {}",
+        printer.host,
+        printer.port,
+        status.label_length,
+        if status.thermal_transfer {
+            "thermal transfer"
+        } else {
+            "direct thermal"
+        }
+    );
+    if args.print_calibration {
+        // the printer's whole print area: 448 dots wide, as long as its label
+        println!("printing the calibration label");
+        printer.print(&printer::calibration_zpl(448, status.label_length))?;
+    }
+    for mm in &args.print_barcode_test {
+        // test labels are the 51 x 38 mm ones
+        let size = label::LabelSize::from_mm(51.0, 38.0);
+        let mut options = label::LabelOptions::new(label::CodeKind::Barcode);
+        options.barcode_height = (mm * 8.0).round() as u32;
+        options.caption = Some(format!("{mm}mm"));
+        let img = label::render_with(&label::sample_content(), size, &options)?;
+        println!(
+            "printing a label with a {mm} mm barcode ({} dots)",
+            options.barcode_height
+        );
+        printer.print(&printer::bitmap_zpl(&img, 0, 0))?;
+        // let the printer finish this label before the next job arrives
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -99,6 +159,13 @@ fn main() -> Result<()> {
         None => Settings::default(),
     };
     args.apply_to(&mut settings);
+
+    if let Some(port) = args.printer_port {
+        settings.printer_port = port;
+    }
+    if args.print_calibration || !args.print_barcode_test.is_empty() {
+        return print_tests(&args, &settings);
+    }
 
     if let Some(dir) = &args.label_preview {
         let content = match args.label_release {

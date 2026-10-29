@@ -369,8 +369,40 @@ fn barcode(id: u32, module: u32, height: u32) -> Result<CodeBitmap> {
     })
 }
 
+/// How the code is drawn, besides its kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelOptions {
+    pub kind: CodeKind,
+    /// Height of the bars of a barcode in dots.
+    pub barcode_height: u32,
+    /// Width of the narrowest bar of a barcode in dots.
+    pub barcode_module: u32,
+    /// Small text in the bottom left corner (used by test labels).
+    pub caption: Option<String>,
+}
+
+impl LabelOptions {
+    pub fn new(kind: CodeKind) -> Self {
+        Self {
+            kind,
+            barcode_height: 40,
+            barcode_module: 2,
+            caption: None,
+        }
+    }
+}
+
 /// Draws the label. Black pixels are 0, the rest 255.
 pub fn render(content: &LabelContent, size: LabelSize, kind: CodeKind) -> Result<GrayImage> {
+    render_with(content, size, &LabelOptions::new(kind))
+}
+
+pub fn render_with(
+    content: &LabelContent,
+    size: LabelSize,
+    options: &LabelOptions,
+) -> Result<GrayImage> {
+    let kind = options.kind;
     let fonts = Fonts::load()?;
     let mut img = GrayImage::from_pixel(size.width, size.height, WHITE);
     let inner_width = (size.width - 2 * MARGIN) as f32;
@@ -380,7 +412,11 @@ pub fn render(content: &LabelContent, size: LabelSize, kind: CodeKind) -> Result
     // Where the code goes decides how much room is left for the tracks.
     let code = match kind {
         CodeKind::Qr => qr_code(content.release_id, 4, 2)?,
-        CodeKind::Barcode => barcode(content.release_id, 2, 40)?,
+        CodeKind::Barcode => barcode(
+            content.release_id,
+            options.barcode_module,
+            options.barcode_height,
+        )?,
     };
     let (code_left, code_top) = match kind {
         // bottom right corner; the quiet zone may overlap the margin
@@ -504,6 +540,11 @@ pub fn render(content: &LabelContent, size: LabelSize, kind: CodeKind) -> Result
     }
 
     code.draw(&mut img, code_left, code_top);
+    if let Some(caption) = &options.caption {
+        let px = 15.0;
+        let top = (size.height - MARGIN) as f32 - px;
+        draw_text(&mut img, &fonts.regular, px, left, top, caption);
+    }
     Ok(img)
 }
 
@@ -889,5 +930,59 @@ mod tests {
         for f in files {
             assert!(f.exists(), "{}", f.display());
         }
+    }
+
+    #[test]
+    fn barcode_height_and_module_are_adjustable() {
+        let content = sample_content();
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        for height in [16, 24, 40] {
+            options.barcode_height = height;
+            let img = render_with(&content, SIZE_TEST, &options).unwrap();
+            assert_eq!(decode(&img).as_deref(), Some("32474433"), "height {height}");
+            assert_inside_safe_area(&img, &format!("height {height}"));
+        }
+        options.barcode_height = 24;
+        options.barcode_module = 3;
+        let img = render_with(&content, SIZE_TEST, &options).unwrap();
+        assert_eq!(decode(&img).as_deref(), Some("32474433"));
+        let narrow = barcode(32474433, 2, 24).unwrap();
+        let wide = barcode(32474433, 3, 24).unwrap();
+        assert!(wide.width > narrow.width);
+    }
+
+    #[test]
+    fn a_shorter_barcode_leaves_more_room_for_tracks() {
+        let mut content = crowded_content();
+        content.tracks.truncate(20);
+        let ink_above = |height: u32| {
+            let mut o = LabelOptions::new(CodeKind::Barcode);
+            o.barcode_height = height;
+            let img = render_with(&content, SIZE_TEST, &o).unwrap();
+            // ink beside the place where a tall barcode starts: track lines continue there only if it is short
+            let band = img
+                .enumerate_pixels()
+                .filter(|(x, y, p)| p.0[0] < 128 && *y > 253 && *y < 272 && *x > 16 && *x < 80);
+            band.count()
+        };
+        assert!(ink_above(16) > ink_above(40));
+    }
+
+    #[test]
+    fn the_caption_is_drawn_in_the_bottom_left_corner() {
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        let plain = render_with(&sample_content(), SIZE_TEST, &options).unwrap();
+        options.caption = Some("4.0mm".to_string());
+        let captioned = render_with(&sample_content(), SIZE_TEST, &options).unwrap();
+        let differing: Vec<_> = plain
+            .enumerate_pixels()
+            .filter(|(x, y, p)| captioned.get_pixel(*x, *y) != *p)
+            .collect();
+        assert!(!differing.is_empty());
+        assert!(
+            differing.iter().all(|(x, y, _)| *x < 100 && *y > 260),
+            "caption must stay in its corner"
+        );
+        assert_eq!(decode(&captioned).as_deref(), Some("32474433"));
     }
 }
