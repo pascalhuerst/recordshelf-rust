@@ -11,6 +11,15 @@ use anyhow::{Context, Result, bail};
 use image::GrayImage;
 
 pub const DEFAULT_PORT: u16 = 9100;
+
+/// Width of the print area of the ZD411 in dots (56 mm at 203 dpi).
+pub const PRINT_WIDTH: u32 = 448;
+
+/// Left offset that centres a label of `label_width` dots in the print area.
+/// The stock is fed centred (measured with the calibration label).
+pub fn centred_x(label_width: u32) -> u32 {
+    PRINT_WIDTH.saturating_sub(label_width) / 2
+}
 const TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Where the printer is.
@@ -416,5 +425,13 @@ mod tests {
             Printer::new("127.0.0.1", free_port).status().unwrap_err()
         );
         assert!(err.contains("connect to printer"), "{err}");
+    }
+
+    #[test]
+    fn labels_are_centred_in_the_print_area() {
+        assert_eq!(centred_x(408), 20, "51 mm label: 2.5 mm each side");
+        assert_eq!(centred_x(416), 16, "52 mm label: 2 mm each side");
+        assert_eq!(centred_x(448), 0);
+        assert_eq!(centred_x(500), 0, "wider than the print area");
     }
 }

@@ -29,6 +29,8 @@ pub struct Settings {
     /// Label printer (Zebra, raw ZPL on TCP): host name or IP address
     pub printer_host: String,
     pub printer_port: u16,
+    /// Distance of the label's top edge from the printer's print origin, in mm
+    pub label_top_mm: f32,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             folder_id: 0,
             printer_host: String::new(),
             printer_port: crate::printer::DEFAULT_PORT,
+            label_top_mm: 1.5,
         }
     }
 }

@@ -143,7 +143,11 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
             "printing a label with a {mm} mm barcode ({} dots)",
             options.barcode_height
         );
-        printer.print(&printer::bitmap_zpl(&img, 0, 0))?;
+        let (x, y) = (
+            printer::centred_x(size.width),
+            (settings.label_top_mm * 8.0).round() as u32,
+        );
+        printer.print(&printer::bitmap_zpl(&img, x, y))?;
         // let the printer finish this label before the next job arrives
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
