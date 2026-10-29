@@ -746,15 +746,14 @@ impl RecordShelfApp {
                     .collect::<Vec<_>>()
                     .join(" | ");
                     let line = format!("{}\n{details}", item.title_display());
-                    let owned = item
+                    // Yellow third line for pressings that are already in the collection.
+                    let owned_line = item
                         .id
                         .and_then(|id| self.ownership.get(&id))
-                        .is_some_and(|o| !o.is_empty());
-                    let text = if owned {
-                        RichText::new(format!("\u{2713} {line}")).color(Color32::LIGHT_GREEN)
-                    } else {
-                        RichText::new(line)
-                    };
+                        .and_then(|o| ownership_text(Some(o), &self.folders))
+                        .filter(|(_, owned)| *owned)
+                        .map(|(text, _)| text);
+                    let text = row_job(egui::TextStyle::Body.resolve(ui.style()), line, owned_line);
                     let row_top = ui.cursor().min;
                     let visible = ui.is_rect_visible(egui::Rect::from_min_size(
                         row_top,
@@ -1475,6 +1474,28 @@ fn non_empty(s: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Layout of a result row: the release text in the normal text colour and,
+/// for releases already in the collection, a yellow line below it.
+fn row_job(font: egui::FontId, text: String, owned_line: Option<String>) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let plain = egui::TextFormat {
+        font_id: font.clone(),
+        // follow the widget's own colour (changes when the row is selected)
+        color: Color32::PLACEHOLDER,
+        ..Default::default()
+    };
+    job.append(&text, 0.0, plain);
+    if let Some(line) = owned_line {
+        let yellow = egui::TextFormat {
+            font_id: font,
+            color: Color32::YELLOW,
+            ..Default::default()
+        };
+        job.append(&format!("\n{line}"), 0.0, yellow);
+    }
+    job
 }
 
 /// Text for the collection status of a release: "Nx in your collection: folders"
@@ -2248,5 +2269,27 @@ mod tests {
                 .is_some_and(|n| n.text.contains("no exact match"))
         );
         assert_eq!(app.worker.pending(), before);
+    }
+
+    #[test]
+    fn owned_rows_get_a_yellow_line() {
+        let font = egui::FontId::default();
+        let plain = row_job(font.clone(), "Title\ndetails".into(), None);
+        assert_eq!(plain.sections.len(), 1);
+        assert_eq!(plain.sections[0].format.color, Color32::PLACEHOLDER);
+
+        let owned = row_job(
+            font,
+            "Title\ndetails".into(),
+            Some("1x in your collection: Techno".into()),
+        );
+        assert_eq!(owned.sections.len(), 2);
+        assert_eq!(owned.sections[1].format.color, Color32::YELLOW);
+        assert!(owned.text.ends_with("\n1x in your collection: Techno"));
+        assert_eq!(
+            owned.sections[0].format.color,
+            Color32::PLACEHOLDER,
+            "release text keeps its colour"
+        );
     }
 }
