@@ -781,14 +781,11 @@ fn render_stored(ui: &mut egui::Ui, record: &StoredRelease, sink: &mut LinkSink)
                 .duration_seconds
                 .map(|d| format!(" [{}]", duration_display(d)))
                 .unwrap_or_default();
-            ui.label(
-                RichText::new(format!(
-                    "  {} {}{duration}",
-                    track.position.as_deref().unwrap_or(""),
-                    track.title
-                ))
-                .small(),
-            );
+            ui.label(format!(
+                "  {} {}{duration}",
+                track.position.as_deref().unwrap_or(""),
+                track.title
+            ));
         }
     }
     if !record.credits.is_empty() {
@@ -805,8 +802,6 @@ fn render_stored(ui: &mut egui::Ui, record: &StoredRelease, sink: &mut LinkSink)
             });
         }
     }
-    ui.add_space(4.0);
-    ui.label(RichText::new("Click a value to search the collection for it.").small());
 }
 
 #[cfg(test)]
@@ -1871,5 +1866,71 @@ mod tests {
         let app = app_showing_details();
         assert_eq!(app.collection.search, "");
         assert_eq!(app.collection.filtered.len(), 3);
+    }
+
+    // --- details look -----------------------------------------------------------------
+
+    /// All text drawn in a frame with its font size.
+    fn drawn_text(app: &mut RecordShelfApp) -> Vec<(String, f32)> {
+        let ctx = app.repaint.clone();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_collection(ui));
+        });
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn collect_text(shape: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                let size = text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map_or(0.0, |s| s.format.font_id.size);
+                out.push((text.galley.text().to_string(), size));
+            }
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_details_have_no_hint_line() {
+        let mut app = app_showing_details();
+        let texts = drawn_text(&mut app);
+        assert!(
+            texts.iter().any(|(t, _)| t.contains("Tracklist")),
+            "the details are drawn: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t.contains("Click a value")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn track_names_have_the_size_of_the_other_details() {
+        let mut app = app_showing_details();
+        let texts = drawn_text(&mut app);
+        let size_of = |needle: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} not drawn in {texts:?}"))
+                .1
+        };
+        let body = size_of("Copies:");
+        assert_eq!(
+            size_of("A1 One [3:45]"),
+            body,
+            "a track with a position and a duration"
+        );
+        assert_eq!(size_of("Two"), body, "a track without them");
+        assert_eq!(size_of("Producer:"), body, "the credits as well");
     }
 }
