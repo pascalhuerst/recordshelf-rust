@@ -115,7 +115,11 @@ pub struct SearchQuery {
 
 impl SearchQuery {
     fn params(&self, currency: &str) -> Vec<(&'static str, String)> {
-        let mut params = vec![("curr_abbr", currency.to_string())];
+        // Only vinyl is of interest; every search is restricted to it.
+        let mut params = vec![
+            ("curr_abbr", currency.to_string()),
+            ("format", "Vinyl".to_string()),
+        ];
         let optional = [
             ("q", self.query.clone()),
             ("artist", self.artist.clone()),
@@ -467,6 +471,7 @@ mod tests {
         assert!(line.contains("type=release"), "{line}");
         assert!(line.contains("per_page=10"), "{line}");
         assert!(line.contains("curr_abbr=EUR"), "{line}");
+        assert!(line.contains("format=Vinyl"), "{line}");
         assert!(!line.contains("artist="), "{line}");
         assert!(!line.contains("&page="), "{line}");
     }

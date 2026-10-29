@@ -20,7 +20,10 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 - `discogs.rs` – blocking `reqwest` client + serde models. Search items use lenient deserializers (Discogs returns mixed types). Collection instances come from `GET /users/{u}/collection/releases/{id}` (`releases[]` with `instance_id`, `folder_id`).
 - `ui.rs` – `RecordShelfApp`: Scan tab, Search tab (keys: Up/Down, Enter load, `A` folder picker / confirm, Esc), folder picker window, Settings window, bottom status bar. Never do network I/O on the UI thread; send a `Request`.
 
+- `decks.rs`, `decks_bridge.rs` – decks.de catalog-number lookup via a browser userscript (`--decks-bridge`); see `decks.md`. Personal tool, never to be published.
+
 ## Conventions
+- All Discogs searches are restricted to `format=Vinyl` (only vinyl is of interest); this is applied in `SearchQuery::params`.
 - Errors: `anyhow` with `.context(...)`; worker turns them into `String`s for the UI; the UI shows them as a `Notice` in the status bar.
 - Owned releases are flagged (ownership cache `HashMap<release_id, Vec<CollectionInstance>>`); adding a duplicate copy is always allowed.
 - Tests live in `#[cfg(test)]` modules next to the code; Discogs HTTP is tested against a local one-shot `TcpListener` server (`DiscogsClient.base` is overridable in-crate).
@@ -29,6 +32,7 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 ## Known gaps
 - Settings saved from the window also persist any CLI/env overrides active in that run.
 - Barcode with several matching pressings shows only the first (hint shown); no picker yet.
+- Scanner reports letters upper case regardless of Shift.
 - No automatic scanner reconnect if the device is unplugged.
 - The worker is a single thread, so a slow request delays the ones queued behind it.
 - UI code (`ui.rs`) has only helper-level tests; no egui interaction tests.
