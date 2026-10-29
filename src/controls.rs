@@ -13,17 +13,23 @@ pub enum Command {
     Move,
     Open,
     Print,
+    /// Bring the selected release in line with the collection in our database.
+    Sync,
+    /// Switch between syncing by hand (S) and syncing automatically.
+    AutoSync,
     ChooseFolder,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 7] = [
+    pub const ALL: [Command; 9] = [
         Command::Add,
         Command::Remove,
         Command::Move,
         Command::Open,
         Command::Print,
+        Command::Sync,
+        Command::AutoSync,
         Command::ChooseFolder,
         Command::Quit,
     ];
@@ -35,6 +41,8 @@ impl Command {
             Command::Move => Key::M,
             Command::Open => Key::O,
             Command::Print => Key::P,
+            Command::Sync => Key::S,
+            Command::AutoSync => Key::U,
             Command::ChooseFolder => Key::F,
             Command::Quit => Key::Q,
         }
@@ -42,7 +50,10 @@ impl Command {
 
     /// Whether the command acts on the selected release.
     pub fn needs_selection(self) -> bool {
-        !matches!(self, Command::ChooseFolder | Command::Quit)
+        !matches!(
+            self,
+            Command::ChooseFolder | Command::Quit | Command::AutoSync
+        )
     }
 
     /// Whether the command is only offered for releases we own (a label can
@@ -59,6 +70,8 @@ impl Command {
             Command::Move => "M",
             Command::Open => "O",
             Command::Print => "P",
+            Command::Sync => "S",
+            Command::AutoSync => "U",
             Command::ChooseFolder => "F",
             Command::Quit => "Q",
         }
@@ -148,6 +161,34 @@ pub fn plan_move(copies: &[CollectionInstance], to_folder: u32) -> Vec<Collectio
         .collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum SyncDecision {
+    Nothing,
+    /// Store the release with this many copies.
+    Save(u16),
+    /// Remove the release from the database.
+    Remove,
+}
+
+/// What to do so that our database agrees with the Discogs collection.
+/// `owned` is the number of copies in the collection, `in_library` the number
+/// in our database (0 if the release is not there). With `force` a release we
+/// own is stored again even if the copy counts agree (refreshes the data).
+pub fn decide_sync(owned: usize, in_library: i16, force: bool) -> SyncDecision {
+    if owned > 0 {
+        let copies = u16::try_from(owned).unwrap_or(u16::MAX);
+        if force || i32::from(in_library) != i32::from(copies) {
+            SyncDecision::Save(copies)
+        } else {
+            SyncDecision::Nothing
+        }
+    } else if in_library > 0 {
+        SyncDecision::Remove
+    } else {
+        SyncDecision::Nothing
+    }
+}
+
 /// Web page of a release: the search result's uri (relative or absolute), or
 /// the generic release URL.
 pub fn release_url(uri: Option<&str>, id: u32) -> String {
@@ -185,6 +226,9 @@ mod tests {
         assert_eq!(Command::Print.key_label(), "P");
         assert!(Command::Print.needs_selection() && Command::Print.needs_ownership());
         assert!(!Command::Add.needs_ownership() && !Command::Open.needs_ownership());
+        assert_eq!(Command::Sync.key(), Key::S);
+        assert_eq!(Command::AutoSync.key(), Key::U);
+        assert!(Command::Sync.needs_selection() && !Command::AutoSync.needs_selection());
         assert_eq!(Command::Quit.key(), Key::Q);
         assert_eq!(Command::Quit.key_label(), "Q");
         assert!(Command::Remove.needs_selection());
@@ -270,5 +314,32 @@ mod tests {
         assert_eq!(plan_move(&copies, 4), vec![copy(2, 7)]);
         assert_eq!(plan_move(&copies, 9), copies.to_vec());
         assert!(plan_move(&[copy(1, 4)], 4).is_empty());
+    }
+
+    #[test]
+    fn sync_follows_the_collection() {
+        use SyncDecision::*;
+        // not in the database yet
+        assert_eq!(decide_sync(1, 0, false), Save(1));
+        assert_eq!(decide_sync(2, 0, false), Save(2));
+        // the copy count changed on Discogs
+        assert_eq!(decide_sync(2, 1, false), Save(2));
+        assert_eq!(decide_sync(1, 3, false), Save(1));
+        // already in line
+        assert_eq!(decide_sync(1, 1, false), Nothing);
+        assert_eq!(decide_sync(3, 3, false), Nothing);
+        // by hand the data is refreshed anyway
+        assert_eq!(decide_sync(1, 1, true), Save(1));
+        // no longer owned: remove, but only if we have it
+        assert_eq!(decide_sync(0, 2, false), Remove);
+        assert_eq!(decide_sync(0, 1, true), Remove);
+        assert_eq!(decide_sync(0, 0, false), Nothing);
+        assert_eq!(
+            decide_sync(0, 0, true),
+            Nothing,
+            "nothing to store for a release we do not own"
+        );
+        // absurd counts do not overflow
+        assert_eq!(decide_sync(100_000, 0, false), Save(u16::MAX));
     }
 }

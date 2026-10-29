@@ -11,16 +11,31 @@ use std::{
 
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
 use crate::config::Settings;
-use crate::controls::{self, AddDecision, Command, MoveDecision, PENDING_INSTANCE, RemoveDecision};
+use crate::controls::{
+    self, AddDecision, Command, MoveDecision, PENDING_INSTANCE, RemoveDecision, SyncDecision,
+};
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
     format_line,
 };
 use crate::label::{CodeKind, LabelContent};
+use crate::library::Entry as LibraryEntry;
 use crate::shop_bridge::{self, Bridge, ShopPage};
 use crate::shops::{self, Route, Shop};
-use crate::worker::{PrintJob, Request, Response, Worker};
+use crate::worker::{
+    LibraryRequest, LibraryResponse, PrintJob, Request, Response, SyncJob, SyncOutcome, Worker,
+};
 use eframe::egui::{self, Color32, RichText};
+
+/// How far the connection to our own database is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LibraryLink {
+    /// No database configured.
+    Off,
+    Connecting,
+    Ready,
+    Failed(String),
+}
 
 /// Download state of a cover picture, keyed by URL.
 enum ImageState {
@@ -124,6 +139,17 @@ pub struct RecordShelfApp {
     selection_changed: Instant,
     settings_open: bool,
     images: HashMap<String, ImageState>,
+    library_link: LibraryLink,
+    /// What our database has, per release (copies 0 = not in it).
+    library: HashMap<u32, LibraryEntry>,
+    library_status_requested: HashSet<u32>,
+    library_status_queue: Vec<u32>,
+    /// Releases with a sync request on its way.
+    library_busy: HashSet<u32>,
+    /// Releases whose sync was asked for with S: it runs as soon as the data is there.
+    pending_forced: HashSet<u32>,
+    /// Cover downloads that are waited for before they are stored: url -> release.
+    cover_wanted: HashMap<String, u32>,
     bridge: Option<BridgeState>,
     shop_info: Option<String>,
     settings_draft: Settings,
@@ -172,12 +198,20 @@ impl RecordShelfApp {
             selection_changed: Instant::now(),
             settings_open: false,
             images: HashMap::new(),
+            library_link: LibraryLink::Off,
+            library: HashMap::new(),
+            library_status_requested: HashSet::new(),
+            library_status_queue: Vec::new(),
+            library_busy: HashSet::new(),
+            pending_forced: HashSet::new(),
+            cover_wanted: HashMap::new(),
             bridge: None,
             shop_info: None,
             settings_draft: Settings::default(),
             devices: Vec::new(),
         };
         app.configure_worker();
+        app.configure_library();
         if let Some(port) = bridge_port {
             app.start_bridge(port);
         }
@@ -216,6 +250,302 @@ impl RecordShelfApp {
         if can_load_folders {
             self.worker.send(Request::LoadFolders);
         }
+    }
+
+    // --- our own database ------------------------------------------------
+
+    /// (Re)connects to the database from the settings; forgets what was known.
+    fn configure_library(&mut self) {
+        let url = self.settings.database_url.trim().to_string();
+        self.library.clear();
+        self.library_status_requested.clear();
+        self.library_status_queue.clear();
+        self.library_busy.clear();
+        self.pending_forced.clear();
+        self.cover_wanted.clear();
+        self.library_link = if url.is_empty() {
+            LibraryLink::Off
+        } else {
+            LibraryLink::Connecting
+        };
+        self.worker
+            .send(Request::Library(LibraryRequest::Configure { url }));
+    }
+
+    fn library_ready(&self) -> bool {
+        self.library_link == LibraryLink::Ready
+    }
+
+    /// Asks the database about a release we know nothing about yet (batched, see
+    /// `flush_library_status`).
+    fn queue_library_status(&mut self, id: u32) {
+        if self.library_ready()
+            && !self.library.contains_key(&id)
+            && self.library_status_requested.insert(id)
+        {
+            self.library_status_queue.push(id);
+        }
+    }
+
+    fn flush_library_status(&mut self) {
+        if !self.library_status_queue.is_empty() {
+            let ids = std::mem::take(&mut self.library_status_queue);
+            self.worker
+                .send(Request::Library(LibraryRequest::Status(ids)));
+        }
+    }
+
+    /// Called when new data about a release arrived (release, collection
+    /// status, database status): syncs it if that is wanted.
+    fn after_data(&mut self, id: u32) {
+        let forced = self.pending_forced.contains(&id);
+        if forced || self.settings.library_auto_sync {
+            self.maybe_sync(id, forced);
+        }
+    }
+
+    /// Brings our database in line with the Discogs collection for one release
+    /// (see `controls::decide_sync`). Waits quietly for data that is still missing.
+    fn maybe_sync(&mut self, id: u32, force: bool) {
+        if !self.library_ready() || self.library_busy.contains(&id) {
+            return;
+        }
+        let Some(owned) = self.ownership.get(&id).map(Vec::len) else {
+            return;
+        };
+        let Some(in_library) = self.library.get(&id).map(|e| e.copies) else {
+            self.queue_library_status(id);
+            return;
+        };
+        match controls::decide_sync(owned, in_library, force) {
+            SyncDecision::Nothing => {
+                if force && owned == 0 {
+                    self.set_info("Not in your collection, so not in the library".to_string());
+                }
+            }
+            SyncDecision::Remove => {
+                self.library_busy.insert(id);
+                self.worker
+                    .send(Request::Library(LibraryRequest::Sync(Box::new(
+                        SyncJob::Remove { release_id: id },
+                    ))));
+            }
+            SyncDecision::Save(copies) => {
+                let Some(release) = self.releases.get(&id).cloned().map(Box::new) else {
+                    self.request_release(id);
+                    return;
+                };
+                self.library_busy.insert(id);
+                self.worker
+                    .send(Request::Library(LibraryRequest::Sync(Box::new(
+                        SyncJob::Save {
+                            release_id: id,
+                            release,
+                            copies,
+                        },
+                    ))));
+            }
+        }
+        self.pending_forced.remove(&id);
+    }
+
+    /// S: sync the selected release now, whatever the mode.
+    fn sync_selected(&mut self) {
+        if !self.library_usable() {
+            return;
+        }
+        let Some(id) = self.selected_id() else {
+            self.set_error("Select a release first".to_string());
+            return;
+        };
+        self.pending_forced.insert(id);
+        // what is still missing: the release data (which brings the collection
+        // status along) or just the collection status
+        if !self.releases.contains_key(&id) {
+            self.request_release(id);
+        } else if !self.ownership.contains_key(&id) {
+            self.worker.send(Request::CheckOwnership(id));
+        }
+        self.queue_library_status(id);
+        self.set_info("Syncing to the library...".to_string());
+        self.maybe_sync(id, true);
+        self.flush_library_status();
+    }
+
+    /// Explains why the library cannot be used right now, if it cannot.
+    fn library_usable(&mut self) -> bool {
+        match &self.library_link {
+            LibraryLink::Ready => true,
+            LibraryLink::Off => {
+                self.set_error("No database configured (database_url in the settings)".to_string());
+                false
+            }
+            LibraryLink::Connecting => {
+                self.set_info("Still connecting to the database...".to_string());
+                false
+            }
+            LibraryLink::Failed(msg) => {
+                let msg = format!("The database is not available: {msg}");
+                self.set_error(msg);
+                false
+            }
+        }
+    }
+
+    /// U: switch between syncing by hand and syncing automatically.
+    fn toggle_auto_sync(&mut self) {
+        if self.library_link == LibraryLink::Off {
+            self.set_error("No database configured (database_url in the settings)".to_string());
+            return;
+        }
+        let auto = !self.settings.library_auto_sync;
+        self.settings.library_auto_sync = auto;
+        if let Some(path) = &self.config_path
+            && let Err(err) = Settings::update_on_disk(path, |s| s.library_auto_sync = auto)
+        {
+            self.set_error(format!("{err:#}"));
+            return;
+        }
+        self.set_info(if auto {
+            "Auto sync on: the library follows your collection".to_string()
+        } else {
+            "Auto sync off: press S to sync a release".to_string()
+        });
+        if auto {
+            let ids: Vec<u32> = self.search_results.iter().filter_map(|i| i.id).collect();
+            for id in ids {
+                self.after_data(id);
+            }
+        }
+    }
+
+    /// Stores the cover of a release that is in our database: from the picture
+    /// we already have, or after it was downloaded.
+    fn ensure_cover(&mut self, id: u32) {
+        let Some(url) = self
+            .releases
+            .get(&id)
+            .and_then(|r| r.cover_url())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if let Some(ImageState::Ready(bytes)) = self.images.get(&url) {
+            let image = bytes.to_vec();
+            self.worker.send(Request::Library(LibraryRequest::Cover {
+                release_id: id,
+                image,
+                source_url: url,
+            }));
+            return;
+        }
+        self.cover_wanted.insert(url.clone(), id);
+        if matches!(self.images.get(&url), Some(ImageState::Failed)) {
+            self.images.remove(&url); // try the download again
+        }
+        self.ensure_image(&url);
+    }
+
+    fn handle_library_response(&mut self, response: LibraryResponse) {
+        match response {
+            LibraryResponse::Disabled => self.library_link = LibraryLink::Off,
+            LibraryResponse::Failed(msg) => {
+                self.set_error(format!("Database: {msg}"));
+                self.library_link = LibraryLink::Failed(msg);
+            }
+            LibraryResponse::Ready { migrated } => {
+                self.library_link = LibraryLink::Ready;
+                if migrated > 0 {
+                    self.set_info(format!(
+                        "Database brought up to date ({migrated} migration(s))"
+                    ));
+                }
+                // what we already know about: look it up in the database
+                let ids: Vec<u32> = self.ownership.keys().copied().collect();
+                for id in ids {
+                    self.queue_library_status(id);
+                }
+            }
+            LibraryResponse::Status { ids, result } => match result {
+                Ok(found) => {
+                    for id in &ids {
+                        let entry = found.get(id).copied().unwrap_or(LibraryEntry {
+                            copies: 0,
+                            has_cover: false,
+                        });
+                        self.library.insert(*id, entry);
+                    }
+                    for id in ids {
+                        self.after_data(id);
+                    }
+                }
+                Err(err) => {
+                    for id in &ids {
+                        self.library_status_requested.remove(id);
+                    }
+                    self.set_error(format!("Database: {err}"));
+                }
+            },
+            LibraryResponse::Synced { release_id, result } => {
+                self.library_busy.remove(&release_id);
+                match result {
+                    Ok(SyncOutcome::Saved { created, copies }) => {
+                        let has_cover = self.library.get(&release_id).is_some_and(|e| e.has_cover);
+                        self.library.insert(
+                            release_id,
+                            LibraryEntry {
+                                copies: i16::try_from(copies).unwrap_or(i16::MAX),
+                                has_cover,
+                            },
+                        );
+                        let title = self.title_of(release_id);
+                        self.set_info(if created {
+                            format!("Added to the library: {title}")
+                        } else {
+                            format!("Library updated ({copies}x): {title}")
+                        });
+                        if !has_cover {
+                            self.ensure_cover(release_id);
+                        }
+                    }
+                    Ok(SyncOutcome::Removed { existed }) => {
+                        self.library.insert(
+                            release_id,
+                            LibraryEntry {
+                                copies: 0,
+                                has_cover: false,
+                            },
+                        );
+                        if existed {
+                            let title = self.title_of(release_id);
+                            self.set_info(format!("Removed from the library: {title}"));
+                        }
+                    }
+                    Err(err) => self.set_error(format!("Library sync failed: {err}")),
+                }
+                // the collection may have changed while this was running
+                self.after_data(release_id);
+            }
+            LibraryResponse::Cover { release_id, result } => match result {
+                Ok(true) => {
+                    if let Some(entry) = self.library.get_mut(&release_id) {
+                        entry.has_cover = true;
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => self.set_error(format!("Cover not stored: {err}")),
+            },
+        }
+    }
+
+    fn title_of(&self, id: u32) -> String {
+        self.search_results
+            .iter()
+            .find(|i| i.id == Some(id))
+            .map(SearchItem::title_display)
+            .filter(|t| !t.is_empty())
+            .or_else(|| self.releases.get(&id).and_then(|r| r.title.clone()))
+            .unwrap_or_else(|| format!("release {id}"))
     }
 
     /// Starts the localhost bridge and writes the userscript next to the settings file.
@@ -406,6 +736,8 @@ impl RecordShelfApp {
         let discogs_changed = (&old.token, &old.username, &old.currency, &old.user_agent)
             != (&new.token, &new.username, &new.currency, &new.user_agent);
 
+        let library_changed = old.database_url != new.database_url;
+
         if scanner_changed {
             self.scanner_stop.store(true, Ordering::SeqCst);
             let (stop, rx, status) = start_scanner(&self.settings, &self.repaint);
@@ -424,6 +756,9 @@ impl RecordShelfApp {
             self.failed.clear();
             self.notice = None;
             self.configure_worker();
+        }
+        if library_changed {
+            self.configure_library();
         }
         if self.config_path.is_none() {
             self.set_info("Settings applied (no config path, not saved)".to_string());
@@ -669,9 +1004,14 @@ impl RecordShelfApp {
                                     .desired_width(f32::INFINITY),
                             );
                         });
+                        ui.checkbox(
+                            &mut draft.library_auto_sync,
+                            "Keep the library in line with my Discogs collection automatically",
+                        );
                         ui.label(
                             RichText::new(
-                                "Written by db/db.sh bootstrap. The app does not use the database yet.",
+                                "The URL is written by db/db.sh bootstrap. Without auto sync, press S to sync \
+                                 the selected release (U switches).",
                             )
                             .small(),
                         );
@@ -765,6 +1105,7 @@ impl RecordShelfApp {
         for resp in self.worker.poll() {
             self.handle_response(resp);
         }
+        self.flush_library_status();
     }
 
     fn handle_response(&mut self, resp: Response) {
@@ -788,6 +1129,8 @@ impl RecordShelfApp {
                 Ok(release) => {
                     self.failed.remove(&id);
                     self.releases.insert(id, release);
+                    self.queue_library_status(id);
+                    self.after_data(id);
                 }
                 Err(err) => {
                     self.failed.insert(id);
@@ -812,12 +1155,29 @@ impl RecordShelfApp {
                 Err(err) => self.set_error(err),
             },
             Response::Image { url, result } => {
+                let wanted = self.cover_wanted.remove(&url);
                 let state = match result {
-                    Ok(bytes) => ImageState::Ready(bytes.into()),
-                    Err(_) => ImageState::Failed,
+                    Ok(bytes) => {
+                        if let Some(release_id) = wanted {
+                            self.worker.send(Request::Library(LibraryRequest::Cover {
+                                release_id,
+                                image: bytes.clone(),
+                                source_url: url.clone(),
+                            }));
+                        }
+                        ImageState::Ready(bytes.into())
+                    }
+                    Err(_) => {
+                        if let Some(release_id) = wanted {
+                            let title = self.title_of(release_id);
+                            self.set_error(format!("Could not download the cover of {title}"));
+                        }
+                        ImageState::Failed
+                    }
                 };
                 self.images.insert(url, state);
             }
+            Response::Library(response) => self.handle_library_response(response),
             Response::Folders(Ok(mut folders)) => {
                 // Folder 0 ("All") is a view; releases cannot be added to it.
                 folders.retain(|f| f.id != 0);
@@ -837,6 +1197,8 @@ impl RecordShelfApp {
             Response::Ownership { release_id, result } => match result {
                 Ok(instances) => {
                     self.ownership.insert(release_id, instances);
+                    self.queue_library_status(release_id);
+                    self.after_data(release_id);
                 }
                 Err(err) => self.set_error(err),
             },
@@ -1044,6 +1406,16 @@ impl RecordShelfApp {
                         }
                         ui.vertical(|ui| {
                             render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
+                            if self.library_ready()
+                                && let Some(id) = release.id
+                                && let Some((text, color)) = library_line(
+                                    owned.map(Vec::len),
+                                    self.library.get(&id).copied(),
+                                )
+                            {
+                                ui.colored_label(color, text);
+                                ui.add_space(4.0);
+                            }
                             render_release(ui, release);
                         });
                     });
@@ -1330,6 +1702,14 @@ impl RecordShelfApp {
                 self.repaint.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
             }
+            Command::AutoSync => {
+                self.toggle_auto_sync();
+                return;
+            }
+            Command::Sync => {
+                self.sync_selected();
+                return;
+            }
             _ => {}
         }
         let Some(id) = self.selected_id() else {
@@ -1342,7 +1722,7 @@ impl RecordShelfApp {
             Command::Move => self.move_release(id),
             Command::Open => self.open_release(id),
             Command::Print => self.print_label(id),
-            Command::ChooseFolder | Command::Quit => {}
+            Command::ChooseFolder | Command::Quit | Command::Sync | Command::AutoSync => {}
         }
     }
 
@@ -1531,11 +1911,17 @@ impl RecordShelfApp {
             .selected_id()
             .and_then(|id| self.ownership.get(&id))
             .is_some_and(|copies| !copies.is_empty());
+        let library_off = self.library_link == LibraryLink::Off;
+        let auto_sync = self.settings.library_auto_sync;
         let mut clicked = None;
         ui.horizontal(|ui| {
             for cmd in Command::ALL {
                 // the label button only appears for records we own
                 if cmd.needs_ownership() && !owned {
+                    continue;
+                }
+                // the library buttons only appear when a database is configured
+                if matches!(cmd, Command::Sync | Command::AutoSync) && library_off {
                     continue;
                 }
                 let label = match cmd {
@@ -1544,6 +1930,10 @@ impl RecordShelfApp {
                     Command::Move => "Move".to_string(),
                     Command::Open => "Open in browser".to_string(),
                     Command::Print => "Print label".to_string(),
+                    Command::Sync => "Sync to library".to_string(),
+                    Command::AutoSync => {
+                        format!("Auto sync: {}", if auto_sync { "on" } else { "off" })
+                    }
                     Command::ChooseFolder => "Change folder".to_string(),
                     Command::Quit => "Quit".to_string(),
                 };
@@ -1638,6 +2028,12 @@ impl eframe::App for RecordShelfApp {
                         }
                     }
                 }
+                if let Some((text, color)) =
+                    library_indicator(&self.library_link, self.settings.library_auto_sync)
+                {
+                    ui.separator();
+                    ui.colored_label(color, text);
+                }
                 if let Some(notice) = &self.notice {
                     ui.separator();
                     let color = if notice.is_error {
@@ -1649,7 +2045,7 @@ impl eframe::App for RecordShelfApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.worker.pending() > 0 {
-                        ui.label("Contacting Discogs...");
+                        ui.label("Working...");
                         ui.spinner();
                     }
                 });
@@ -1782,6 +2178,41 @@ fn row_job(font: egui::FontId, text: String, owned_line: Option<String>) -> egui
         job.append(&format!("\n{line}"), 0.0, yellow);
     }
     job
+}
+
+/// Status bar indicator for the database link: text and colour.
+fn library_indicator(link: &LibraryLink, auto_sync: bool) -> Option<(String, Color32)> {
+    match link {
+        LibraryLink::Off => None,
+        LibraryLink::Connecting => Some(("Library: connecting...".into(), Color32::YELLOW)),
+        LibraryLink::Failed(_) => Some(("Library: not available".into(), Color32::RED)),
+        LibraryLink::Ready if auto_sync => {
+            Some(("Library: auto sync [U]".into(), Color32::LIGHT_GREEN))
+        }
+        LibraryLink::Ready => Some(("Library: manual sync [S], auto [U]".into(), Color32::YELLOW)),
+    }
+}
+
+/// How a release stands towards our database, compared with the Discogs
+/// collection: green when they agree, yellow when a sync is due.
+fn library_line(owned: Option<usize>, entry: Option<LibraryEntry>) -> Option<(String, Color32)> {
+    let (owned, in_library) = (owned?, usize::try_from(entry?.copies).unwrap_or(0));
+    match (owned, in_library) {
+        (0, 0) => None,
+        (o, l) if o == l => Some((format!("In the library ({l}x)"), Color32::LIGHT_GREEN)),
+        (_, 0) => Some((
+            "Not in the library yet (press S to sync)".into(),
+            Color32::YELLOW,
+        )),
+        (0, l) => Some((
+            format!("In the library ({l}x), but no longer in your collection (press S)"),
+            Color32::YELLOW,
+        )),
+        (o, l) => Some((
+            format!("Library has {l}x, your collection {o}x (press S to sync)"),
+            Color32::YELLOW,
+        )),
+    }
 }
 
 /// Text for the collection status of a release: "Nx in your collection: folders"
@@ -2820,6 +3251,523 @@ mod tests {
             app.shop_info
                 .as_ref()
                 .is_some_and(|i| i.contains("525768") && !i.contains("old"))
+        );
+    }
+
+    // --- library -------------------------------------------------------------
+
+    fn app_with_library(auto: bool) -> RecordShelfApp {
+        let mut app = app_ready_to_add();
+        app.library_link = LibraryLink::Ready;
+        app.settings.library_auto_sync = auto;
+        app.releases.insert(1, Release::default());
+        app
+    }
+
+    fn entry(copies: i16, has_cover: bool) -> LibraryEntry {
+        LibraryEntry { copies, has_cover }
+    }
+
+    #[test]
+    fn auto_sync_stores_an_owned_release_that_is_missing() {
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(app.library_busy.contains(&1));
+    }
+
+    #[test]
+    fn auto_sync_does_nothing_when_they_agree() {
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(2, true));
+        app.ownership.insert(1, vec![copy(10, 1), copy(11, 1)]);
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(app.worker.pending(), before);
+        assert!(app.library_busy.is_empty());
+    }
+
+    #[test]
+    fn auto_sync_updates_the_copy_count() {
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(1, true));
+        app.ownership.insert(1, vec![copy(10, 1), copy(11, 1)]);
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    #[test]
+    fn auto_sync_removes_a_release_that_is_no_longer_owned() {
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(1, true));
+        app.ownership.insert(1, Vec::new());
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(app.worker.pending(), before + 1);
+        // nothing to remove for a release that is not in the library
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, Vec::new());
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(app.worker.pending(), before);
+    }
+
+    #[test]
+    fn nothing_is_synced_without_the_data_it_needs() {
+        // collection status unknown
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(0, false));
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(app.worker.pending(), before);
+
+        // database status unknown: it is asked for, once, in one batch
+        let mut app = app_with_library(true);
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.after_data(1);
+        app.after_data(1);
+        assert_eq!(app.library_status_queue, vec![1]);
+        let before = app.worker.pending();
+        app.flush_library_status();
+        assert_eq!(app.worker.pending(), before + 1);
+        app.flush_library_status();
+        assert_eq!(
+            app.worker.pending(),
+            before + 1,
+            "an empty queue sends nothing"
+        );
+
+        // release data missing: it is requested instead
+        let mut app = app_with_library(true);
+        app.releases.clear();
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.after_data(1);
+        assert!(app.requested.contains(&1));
+        assert!(
+            app.library_busy.is_empty(),
+            "no sync without the release data"
+        );
+    }
+
+    #[test]
+    fn manual_mode_waits_for_s() {
+        let mut app = app_with_library(false);
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(
+            app.worker.pending(),
+            before,
+            "manual mode does not sync by itself"
+        );
+        app.run_command(Command::Sync);
+        assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    #[test]
+    fn s_refreshes_a_release_even_when_the_counts_agree() {
+        let mut app = app_with_library(false);
+        app.library.insert(1, entry(1, true));
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        let before = app.worker.pending();
+        app.run_command(Command::Sync);
+        assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    #[test]
+    fn s_waits_for_missing_data_and_then_syncs() {
+        let mut app = app_with_library(false);
+        app.releases.clear();
+        // nothing known yet: the release and the collection status are requested
+        app.run_command(Command::Sync);
+        assert!(app.requested.contains(&1) && app.pending_forced.contains(&1));
+        assert!(app.library_busy.is_empty());
+        // the data arrives one piece at a time
+        app.handle_response(Response::Ownership {
+            release_id: 1,
+            result: Ok(vec![copy(10, 1)]),
+        });
+        assert!(
+            app.library_busy.is_empty(),
+            "still waiting for the database status and the release"
+        );
+        app.handle_library_response(LibraryResponse::Status {
+            ids: vec![1],
+            result: Ok(std::collections::HashMap::new()),
+        });
+        assert!(app.library_busy.is_empty(), "still waiting for the release");
+        app.handle_response(Response::Release {
+            id: 1,
+            result: Ok(Release::default()),
+        });
+        assert!(
+            app.library_busy.contains(&1),
+            "now it syncs, although auto sync is off"
+        );
+        assert!(!app.pending_forced.contains(&1));
+    }
+
+    #[test]
+    fn s_for_a_release_we_do_not_own_says_so() {
+        let mut app = app_with_library(false);
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, Vec::new());
+        app.run_command(Command::Sync);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("Not in your collection"))
+        );
+        assert!(app.library_busy.is_empty());
+    }
+
+    #[test]
+    fn a_release_is_not_synced_twice_at_once() {
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.after_data(1);
+        let before = app.worker.pending();
+        app.after_data(1);
+        assert_eq!(
+            app.worker.pending(),
+            before,
+            "the first request is still on its way"
+        );
+    }
+
+    #[test]
+    fn the_library_commands_explain_why_they_cannot_run() {
+        let mut app = app_with_library(true);
+        app.library_link = LibraryLink::Off;
+        app.run_command(Command::Sync);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("database_url"))
+        );
+        app.run_command(Command::AutoSync);
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
+        assert!(app.settings.library_auto_sync, "the mode is unchanged");
+
+        app.library_link = LibraryLink::Failed("connection refused".into());
+        app.run_command(Command::Sync);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("connection refused"))
+        );
+        app.library_link = LibraryLink::Connecting;
+        app.run_command(Command::Sync);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| !n.is_error && n.text.contains("connecting"))
+        );
+    }
+
+    #[test]
+    fn u_switches_the_mode_and_remembers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_library(true);
+        app.config_path = Some(dir.path().join("config.toml"));
+        app.run_command(Command::AutoSync);
+        assert!(!app.settings.library_auto_sync);
+        assert!(
+            !Settings::load(&dir.path().join("config.toml"))
+                .unwrap()
+                .library_auto_sync
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("Auto sync off"))
+        );
+        app.run_command(Command::AutoSync);
+        assert!(app.settings.library_auto_sync);
+        assert!(
+            Settings::load(&dir.path().join("config.toml"))
+                .unwrap()
+                .library_auto_sync
+        );
+    }
+
+    #[test]
+    fn turning_auto_sync_on_catches_up_with_the_results() {
+        let mut app = app_with_library(false);
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        let before = app.worker.pending();
+        app.run_command(Command::AutoSync);
+        assert_eq!(
+            app.worker.pending(),
+            before + 1,
+            "the owned release is synced at once"
+        );
+    }
+
+    #[test]
+    fn database_answers_update_what_is_known() {
+        let mut app = app_with_library(false);
+        let mut found = std::collections::HashMap::new();
+        found.insert(1, entry(2, true));
+        app.handle_library_response(LibraryResponse::Status {
+            ids: vec![1, 2],
+            result: Ok(found),
+        });
+        assert_eq!(app.library[&1], entry(2, true));
+        assert_eq!(
+            app.library[&2],
+            entry(0, false),
+            "not found means not in the library"
+        );
+    }
+
+    #[test]
+    fn a_finished_sync_updates_the_entry_and_fetches_the_cover() {
+        let mut app = app_with_library(true);
+        app.library.insert(1, entry(0, false));
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.releases.insert(
+            1,
+            serde_json::from_str(r#"{"id": 1, "images": [{"type": "primary", "uri": "https://i.discogs.com/c.jpg"}]}"#).unwrap(),
+        );
+        app.library_busy.insert(1);
+        app.handle_library_response(LibraryResponse::Synced {
+            release_id: 1,
+            result: Ok(SyncOutcome::Saved {
+                created: true,
+                copies: 1,
+            }),
+        });
+        assert_eq!(app.library[&1], entry(1, false));
+        assert!(app.library_busy.is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.starts_with("Added to the library"))
+        );
+        assert_eq!(
+            app.cover_wanted.get("https://i.discogs.com/c.jpg"),
+            Some(&1)
+        );
+        assert!(
+            app.images.contains_key("https://i.discogs.com/c.jpg"),
+            "the download was started"
+        );
+    }
+
+    #[test]
+    fn a_downloaded_cover_is_stored_in_the_library() {
+        let mut app = app_with_library(true);
+        app.cover_wanted
+            .insert("https://i.discogs.com/c.jpg".into(), 1);
+        let before = app.worker.pending();
+        app.handle_response(Response::Image {
+            url: "https://i.discogs.com/c.jpg".into(),
+            result: Ok(vec![1, 2, 3]),
+        });
+        assert_eq!(app.worker.pending(), before + 1, "a store request was sent");
+        assert!(app.cover_wanted.is_empty());
+        // an image that was only displayed is not stored
+        let before = app.worker.pending();
+        app.handle_response(Response::Image {
+            url: "https://i.discogs.com/other.jpg".into(),
+            result: Ok(vec![1]),
+        });
+        assert_eq!(app.worker.pending(), before);
+    }
+
+    #[test]
+    fn a_cover_that_is_already_loaded_is_stored_without_downloading_again() {
+        let mut app = app_with_library(true);
+        app.releases.insert(
+            1,
+            serde_json::from_str(r#"{"id": 1, "images": [{"type": "primary", "uri": "https://i.discogs.com/c.jpg"}]}"#).unwrap(),
+        );
+        app.images.insert(
+            "https://i.discogs.com/c.jpg".into(),
+            ImageState::Ready(vec![1, 2].into()),
+        );
+        let before = app.worker.pending();
+        app.ensure_cover(1);
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(app.cover_wanted.is_empty());
+    }
+
+    #[test]
+    fn a_failed_cover_download_is_reported() {
+        let mut app = app_with_library(true);
+        app.cover_wanted
+            .insert("https://i.discogs.com/c.jpg".into(), 1);
+        app.handle_response(Response::Image {
+            url: "https://i.discogs.com/c.jpg".into(),
+            result: Err("403".into()),
+        });
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("cover"))
+        );
+    }
+
+    #[test]
+    fn connection_results_set_the_link() {
+        let mut app = app_with_library(true);
+        app.library_link = LibraryLink::Connecting;
+        app.handle_library_response(LibraryResponse::Ready { migrated: 1 });
+        assert_eq!(app.library_link, LibraryLink::Ready);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("1 migration"))
+        );
+        app.handle_library_response(LibraryResponse::Failed("connection refused".into()));
+        assert_eq!(
+            app.library_link,
+            LibraryLink::Failed("connection refused".into())
+        );
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
+        app.handle_library_response(LibraryResponse::Disabled);
+        assert_eq!(app.library_link, LibraryLink::Off);
+    }
+
+    #[test]
+    fn a_connection_made_later_looks_up_what_is_already_known() {
+        let mut app = app_with_library(true);
+        app.library_link = LibraryLink::Connecting;
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.handle_library_response(LibraryResponse::Ready { migrated: 0 });
+        assert_eq!(app.library_status_queue, vec![1]);
+    }
+
+    #[test]
+    fn a_failed_sync_is_reported_and_can_be_retried() {
+        let mut app = app_with_library(true);
+        app.library_busy.insert(1);
+        app.handle_library_response(LibraryResponse::Synced {
+            release_id: 1,
+            result: Err("connection lost".into()),
+        });
+        assert!(app.library_busy.is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("connection lost"))
+        );
+    }
+
+    #[test]
+    fn changing_the_database_url_reconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.library.insert(1, entry(1, true));
+        app.settings_draft.database_url = "postgres://x@127.0.0.1:1/y".into();
+        app.save_settings();
+        assert_eq!(app.library_link, LibraryLink::Connecting);
+        assert!(
+            app.library.is_empty(),
+            "what was known about the old database is forgotten"
+        );
+        app.open_settings();
+        app.settings_draft.database_url = String::new();
+        app.save_settings();
+        assert_eq!(app.library_link, LibraryLink::Off);
+    }
+
+    #[test]
+    fn auto_sync_can_be_chosen_in_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings_draft.library_auto_sync = false;
+        app.save_settings();
+        assert!(
+            !Settings::load(&dir.path().join("config.toml"))
+                .unwrap()
+                .library_auto_sync
+        );
+    }
+
+    #[test]
+    fn the_library_line_compares_collection_and_database() {
+        let text = |owned, e| library_line(owned, e).map(|(t, _)| t);
+        assert_eq!(
+            text(Some(1), Some(entry(1, true))).as_deref(),
+            Some("In the library (1x)")
+        );
+        assert_eq!(
+            text(Some(2), Some(entry(2, false))).as_deref(),
+            Some("In the library (2x)")
+        );
+        assert!(
+            text(Some(1), Some(entry(0, false)))
+                .unwrap()
+                .contains("Not in the library yet")
+        );
+        assert!(
+            text(Some(2), Some(entry(1, true)))
+                .unwrap()
+                .contains("Library has 1x, your collection 2x")
+        );
+        assert!(
+            text(Some(0), Some(entry(1, true)))
+                .unwrap()
+                .contains("no longer in your collection")
+        );
+        assert_eq!(
+            text(Some(0), Some(entry(0, false))),
+            None,
+            "nothing to say about a release we do not own"
+        );
+        assert_eq!(
+            text(None, Some(entry(1, true))),
+            None,
+            "collection status unknown"
+        );
+        assert_eq!(text(Some(1), None), None, "database status unknown");
+        assert_eq!(
+            library_line(Some(1), Some(entry(1, true))).unwrap().1,
+            Color32::LIGHT_GREEN
+        );
+        assert_eq!(
+            library_line(Some(1), Some(entry(0, false))).unwrap().1,
+            Color32::YELLOW
+        );
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_mode() {
+        assert_eq!(library_indicator(&LibraryLink::Off, true), None);
+        assert!(
+            library_indicator(&LibraryLink::Ready, true)
+                .unwrap()
+                .0
+                .contains("auto sync")
+        );
+        assert!(
+            library_indicator(&LibraryLink::Ready, false)
+                .unwrap()
+                .0
+                .contains("manual sync")
+        );
+        assert_eq!(
+            library_indicator(&LibraryLink::Failed("x".into()), true)
+                .unwrap()
+                .1,
+            Color32::RED
+        );
+        assert!(
+            library_indicator(&LibraryLink::Connecting, true)
+                .unwrap()
+                .0
+                .contains("connecting")
         );
     }
 }

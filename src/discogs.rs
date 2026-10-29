@@ -412,6 +412,22 @@ pub struct Release {
     pub tracklist: Option<Vec<Track>>,
     pub uri: Option<String>,
     pub images: Option<Vec<ReleaseImage>>,
+    pub master_id: Option<u32>,
+    /// Release date as Discogs gives it: "2017-03-10", "2017-03" or "2017"
+    /// (sometimes with zeros for what is unknown, e.g. "2017-00-00").
+    pub released: Option<String>,
+    pub notes: Option<String>,
+    /// Further credits (producer, remixer, ...).
+    pub extraartists: Option<Vec<Credit>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Credit {
+    pub id: Option<u32>,
+    pub name: Option<String>,
+    pub role: Option<String>,
+    /// Which tracks the credit applies to, free text such as "A1, B2".
+    pub tracks: Option<String>,
 }
 
 impl Release {
@@ -439,11 +455,15 @@ pub struct ReleaseImage {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Artist {
+    pub id: Option<u32>,
     pub name: Option<String>,
+    /// What the sleeve puts between this artist and the next ("&", ",", "feat.").
+    pub join: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Label {
+    pub id: Option<u32>,
     pub name: Option<String>,
     pub catno: Option<String>,
 }
@@ -451,6 +471,9 @@ pub struct Label {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Format {
     pub name: Option<String>,
+    /// Number of discs; Discogs sends it as a string.
+    #[serde(default, deserialize_with = "deserialize_opt_u32")]
+    pub qty: Option<u32>,
     pub descriptions: Option<Vec<String>>,
     /// Free text, e.g. the colour ("X-ray Colour") or "180 Gram / Green Marble".
     pub text: Option<String>,
@@ -492,6 +515,12 @@ pub struct Track {
     pub position: Option<String>,
     pub title: Option<String>,
     pub duration: Option<String>,
+    /// "track", "heading" or "index" (a track made of sub tracks).
+    #[serde(rename = "type_")]
+    pub kind: Option<String>,
+    pub sub_tracks: Option<Vec<Track>>,
+    /// Only given where they differ from the release artists.
+    pub artists: Option<Vec<Artist>>,
 }
 
 #[cfg(test)]
@@ -871,5 +900,50 @@ mod tests {
     fn move_instance_reports_http_errors() {
         let (base, _server) = serve_once("404 Not Found", r#"{"message": "nope"}"#);
         assert!(client(&base).move_instance("me", 3, 99, 1, 8).is_err());
+    }
+
+    #[test]
+    fn release_model_decodes_the_fields_for_our_database() {
+        let body = r#"{"id": 9, "master_id": 77, "title": "T", "released": "2017-03-10", "notes": "Pressed in DE",
+            "artists": [{"id": 1, "name": "A", "join": "feat."}, {"id": 2, "name": "B", "join": ""}],
+            "labels": [{"id": 5, "name": "L", "catno": "C-1"}],
+            "formats": [{"name": "Vinyl", "qty": "2", "descriptions": ["12\""], "text": "Green"}],
+            "extraartists": [{"id": 3, "name": "C", "role": "Producer", "tracks": "A1"}],
+            "tracklist": [{"position": "A1", "type_": "track", "title": "One", "duration": "3:00",
+                           "artists": [{"id": 4, "name": "D"}]},
+                          {"position": "", "type_": "heading", "title": "Side B"},
+                          {"position": "2", "type_": "index", "title": "Suite", "sub_tracks": [{"position": "2.1", "title": "Part 1"}]}]}"#;
+        let r: Release = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            (r.master_id, r.released.as_deref(), r.notes.as_deref()),
+            (Some(77), Some("2017-03-10"), Some("Pressed in DE"))
+        );
+        let artists = r.artists.unwrap();
+        assert_eq!(
+            (artists[0].id, artists[0].join.as_deref()),
+            (Some(1), Some("feat."))
+        );
+        assert_eq!(r.labels.unwrap()[0].id, Some(5));
+        assert_eq!(r.formats.unwrap()[0].qty, Some(2));
+        let credit = &r.extraartists.unwrap()[0];
+        assert_eq!(
+            (credit.id, credit.role.as_deref(), credit.tracks.as_deref()),
+            (Some(3), Some("Producer"), Some("A1"))
+        );
+        let tracks = r.tracklist.unwrap();
+        assert_eq!(tracks[0].artists.as_ref().unwrap()[0].id, Some(4));
+        assert_eq!(tracks[1].kind.as_deref(), Some("heading"));
+        assert_eq!(
+            tracks[2].sub_tracks.as_ref().unwrap()[0].title.as_deref(),
+            Some("Part 1")
+        );
+    }
+
+    #[test]
+    fn a_release_without_the_new_fields_still_decodes() {
+        let r: Release =
+            serde_json::from_str(r#"{"id": 1, "formats": [{"name": "Vinyl"}]}"#).unwrap();
+        assert_eq!(r.formats.unwrap()[0].qty, None);
+        assert!(r.master_id.is_none() && r.released.is_none() && r.extraartists.is_none());
     }
 }

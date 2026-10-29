@@ -3,12 +3,14 @@ use clap::Parser;
 use std::path::PathBuf;
 
 mod barcode_reader;
+mod catalogue;
 mod config;
 mod controls;
 mod decks;
 mod discogs;
 mod hhv;
 mod label;
+mod library;
 mod printer;
 mod shop_bridge;
 mod shops;

@@ -42,6 +42,8 @@ pub struct Settings {
     pub label_code: String,
     /// PostgreSQL connection string of our own database (written by `db/db.sh bootstrap`)
     pub database_url: String,
+    /// Keep our database in line with the Discogs collection automatically (key U switches)
+    pub library_auto_sync: bool,
     /// Settings this version does not know (hand written, or from a newer
     /// version) are kept when saving instead of being dropped.
     #[serde(flatten)]
@@ -68,6 +70,7 @@ impl Default for Settings {
             label_height_mm: 38.0,
             label_code: "barcode".to_string(),
             database_url: String::new(),
+            library_auto_sync: true,
             extra: std::collections::BTreeMap::new(),
         }
     }
@@ -310,6 +313,7 @@ mod printer_tests {
         assert_eq!(s.printer_speed_ips, 3);
         assert_eq!((s.label_width_mm, s.label_height_mm), (51.0, 38.0));
         assert_eq!(s.label_code, "barcode");
+        assert!(s.library_auto_sync && s.database_url.is_empty());
         assert_eq!(s.label_top_mm, 1.5);
     }
 

@@ -23,7 +23,10 @@ image = { version = "0.24", default-features = false, features = ["jpeg", "png"]
 qrcode = { version = "0.14", default-features = false }
 ab_glyph = "0.2"
 barcoders = { version = "2", default-features = false, features = ["std"] }
+postgres = "0.19"
+sha2 = "0.10"
 
 [dev-dependencies]
+libc = "0.2.191"
 rxing = "0.9"
 tempfile = "3.27.0"

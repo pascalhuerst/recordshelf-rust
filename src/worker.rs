@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::mpsc::{Receiver, Sender, channel},
     thread,
 };
@@ -6,12 +7,164 @@ use std::{
 use anyhow::{Context, Result};
 use eframe::egui;
 
+use crate::catalogue::CatalogueRelease;
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
 use crate::label::{self, CodeKind, LabelContent, LabelOptions, LabelSize};
+use crate::library::{Entry, Library};
 use crate::printer::{self, JobOptions, Printer};
 use crate::shops::{Shop, ShopEntry, search_plan};
+
+/// Requests for the thread that talks to our own database. Each one is
+/// answered by exactly one `LibraryResponse`.
+pub enum LibraryRequest {
+    /// (Re)connect with this URL and bring the schema up to date; an empty
+    /// URL switches the library off.
+    Configure {
+        url: String,
+    },
+    /// Copies and cover state of these releases.
+    Status(Vec<u32>),
+    Sync(Box<SyncJob>),
+    /// Store a downloaded cover for a release that is in the database.
+    Cover {
+        release_id: u32,
+        image: Vec<u8>,
+        source_url: String,
+    },
+}
+
+/// Bring one release in line with the Discogs collection.
+pub enum SyncJob {
+    /// We own `copies` copies: store the release.
+    Save {
+        release_id: u32,
+        release: Box<Release>,
+        copies: u16,
+    },
+    /// We own none (any more): remove it.
+    Remove { release_id: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Saved { created: bool, copies: u16 },
+    Removed { existed: bool },
+}
+
+pub enum LibraryResponse {
+    /// No database configured.
+    Disabled,
+    Ready {
+        /// Migrations applied while connecting.
+        migrated: usize,
+    },
+    Failed(String),
+    Status {
+        ids: Vec<u32>,
+        result: Result<HashMap<u32, Entry>, String>,
+    },
+    Synced {
+        release_id: u32,
+        result: Result<SyncOutcome, String>,
+    },
+    Cover {
+        release_id: u32,
+        result: Result<bool, String>,
+    },
+}
+
+/// State of the database thread: the URL, and the connection if there is one.
+#[derive(Default)]
+pub struct LibraryState {
+    url: String,
+    library: Option<Library>,
+}
+
+impl LibraryState {
+    /// The connection, reconnecting if it was lost.
+    fn connection(&mut self) -> Result<&mut Library, String> {
+        if self.url.trim().is_empty() {
+            return Err("no database configured".to_string());
+        }
+        if self.library.as_ref().is_none_or(Library::is_closed) {
+            match Library::connect(&self.url) {
+                Ok((library, _)) => self.library = Some(library),
+                Err(err) => {
+                    self.library = None;
+                    return Err(format!("{err:#}"));
+                }
+            }
+        }
+        Ok(self.library.as_mut().expect("connected above"))
+    }
+
+    pub fn handle(&mut self, request: LibraryRequest) -> LibraryResponse {
+        match request {
+            LibraryRequest::Configure { url } => {
+                self.url = url.trim().to_string();
+                self.library = None;
+                if self.url.is_empty() {
+                    return LibraryResponse::Disabled;
+                }
+                match Library::connect(&self.url) {
+                    Ok((library, migrated)) => {
+                        self.library = Some(library);
+                        LibraryResponse::Ready { migrated }
+                    }
+                    Err(err) => LibraryResponse::Failed(format!("{err:#}")),
+                }
+            }
+            LibraryRequest::Status(ids) => {
+                let result = self
+                    .connection()
+                    .and_then(|l| l.status(&ids).map_err(|e| format!("{e:#}")));
+                LibraryResponse::Status { ids, result }
+            }
+            LibraryRequest::Sync(job) => {
+                let release_id = match job.as_ref() {
+                    SyncJob::Save { release_id, .. } | SyncJob::Remove { release_id } => {
+                        *release_id
+                    }
+                };
+                let result = self.connection().and_then(|library| match *job {
+                    SyncJob::Save {
+                        release_id,
+                        release,
+                        copies,
+                    } => {
+                        let record = CatalogueRelease::from_release(release_id, &release, copies)
+                            .map_err(|e| format!("{e:#}"))?;
+                        let saved = library
+                            .save_release(&record)
+                            .map_err(|e| format!("{e:#}"))?;
+                        Ok(SyncOutcome::Saved {
+                            created: saved.created,
+                            copies,
+                        })
+                    }
+                    SyncJob::Remove { release_id } => library
+                        .delete_release(release_id)
+                        .map(|existed| SyncOutcome::Removed { existed })
+                        .map_err(|e| format!("{e:#}")),
+                });
+                LibraryResponse::Synced { release_id, result }
+            }
+            LibraryRequest::Cover {
+                release_id,
+                image,
+                source_url,
+            } => {
+                let result = self.connection().and_then(|l| {
+                    l.save_cover(release_id, &image, Some(&source_url))
+                        .map_err(|e| format!("{e:#}"))
+                });
+                LibraryResponse::Cover { release_id, result }
+            }
+        }
+    }
+}
 
 /// Everything needed to print one label (taken from the settings when the
 /// key is pressed).
@@ -78,6 +231,8 @@ pub enum Request {
     },
     /// Draw a label and send it to the printer.
     PrintLabel(Box<PrintJob>),
+    /// Work on our own database (handled by a thread of its own).
+    Library(LibraryRequest),
     /// Moves copies to another folder: `(current folder, instance id)` pairs.
     MoveCopies {
         release_id: u32,
@@ -130,6 +285,7 @@ pub enum Response {
         release_id: u32,
         result: Result<(), String>,
     },
+    Library(LibraryResponse),
     Moved {
         release_id: u32,
         to_folder: u32,
@@ -144,6 +300,7 @@ pub enum Response {
 pub struct Worker {
     tx: Sender<Request>,
     image_tx: Sender<Request>,
+    library_tx: Sender<LibraryRequest>,
     rx: Receiver<Response>,
     pending: usize,
 }
@@ -152,13 +309,36 @@ impl Worker {
     pub fn spawn(repaint: egui::Context) -> Self {
         let (resp_tx, resp_rx) = channel::<Response>();
         let tx = Self::spawn_thread("discogs-worker", resp_tx.clone(), repaint.clone());
-        let image_tx = Self::spawn_thread("discogs-images", resp_tx, repaint);
+        let image_tx = Self::spawn_thread("discogs-images", resp_tx.clone(), repaint.clone());
+        let library_tx = Self::spawn_library_thread(resp_tx, repaint);
         Self {
             tx,
             image_tx,
+            library_tx,
             rx: resp_rx,
             pending: 0,
         }
+    }
+
+    fn spawn_library_thread(
+        resp_tx: Sender<Response>,
+        repaint: egui::Context,
+    ) -> Sender<LibraryRequest> {
+        let (req_tx, req_rx) = channel::<LibraryRequest>();
+        thread::Builder::new()
+            .name("library".to_string())
+            .spawn(move || {
+                let mut state = LibraryState::default();
+                while let Ok(request) = req_rx.recv() {
+                    let response = Response::Library(state.handle(request));
+                    if resp_tx.send(response).is_err() {
+                        break;
+                    }
+                    repaint.request_repaint();
+                }
+            })
+            .expect("spawn library thread");
+        req_tx
     }
 
     fn spawn_thread(
@@ -189,6 +369,13 @@ impl Worker {
 
     pub fn send(&mut self, req: Request) {
         match req {
+            Request::Library(request) => {
+                // connecting is shown by the library indicator, not by the spinner
+                if !matches!(request, LibraryRequest::Configure { .. }) {
+                    self.pending += 1;
+                }
+                let _ = self.library_tx.send(request);
+            }
             Request::FetchImage(_) => {
                 let _ = self.image_tx.send(req);
             }
@@ -211,7 +398,17 @@ impl Worker {
         let out: Vec<Response> = self.rx.try_iter().collect();
         let answered = out
             .iter()
-            .filter(|r| !matches!(r, Response::Image { .. }))
+            .filter(|r| {
+                !matches!(
+                    r,
+                    Response::Image { .. }
+                        | Response::Library(
+                            LibraryResponse::Disabled
+                                | LibraryResponse::Ready { .. }
+                                | LibraryResponse::Failed(_)
+                        )
+                )
+            })
             .count();
         self.pending = self.pending.saturating_sub(answered);
         out
@@ -295,6 +492,8 @@ impl State {
                     result,
                 }
             }
+            // handled by the library thread, never gets here
+            Request::Library(_) => return None,
             Request::PrintLabel(job) => Response::Printed {
                 release_id: job.content.release_id,
                 result: job.run().map_err(|e| format!("{e:#}")),
@@ -580,5 +779,248 @@ mod tests {
             }) => assert!(msg.contains("connect to printer"), "{msg}"),
             _ => panic!("expected a failed print"),
         }
+    }
+
+    // --- the database thread, against a real PostgreSQL ------------------------
+
+    fn release_json(id: u32, title: &str) -> Release {
+        serde_json::from_str(&format!(
+            r#"{{"id": {id}, "title": "{title}", "released": "2017-03",
+                "artists": [{{"id": 1, "name": "Artist"}}],
+                "labels": [{{"id": 5, "name": "Label", "catno": "CAT 1"}}],
+                "formats": [{{"name": "Vinyl", "descriptions": ["12\""]}}],
+                "tracklist": [{{"position": "A1", "title": "One", "duration": "3:00"}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn save_job(id: u32, copies: u16) -> LibraryRequest {
+        LibraryRequest::Sync(Box::new(SyncJob::Save {
+            release_id: id,
+            release: Box::new(release_json(id, "A Title")),
+            copies,
+        }))
+    }
+
+    fn png() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(30, 30, |x, y| image::Rgb([x as u8, y as u8, 7]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn the_library_thread_walks_through_a_releases_life() {
+        let Some(server) = crate::library::testing::server() else {
+            return;
+        };
+        let mut state = LibraryState::default();
+        let url = server.new_database("w_life");
+        assert!(matches!(
+            state.handle(LibraryRequest::Configure { url }),
+            LibraryResponse::Ready { migrated: 1 }
+        ));
+
+        // not there yet
+        match state.handle(LibraryRequest::Status(vec![7])) {
+            LibraryResponse::Status { ids, result } => {
+                assert_eq!(ids, vec![7]);
+                assert!(result.unwrap().is_empty());
+            }
+            _ => panic!("expected a status"),
+        }
+        // stored
+        match state.handle(save_job(7, 2)) {
+            LibraryResponse::Synced {
+                release_id: 7,
+                result,
+            } => {
+                assert_eq!(
+                    result.unwrap(),
+                    SyncOutcome::Saved {
+                        created: true,
+                        copies: 2
+                    }
+                );
+            }
+            _ => panic!("expected a sync result"),
+        }
+        // a second copy on Discogs: updated, not created
+        match state.handle(save_job(7, 3)) {
+            LibraryResponse::Synced { result, .. } => {
+                assert_eq!(
+                    result.unwrap(),
+                    SyncOutcome::Saved {
+                        created: false,
+                        copies: 3
+                    }
+                );
+            }
+            _ => panic!(),
+        }
+        // the cover
+        match state.handle(LibraryRequest::Cover {
+            release_id: 7,
+            image: png(),
+            source_url: "https://i.discogs.com/c.png".into(),
+        }) {
+            LibraryResponse::Cover {
+                release_id: 7,
+                result,
+            } => assert!(result.unwrap()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Status(vec![7, 8])) {
+            LibraryResponse::Status { result, .. } => {
+                let found = result.unwrap();
+                assert_eq!(found.len(), 1);
+                assert_eq!(
+                    found[&7],
+                    Entry {
+                        copies: 3,
+                        has_cover: true
+                    }
+                );
+            }
+            _ => panic!(),
+        }
+        // gone from the collection: removed, with its cover
+        match state.handle(LibraryRequest::Sync(Box::new(SyncJob::Remove {
+            release_id: 7,
+        }))) {
+            LibraryResponse::Synced { result, .. } => {
+                assert_eq!(result.unwrap(), SyncOutcome::Removed { existed: true });
+            }
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Sync(Box::new(SyncJob::Remove {
+            release_id: 7,
+        }))) {
+            LibraryResponse::Synced { result, .. } => {
+                assert_eq!(result.unwrap(), SyncOutcome::Removed { existed: false });
+            }
+            _ => panic!(),
+        }
+        // a cover for a release that is not (any more) there is not stored
+        match state.handle(LibraryRequest::Cover {
+            release_id: 7,
+            image: png(),
+            source_url: String::new(),
+        }) {
+            LibraryResponse::Cover { result, .. } => assert!(!result.unwrap()),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn requests_without_a_database_fail_with_a_message() {
+        let mut state = LibraryState::default();
+        assert!(matches!(
+            state.handle(LibraryRequest::Configure { url: "  ".into() }),
+            LibraryResponse::Disabled
+        ));
+        match state.handle(LibraryRequest::Status(vec![1])) {
+            LibraryResponse::Status { result, .. } => {
+                assert!(result.unwrap_err().contains("no database configured"))
+            }
+            _ => panic!(),
+        }
+        match state.handle(save_job(1, 1)) {
+            LibraryResponse::Synced { result, .. } => assert!(result.is_err()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Cover {
+            release_id: 1,
+            image: png(),
+            source_url: String::new(),
+        }) {
+            LibraryResponse::Cover { result, .. } => assert!(result.is_err()),
+            _ => panic!(),
+        }
+        // an unreachable database is a failed connection, not a crash
+        match state.handle(LibraryRequest::Configure {
+            url: "postgres://x@127.0.0.1:1/y".into(),
+        }) {
+            LibraryResponse::Failed(msg) => {
+                assert!(msg.contains("connect to the database"), "{msg}")
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn a_release_without_a_title_is_reported_not_stored() {
+        let Some(server) = crate::library::testing::server() else {
+            return;
+        };
+        let mut state = LibraryState::default();
+        state.handle(LibraryRequest::Configure {
+            url: server.new_database("w_notitle"),
+        });
+        let job = LibraryRequest::Sync(Box::new(SyncJob::Save {
+            release_id: 3,
+            release: Box::new(Release::default()),
+            copies: 1,
+        }));
+        match state.handle(job) {
+            LibraryResponse::Synced { result, .. } => {
+                assert!(result.unwrap_err().contains("no title"))
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn the_connection_is_rebuilt_after_it_was_lost() {
+        let Some(server) = crate::library::testing::server() else {
+            return;
+        };
+        let mut state = LibraryState::default();
+        let url = server.new_database("w_reconnect");
+        state.handle(LibraryRequest::Configure { url: url.clone() });
+        state.handle(save_job(1, 1));
+        // the server drops the connection (e.g. a restart)
+        let mut admin = crate::library::testing::raw(&url);
+        admin
+            .execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'w_reconnect' AND pid <> pg_backend_pid()",
+                &[],
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // the first request after that may fail on the dead connection; the next one works again
+        let _ = state.handle(LibraryRequest::Status(vec![1]));
+        match state.handle(LibraryRequest::Status(vec![1])) {
+            LibraryResponse::Status { result, .. } => assert_eq!(result.unwrap()[&1].copies, 1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn library_requests_are_counted_but_connecting_is_not() {
+        let Some(server) = crate::library::testing::server() else {
+            return;
+        };
+        let mut worker = Worker::spawn(egui::Context::default());
+        worker.send(Request::Library(LibraryRequest::Configure {
+            url: server.new_database("w_pending"),
+        }));
+        assert_eq!(worker.pending(), 0, "connecting is not counted");
+        worker.send(Request::Library(LibraryRequest::Status(vec![1])));
+        assert_eq!(worker.pending(), 1);
+        let mut responses = Vec::new();
+        for _ in 0..300 {
+            responses.extend(worker.poll());
+            if responses.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(responses.len(), 2, "the connection result and the status");
+        assert_eq!(worker.pending(), 0);
+        assert!(matches!(
+            responses[0],
+            Response::Library(LibraryResponse::Ready { .. })
+        ));
     }
 }
