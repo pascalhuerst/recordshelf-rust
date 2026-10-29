@@ -93,6 +93,27 @@ impl DiscogsClient {
         Ok(resp.releases)
     }
 
+    /// Downloads an image. Discogs image URLs need the API credentials, which
+    /// are only ever sent to discogs.com hosts.
+    pub fn image(&self, url: &str) -> Result<Vec<u8>> {
+        let parsed = reqwest::Url::parse(url).context("parse image url")?;
+        let host = parsed.host_str().unwrap_or_default();
+        anyhow::ensure!(
+            host == "discogs.com" || host.ends_with(".discogs.com"),
+            "refusing to fetch image from {host}"
+        );
+        let bytes = self
+            .http
+            .get(parsed)
+            .send()
+            .context("send image request")?
+            .error_for_status()
+            .context("Discogs image error response")?
+            .bytes()
+            .context("read image body")?;
+        Ok(bytes.to_vec())
+    }
+
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResponse> {
         let url = format!("{}/database/search", self.base);
         self.get(&url, &query.params(&self.currency), "search")
@@ -190,25 +211,13 @@ pub struct SearchItem {
     pub format_descriptions: Option<Vec<String>>,
     #[serde(deserialize_with = "deserialize_opt_string")]
     pub uri: Option<String>,
+    /// Small cover (150px) for list rows.
+    #[serde(deserialize_with = "deserialize_opt_string")]
+    pub thumb: Option<String>,
 }
 impl SearchItem {
     pub fn title_display(&self) -> String {
         self.title.clone().unwrap_or_default()
-    }
-
-    pub fn artist_display(&self) -> String {
-        if let Some(a) = &self.artist
-            && !a.is_empty()
-        {
-            return a.clone();
-        }
-        // Fallback: derive from title "Artist - Title"
-        if let Some(t) = &self.title
-            && let Some((artist, _)) = t.split_once(" - ")
-        {
-            return artist.trim().to_string();
-        }
-        String::new()
     }
 
     pub fn label_display(&self) -> String {
@@ -301,6 +310,30 @@ pub struct Release {
     pub styles: Option<Vec<String>>,
     pub tracklist: Option<Vec<Track>>,
     pub uri: Option<String>,
+    pub images: Option<Vec<ReleaseImage>>,
+}
+
+impl Release {
+    /// URL of the main cover picture (the "primary" image, else the first).
+    pub fn cover_url(&self) -> Option<&str> {
+        let images = self.images.as_ref()?;
+        let image = images
+            .iter()
+            .find(|i| i.kind.as_deref() == Some("primary"))
+            .or_else(|| images.first())?;
+        [image.uri.as_deref(), image.uri150.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|u| !u.is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReleaseImage {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub uri: Option<String>,
+    pub uri150: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -502,16 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn artist_falls_back_to_title_prefix() {
-        let it = item(r#"{"id": 1, "title": "Miles Davis - Kind of Blue"}"#);
-        assert_eq!(it.artist_display(), "Miles Davis");
-        let it = item(r#"{"id": 1, "title": "Kind of Blue", "artist": "Miles Davis"}"#);
-        assert_eq!(it.artist_display(), "Miles Davis");
-        let it = item(r#"{"id": 1, "title": "Untitled"}"#);
-        assert_eq!(it.artist_display(), "");
-    }
-
-    #[test]
     fn display_helpers_join_fields() {
         let it = item(
             r#"{"id": 1, "label": ["Blue Note", "Other"], "catno": "BLP 1", "format": ["Vinyl", "LP"]}"#,
@@ -533,5 +556,57 @@ mod tests {
         assert_eq!(r.artists.unwrap()[0].name.as_deref(), Some("A"));
         assert_eq!(r.labels.unwrap()[0].catno.as_deref(), Some("C-1"));
         assert_eq!(r.tracklist.unwrap()[0].duration.as_deref(), Some("3:00"));
+    }
+
+    #[test]
+    fn search_item_has_thumbnail() {
+        let it = item(r#"{"id": 1, "thumb": "https://i.discogs.com/abc/thumb.jpg"}"#);
+        assert_eq!(
+            it.thumb.as_deref(),
+            Some("https://i.discogs.com/abc/thumb.jpg")
+        );
+        assert_eq!(item(r#"{"id": 1}"#).thumb, None);
+    }
+
+    fn release_with_images(json: &str) -> Release {
+        serde_json::from_str(&format!(r#"{{"images": {json}}}"#)).unwrap()
+    }
+
+    #[test]
+    fn cover_prefers_primary_image() {
+        let r = release_with_images(
+            r#"[{"type": "secondary", "uri": "https://i.discogs.com/b.jpg", "uri150": "https://i.discogs.com/b150.jpg"},
+                {"type": "primary", "uri": "https://i.discogs.com/a.jpg", "uri150": "https://i.discogs.com/a150.jpg"}]"#,
+        );
+        assert_eq!(r.cover_url(), Some("https://i.discogs.com/a.jpg"));
+    }
+
+    #[test]
+    fn cover_falls_back_to_first_image_and_small_uri() {
+        let r = release_with_images(
+            r#"[{"type": "secondary", "uri": "", "uri150": "https://i.discogs.com/s.jpg"}]"#,
+        );
+        assert_eq!(r.cover_url(), Some("https://i.discogs.com/s.jpg"));
+    }
+
+    #[test]
+    fn cover_is_none_without_images() {
+        assert_eq!(release_with_images("[]").cover_url(), None);
+        let r: Release = serde_json::from_str("{}").unwrap();
+        assert_eq!(r.cover_url(), None);
+    }
+
+    #[test]
+    fn images_are_only_fetched_from_discogs_hosts() {
+        let c = DiscogsClient::new("ua", "secret", "EUR").unwrap();
+        for url in [
+            "https://example.com/a.jpg",
+            "http://127.0.0.1:1/a.jpg",
+            "https://evildiscogs.com/a.jpg",
+            "https://discogs.com.evil.org/a.jpg",
+            "not a url",
+        ] {
+            assert!(c.image(url).is_err(), "{url}");
+        }
     }
 }

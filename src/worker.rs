@@ -25,6 +25,9 @@ pub enum Request {
     LoadRelease(u32),
     LoadFolders,
     CheckOwnership(u32),
+    /// Download a cover image. Handled by a separate thread and not counted in
+    /// `pending()`, so pictures never delay or flag normal requests.
+    FetchImage(String),
     /// Find Discogs releases for a decks.de entry (by catalog number etc.).
     DecksLookup {
         code: String,
@@ -53,6 +56,10 @@ pub enum Response {
         entry: DecksEntry,
         result: Result<Vec<SearchItem>, String>,
     },
+    Image {
+        url: String,
+        result: Result<Vec<u8>, String>,
+    },
     Added {
         release_id: u32,
         folder_id: u32,
@@ -72,20 +79,37 @@ pub struct ScanResult {
     pub elapsed: Duration,
 }
 
-/// Handle to the background thread that talks to Discogs, so the UI thread
-/// never blocks on the network.
+/// Handle to the background threads that talk to Discogs, so the UI thread
+/// never blocks on the network. One thread handles API requests in order, a
+/// second one downloads images.
 pub struct Worker {
     tx: Sender<Request>,
+    image_tx: Sender<Request>,
     rx: Receiver<Response>,
     pending: usize,
 }
 
 impl Worker {
     pub fn spawn(repaint: egui::Context) -> Self {
-        let (req_tx, req_rx) = channel::<Request>();
         let (resp_tx, resp_rx) = channel::<Response>();
+        let tx = Self::spawn_thread("discogs-worker", resp_tx.clone(), repaint.clone());
+        let image_tx = Self::spawn_thread("discogs-images", resp_tx, repaint);
+        Self {
+            tx,
+            image_tx,
+            rx: resp_rx,
+            pending: 0,
+        }
+    }
+
+    fn spawn_thread(
+        name: &str,
+        resp_tx: Sender<Response>,
+        repaint: egui::Context,
+    ) -> Sender<Request> {
+        let (req_tx, req_rx) = channel::<Request>();
         thread::Builder::new()
-            .name("discogs-worker".to_string())
+            .name(name.to_string())
             .spawn(move || {
                 let mut state = State {
                     client: None,
@@ -101,28 +125,40 @@ impl Worker {
                 }
             })
             .expect("spawn discogs worker");
-        Self {
-            tx: req_tx,
-            rx: resp_rx,
-            pending: 0,
-        }
+        req_tx
     }
 
     pub fn send(&mut self, req: Request) {
-        if !matches!(req, Request::Configure { .. }) {
-            self.pending += 1;
+        match req {
+            Request::FetchImage(_) => {
+                let _ = self.image_tx.send(req);
+            }
+            Request::Configure { client, username } => {
+                let _ = self.image_tx.send(Request::Configure {
+                    client: client.clone(),
+                    username: username.clone(),
+                });
+                let _ = self.tx.send(Request::Configure { client, username });
+            }
+            _ => {
+                self.pending += 1;
+                let _ = self.tx.send(req);
+            }
         }
-        let _ = self.tx.send(req);
     }
 
     /// Collects finished responses without blocking.
     pub fn poll(&mut self) -> Vec<Response> {
         let out: Vec<Response> = self.rx.try_iter().collect();
-        self.pending = self.pending.saturating_sub(out.len());
+        let answered = out
+            .iter()
+            .filter(|r| !matches!(r, Response::Image { .. }))
+            .count();
+        self.pending = self.pending.saturating_sub(answered);
         out
     }
 
-    /// Number of requests sent but not yet answered.
+    /// Number of requests sent but not yet answered (images excluded).
     pub fn pending(&self) -> usize {
         self.pending
     }
@@ -181,6 +217,13 @@ impl State {
                     .and_then(|u| self.client()?.collection_instances(u, release_id))
                     .map_err(|e| format!("{e:#}")),
             },
+            Request::FetchImage(url) => {
+                let result = self
+                    .client()
+                    .and_then(|c| c.image(&url))
+                    .map_err(|e| format!("{e:#}"));
+                Response::Image { url, result }
+            }
             Request::DecksLookup { code, entry } => {
                 let result = self.decks_lookup(&entry).map_err(|e| format!("{e:#}"));
                 Response::Decks {
@@ -376,5 +419,31 @@ mod tests {
         });
         assert!(resp.is_none());
         assert_eq!(state.username, "new");
+    }
+
+    #[test]
+    fn image_requests_do_not_count_as_pending() {
+        let mut worker = Worker::spawn(egui::Context::default());
+        worker.send(Request::FetchImage("https://i.discogs.com/x.jpg".into()));
+        assert_eq!(worker.pending(), 0);
+        worker.send(Request::LoadFolders);
+        assert_eq!(worker.pending(), 1);
+
+        // No client is configured, so both answer immediately with an error.
+        let mut responses = Vec::new();
+        for _ in 0..200 {
+            responses.extend(worker.poll());
+            if responses.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(responses.len(), 2);
+        assert!(
+            responses
+                .iter()
+                .any(|r| matches!(r, Response::Image { result: Err(_), .. }))
+        );
+        assert_eq!(worker.pending(), 0);
     }
 }

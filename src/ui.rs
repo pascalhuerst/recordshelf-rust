@@ -24,6 +24,16 @@ pub enum Tab {
     Search,
 }
 
+/// Download state of a cover picture, keyed by URL.
+enum ImageState {
+    Loading,
+    Ready(Arc<[u8]>),
+    Failed,
+}
+
+const THUMB_SIZE: f32 = 56.0;
+const COVER_SIZE: f32 = 220.0;
+
 /// The decks.de bridge: localhost server plus the channel for its results.
 struct DecksState {
     bridge: Bridge,
@@ -62,6 +72,7 @@ pub struct RecordShelfApp {
     selected_result: Option<usize>,
     selected_release: Option<Release>,
     settings_open: bool,
+    images: HashMap<String, ImageState>,
     decks: Option<DecksState>,
     decks_info: Option<String>,
     settings_draft: Settings,
@@ -75,6 +86,7 @@ impl RecordShelfApp {
         config_path: Option<PathBuf>,
         decks_port: Option<u16>,
     ) -> Self {
+        egui_extras::install_image_loaders(&repaint);
         let (scanner_stop, scanner_rx, scanner_status) = start_scanner(&settings, &repaint);
         let mut app = Self {
             worker: Worker::spawn(repaint.clone()),
@@ -101,6 +113,7 @@ impl RecordShelfApp {
             selected_result: None,
             selected_release: None,
             settings_open: false,
+            images: HashMap::new(),
             decks: None,
             decks_info: None,
             settings_draft: Settings::default(),
@@ -223,6 +236,14 @@ impl RecordShelfApp {
         self.load_selected_release();
     }
 
+    /// Starts downloading a picture unless it is already loading or cached.
+    fn ensure_image(&mut self, url: &str) {
+        if !self.images.contains_key(url) {
+            self.images.insert(url.to_string(), ImageState::Loading);
+            self.worker.send(Request::FetchImage(url.to_string()));
+        }
+    }
+
     fn open_settings(&mut self) {
         self.settings_draft = self.settings.clone();
         self.devices = barcode_reader::list_devices();
@@ -247,6 +268,7 @@ impl RecordShelfApp {
         self.folders.clear();
         self.folder_selected = None;
         self.ownership.clear();
+        self.images.clear();
         self.notice = None;
         self.configure_worker();
         if self.config_path.is_none() {
@@ -415,6 +437,13 @@ impl RecordShelfApp {
                 Ok(items) => self.show_decks_candidates(&code, &entry, items),
                 Err(err) => self.set_error(err),
             },
+            Response::Image { url, result } => {
+                let state = match result {
+                    Ok(bytes) => ImageState::Ready(bytes.into()),
+                    Err(_) => ImageState::Failed,
+                };
+                self.images.insert(url, state);
+            }
             Response::Folders(Ok(folders)) => {
                 self.folders = folders;
                 self.folder_selected = match self.folder_selected {
@@ -452,6 +481,14 @@ impl RecordShelfApp {
     }
 
     fn ui_scan(&mut self, ui: &mut egui::Ui) {
+        let cover = self
+            .scan_result
+            .as_ref()
+            .and_then(|r| r.release.as_ref()?.cover_url())
+            .map(str::to_string);
+        if let Some(url) = &cover {
+            self.ensure_image(url);
+        }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -471,8 +508,15 @@ impl RecordShelfApp {
                                 ),
                             );
                         }
-                        render_ownership(ui, result.owned.as_deref(), &self.folders);
-                        render_release(ui, release);
+                        ui.horizontal_top(|ui| {
+                            if let Some(url) = &cover {
+                                draw_image(ui, &self.images, url, COVER_SIZE);
+                            }
+                            ui.vertical(|ui| {
+                                render_ownership(ui, result.owned.as_deref(), &self.folders);
+                                render_release(ui, release);
+                            });
+                        });
                     } else {
                         ui.label("No data");
                     }
@@ -520,21 +564,24 @@ impl RecordShelfApp {
 
         ui.separator();
 
+        let mut to_fetch: Vec<String> = Vec::new();
         egui::ScrollArea::vertical()
             .id_source("search-results")
             .max_height(ui.available_height() * 0.5)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (idx, item) in self.search_results.iter().enumerate() {
-                    let line = format!(
-                        "{} | {} | {} | {} | {} | {}",
-                        item.title_display(),
-                        item.artist_display(),
+                    let details = [
                         item.label_display(),
                         item.year.map(|y| y.to_string()).unwrap_or_default(),
                         item.country.clone().unwrap_or_default(),
-                        item.format_display()
-                    );
+                        item.format_display(),
+                    ]
+                    .into_iter()
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                    let line = format!("{}\n{details}", item.title_display());
                     let owned = item
                         .id
                         .and_then(|id| self.ownership.get(&id))
@@ -544,14 +591,35 @@ impl RecordShelfApp {
                     } else {
                         RichText::new(line)
                     };
-                    if ui
-                        .selectable_label(self.selected_result == Some(idx), text)
-                        .clicked()
-                    {
-                        self.selected_result = Some(idx);
-                    }
+                    let row_top = ui.cursor().min;
+                    let visible = ui.is_rect_visible(egui::Rect::from_min_size(
+                        row_top,
+                        egui::vec2(1.0, THUMB_SIZE),
+                    ));
+                    ui.horizontal(|ui| {
+                        match item.thumb.as_deref().filter(|u| !u.is_empty()) {
+                            Some(url) => {
+                                // Only fetch pictures of rows that are actually on screen.
+                                if !draw_image(ui, &self.images, url, THUMB_SIZE) && visible {
+                                    to_fetch.push(url.to_string());
+                                }
+                            }
+                            None => {
+                                ui.allocate_space(egui::vec2(THUMB_SIZE, THUMB_SIZE));
+                            }
+                        }
+                        if ui
+                            .selectable_label(self.selected_result == Some(idx), text)
+                            .clicked()
+                        {
+                            self.selected_result = Some(idx);
+                        }
+                    });
                 }
             });
+        for url in to_fetch {
+            self.ensure_image(&url);
+        }
 
         // Keyboard handling. Skipped while typing, and on the frame a search was
         // triggered by Enter so that the same keypress does not also pick a result.
@@ -564,14 +632,29 @@ impl RecordShelfApp {
 
         ui.separator();
 
+        let cover = self
+            .selected_release
+            .as_ref()
+            .and_then(|r| r.cover_url())
+            .map(str::to_string);
+        if let Some(url) = &cover {
+            self.ensure_image(url);
+        }
         egui::ScrollArea::vertical()
             .id_source("search-release")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(release) = &self.selected_release {
                     let owned = release.id.and_then(|id| self.ownership.get(&id));
-                    render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
-                    render_release(ui, release);
+                    ui.horizontal_top(|ui| {
+                        if let Some(url) = &cover {
+                            draw_image(ui, &self.images, url, COVER_SIZE);
+                        }
+                        ui.vertical(|ui| {
+                            render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
+                            render_release(ui, release);
+                        });
+                    });
                 }
             });
     }
@@ -815,6 +898,34 @@ fn start_scanner(
             None => "No scanner configured (set device_name in the settings file)".to_string(),
         };
     (stop, rx, status)
+}
+
+/// Draws a downloaded picture (or an empty placeholder of the same size).
+/// Returns whether the URL is already known, i.e. needs no fetch.
+fn draw_image(
+    ui: &mut egui::Ui,
+    images: &HashMap<String, ImageState>,
+    url: &str,
+    size: f32,
+) -> bool {
+    match images.get(url) {
+        Some(ImageState::Ready(bytes)) => {
+            ui.add(
+                egui::Image::from_bytes(format!("bytes://{url}"), bytes.clone())
+                    .max_size(egui::vec2(size, size))
+                    .rounding(3.0),
+            );
+            true
+        }
+        Some(_) => {
+            ui.allocate_space(egui::vec2(size, size));
+            true
+        }
+        None => {
+            ui.allocate_space(egui::vec2(size, size));
+            false
+        }
+    }
 }
 
 fn non_empty(s: &str) -> Option<String> {

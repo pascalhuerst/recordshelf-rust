@@ -18,6 +18,7 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 - `barcode_reader.rs` – evdev: `list_devices`, `pick_device`, scanner thread (non-blocking, stoppable via flag). Only emits `ScanEvent::{Info, Code}`.
 - `worker.rs` – single background thread owning the Discogs client. UI sends `Request`s, polls `Response`s (one response per request, FIFO; `Configure` has none). `pending()` drives the status-bar spinner. `ScanCode::classify`: 12–14 digits = UPC/EAN barcode (searched via `barcode=` param), shorter numbers = release id.
 - `discogs.rs` – blocking `reqwest` client + serde models. Search items use lenient deserializers (Discogs returns mixed types). Collection instances come from `GET /users/{u}/collection/releases/{id}` (`releases[]` with `instance_id`, `folder_id`).
+- Cover pictures: search rows show `thumb`, details show the release `images` primary cover. Fetched lazily (only visible rows) by a separate image thread in `worker.rs` (not counted in `pending()`), only from discogs.com hosts, cached by URL in `ui.rs`, drawn via egui_extras image loaders.
 - `ui.rs` – `RecordShelfApp`: Scan tab, Search tab (keys: Up/Down, Enter load, `A` folder picker / confirm, Esc), folder picker window, Settings window, bottom status bar. Never do network I/O on the UI thread; send a `Request`.
 
 - `decks.rs`, `decks_bridge.rs` – decks.de catalog-number lookup via a browser userscript (`--decks-bridge`); see `decks.md`. Personal tool, never to be published.
