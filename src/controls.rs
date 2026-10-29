@@ -12,14 +12,16 @@ pub enum Command {
     Remove,
     Open,
     ChooseFolder,
+    Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 4] = [
+    pub const ALL: [Command; 5] = [
         Command::Add,
         Command::Remove,
         Command::Open,
         Command::ChooseFolder,
+        Command::Quit,
     ];
 
     pub fn key(self) -> Key {
@@ -28,7 +30,13 @@ impl Command {
             Command::Remove => Key::R,
             Command::Open => Key::O,
             Command::ChooseFolder => Key::F,
+            Command::Quit => Key::Q,
         }
+    }
+
+    /// Whether the command acts on the selected release.
+    pub fn needs_selection(self) -> bool {
+        !matches!(self, Command::ChooseFolder | Command::Quit)
     }
 
     /// Key as shown to the user.
@@ -38,6 +46,7 @@ impl Command {
             Command::Remove => "R",
             Command::Open => "O",
             Command::ChooseFolder => "F",
+            Command::Quit => "Q",
         }
     }
 }
@@ -117,6 +126,11 @@ mod tests {
         assert_eq!(Command::Add.key(), Key::A);
         assert_eq!(Command::Remove.key_label(), "R");
         assert_eq!(Command::Open.key_label(), "O");
+        assert_eq!(Command::Quit.key(), Key::Q);
+        assert_eq!(Command::Quit.key_label(), "Q");
+        assert!(Command::Remove.needs_selection());
+        assert!(!Command::Quit.needs_selection());
+        assert!(!Command::ChooseFolder.needs_selection());
     }
 
     #[test]

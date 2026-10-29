@@ -890,9 +890,16 @@ impl RecordShelfApp {
     }
 
     fn run_command(&mut self, cmd: Command) {
-        if cmd == Command::ChooseFolder {
-            self.open_folder_picker();
-            return;
+        match cmd {
+            Command::ChooseFolder => {
+                self.open_folder_picker();
+                return;
+            }
+            Command::Quit => {
+                self.repaint.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            _ => {}
         }
         let Some(id) = self.selected_id() else {
             self.set_error("Select a release first".to_string());
@@ -902,7 +909,7 @@ impl RecordShelfApp {
             Command::Add => self.add_release(id),
             Command::Remove => self.remove_release(id),
             Command::Open => self.open_release(id),
-            Command::ChooseFolder => {}
+            Command::ChooseFolder | Command::Quit => {}
         }
     }
 
@@ -1038,9 +1045,10 @@ impl RecordShelfApp {
                     Command::Remove => "Remove".to_string(),
                     Command::Open => "Open in browser".to_string(),
                     Command::ChooseFolder => "Change folder".to_string(),
+                    Command::Quit => "Quit".to_string(),
                 };
                 let text = format!("{label}  [{}]", cmd.key_label());
-                let enabled = has_selection || cmd == Command::ChooseFolder;
+                let enabled = has_selection || !cmd.needs_selection();
                 if ui.add_enabled(enabled, egui::Button::new(text)).clicked() {
                     clicked = Some(cmd);
                 }
