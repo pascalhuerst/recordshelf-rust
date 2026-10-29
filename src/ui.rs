@@ -10,6 +10,8 @@ use std::{
 
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
 use crate::config::Settings;
+use crate::decks::{self, DecksEntry};
+use crate::decks_bridge::{self, Bridge, DecksPage};
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
@@ -20,6 +22,12 @@ use eframe::egui::{self, Color32, RichText};
 pub enum Tab {
     Scan,
     Search,
+}
+
+/// The decks.de bridge: localhost server plus the channel for its results.
+struct DecksState {
+    bridge: Bridge,
+    rx: Receiver<DecksPage>,
 }
 
 /// One-line message for the status bar.
@@ -54,12 +62,19 @@ pub struct RecordShelfApp {
     selected_result: Option<usize>,
     selected_release: Option<Release>,
     settings_open: bool,
+    decks: Option<DecksState>,
+    decks_info: Option<String>,
     settings_draft: Settings,
     devices: Vec<InputDevice>,
 }
 
 impl RecordShelfApp {
-    pub fn new(repaint: egui::Context, settings: Settings, config_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        repaint: egui::Context,
+        settings: Settings,
+        config_path: Option<PathBuf>,
+        decks_port: Option<u16>,
+    ) -> Self {
         let (scanner_stop, scanner_rx, scanner_status) = start_scanner(&settings, &repaint);
         let mut app = Self {
             worker: Worker::spawn(repaint.clone()),
@@ -86,10 +101,15 @@ impl RecordShelfApp {
             selected_result: None,
             selected_release: None,
             settings_open: false,
+            decks: None,
+            decks_info: None,
             settings_draft: Settings::default(),
             devices: Vec::new(),
         };
         app.configure_worker();
+        if let Some(port) = decks_port {
+            app.start_decks_bridge(port);
+        }
         if !app.settings.has_token() {
             app.open_settings();
         }
@@ -125,6 +145,82 @@ impl RecordShelfApp {
         if can_load_folders {
             self.worker.send(Request::LoadFolders);
         }
+    }
+
+    /// Starts the localhost bridge and writes the userscript next to the settings file.
+    fn start_decks_bridge(&mut self, port: u16) {
+        let Some(dir) = self.config_path.as_ref().and_then(|p| p.parent()) else {
+            self.set_error("decks bridge needs a config directory".to_string());
+            return;
+        };
+        let script_path = dir.join("decks.user.js");
+        let result = decks_bridge::load_or_create_token(dir).and_then(|token| {
+            std::fs::write(&script_path, decks_bridge::userscript(port, &token))?;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let bridge = Bridge::spawn(port, token, tx, self.repaint.clone())?;
+            Ok(DecksState { bridge, rx })
+        });
+        match result {
+            Ok(state) => {
+                self.decks = Some(state);
+                self.set_info(format!(
+                    "decks bridge on 127.0.0.1:{port}; install userscript {}",
+                    script_path.display()
+                ));
+            }
+            Err(err) => self.set_error(format!("decks bridge: {err:#}")),
+        }
+    }
+
+    fn handle_decks_page(&mut self, page: DecksPage) {
+        let code = page.code;
+        if page.status != Some(200) {
+            let status = page
+                .status
+                .map_or("no reply".to_string(), |s| s.to_string());
+            self.decks_info = None;
+            self.set_error(format!(
+                "decks.de lookup for {code} failed ({status}); reload the decks.de tab"
+            ));
+            return;
+        }
+        match decks::find_entry(&code, &page.entries) {
+            Some(entry) => {
+                self.decks_info = Some(format!(
+                    "decks {code}: {} - {} | {} | {}",
+                    entry.artist, entry.title, entry.catno, entry.label
+                ));
+                self.worker.send(Request::DecksLookup {
+                    code,
+                    entry: entry.clone(),
+                });
+            }
+            None => {
+                self.decks_info = None;
+                self.set_error(format!(
+                    "decks.de has no exact match for {code} ({} results)",
+                    page.entries.len()
+                ));
+            }
+        }
+    }
+
+    /// Shows Discogs candidates for a decks entry in the Search tab and loads the first.
+    fn show_decks_candidates(&mut self, code: &str, entry: &DecksEntry, items: Vec<SearchItem>) {
+        if items.is_empty() {
+            self.set_error(format!(
+                "No Discogs release found for {code} ({} / {})",
+                entry.catno, entry.label
+            ));
+            return;
+        }
+        self.notice = None;
+        self.folder_picker_open = false;
+        self.search_results = items;
+        self.selected_result = Some(0);
+        self.selected_release = None;
+        self.tab = Tab::Search;
+        self.load_selected_release();
     }
 
     fn open_settings(&mut self) {
@@ -252,9 +348,30 @@ impl RecordShelfApp {
                 ScanEvent::Info(msg) => self.scanner_status = msg,
                 ScanEvent::Code(code) => {
                     self.scanner_status = format!("Scanned {code}");
-                    self.worker.send(Request::Scan(code));
+                    if decks::is_decks_code(&code) {
+                        match &self.decks {
+                            Some(state) => {
+                                self.decks_info =
+                                    Some(format!("decks {code}: waiting for the browser..."));
+                                state.bridge.enqueue(code);
+                            }
+                            None => self.set_error(format!(
+                                "{code} looks like a decks.de code; start with --decks-bridge"
+                            )),
+                        }
+                    } else {
+                        self.worker.send(Request::Scan(code));
+                    }
                 }
             }
+        }
+        let pages: Vec<DecksPage> = self
+            .decks
+            .as_ref()
+            .map(|d| d.rx.try_iter().collect())
+            .unwrap_or_default();
+        for page in pages {
+            self.handle_decks_page(page);
         }
         for resp in self.worker.poll() {
             self.handle_response(resp);
@@ -288,6 +405,14 @@ impl RecordShelfApp {
                         self.notice = None;
                     }
                 }
+                Err(err) => self.set_error(err),
+            },
+            Response::Decks {
+                code,
+                entry,
+                result,
+            } => match result {
+                Ok(items) => self.show_decks_candidates(&code, &entry, items),
                 Err(err) => self.set_error(err),
             },
             Response::Folders(Ok(folders)) => {
@@ -358,6 +483,9 @@ impl RecordShelfApp {
     fn ui_search(&mut self, ui: &mut egui::Ui) {
         let mut trigger_search = false;
         let mut search_fields_active = false;
+        if let Some(info) = &self.decks_info {
+            ui.colored_label(Color32::LIGHT_BLUE, info);
+        }
         let focus = std::mem::take(&mut self.search_focus);
         let fields = [
             ("Query:", &mut self.search_q),
@@ -529,6 +657,7 @@ impl RecordShelfApp {
             release_title: non_empty(&self.search_title),
             catno: non_empty(&self.search_catno),
             barcode: non_empty(&self.search_barcode),
+            label: None,
             kind: None,
             page: Some(1),
             per_page: Some(25),
@@ -587,6 +716,10 @@ impl RecordShelfApp {
 impl eframe::App for RecordShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        if self.decks.is_some() {
+            // Keeps the "browser connected" indicator fresh.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
         egui::TopBottomPanel::top("top-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -606,6 +739,14 @@ impl eframe::App for RecordShelfApp {
         egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.scanner_status);
+                if let Some(state) = &self.decks {
+                    ui.separator();
+                    if state.bridge.connected() {
+                        ui.colored_label(Color32::LIGHT_GREEN, "decks: browser connected");
+                    } else {
+                        ui.colored_label(Color32::YELLOW, "decks: browser not connected");
+                    }
+                }
                 if let Some(notice) = &self.notice {
                     ui.separator();
                     let color = if notice.is_error {

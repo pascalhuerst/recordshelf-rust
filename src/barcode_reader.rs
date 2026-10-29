@@ -182,6 +182,34 @@ fn translate_key(code: KeyCode) -> Option<char> {
         KeyCode::KEY_MINUS | KeyCode::KEY_KPMINUS => Some('-'),
         KeyCode::KEY_DOT | KeyCode::KEY_KPDOT => Some('.'),
         KeyCode::KEY_SLASH => Some('/'),
+        // Letters are reported upper case regardless of Shift: the codes we
+        // read (decks.de labels) are case-insensitive.
+        KeyCode::KEY_A => Some('A'),
+        KeyCode::KEY_B => Some('B'),
+        KeyCode::KEY_C => Some('C'),
+        KeyCode::KEY_D => Some('D'),
+        KeyCode::KEY_E => Some('E'),
+        KeyCode::KEY_F => Some('F'),
+        KeyCode::KEY_G => Some('G'),
+        KeyCode::KEY_H => Some('H'),
+        KeyCode::KEY_I => Some('I'),
+        KeyCode::KEY_J => Some('J'),
+        KeyCode::KEY_K => Some('K'),
+        KeyCode::KEY_L => Some('L'),
+        KeyCode::KEY_M => Some('M'),
+        KeyCode::KEY_N => Some('N'),
+        KeyCode::KEY_O => Some('O'),
+        KeyCode::KEY_P => Some('P'),
+        KeyCode::KEY_Q => Some('Q'),
+        KeyCode::KEY_R => Some('R'),
+        KeyCode::KEY_S => Some('S'),
+        KeyCode::KEY_T => Some('T'),
+        KeyCode::KEY_U => Some('U'),
+        KeyCode::KEY_V => Some('V'),
+        KeyCode::KEY_W => Some('W'),
+        KeyCode::KEY_X => Some('X'),
+        KeyCode::KEY_Y => Some('Y'),
+        KeyCode::KEY_Z => Some('Z'),
         _ => None,
     }
 }
@@ -250,7 +278,9 @@ mod tests {
         assert_eq!(translate_key(KeyCode::KEY_7), Some('7'));
         assert_eq!(translate_key(KeyCode::KEY_KP0), Some('0'));
         assert_eq!(translate_key(KeyCode::KEY_MINUS), Some('-'));
-        assert_eq!(translate_key(KeyCode::KEY_A), None);
+        assert_eq!(translate_key(KeyCode::KEY_A), Some('A'));
+        assert_eq!(translate_key(KeyCode::KEY_Z), Some('Z'));
+        assert_eq!(translate_key(KeyCode::KEY_SPACE), None);
     }
 
     #[test]

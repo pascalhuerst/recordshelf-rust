@@ -106,6 +106,7 @@ pub struct SearchQuery {
     pub release_title: Option<String>,
     pub catno: Option<String>,
     pub barcode: Option<String>,
+    pub label: Option<String>,
     /// Restrict results to a Discogs entity type, e.g. "release".
     pub kind: Option<String>,
     pub page: Option<u32>,
@@ -121,6 +122,7 @@ impl SearchQuery {
             ("release_title", self.release_title.clone()),
             ("catno", self.catno.clone()),
             ("barcode", self.barcode.clone()),
+            ("label", self.label.clone()),
             ("type", self.kind.clone()),
             ("page", self.page.map(|p| p.to_string())),
             ("per_page", self.per_page.map(|p| p.to_string())),

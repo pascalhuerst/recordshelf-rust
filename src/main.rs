@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 mod barcode_reader;
 mod config;
+mod decks;
+mod decks_bridge;
 mod discogs;
 mod ui;
 mod worker;
@@ -43,6 +45,14 @@ pub struct Args {
     /// Discogs username for collection actions
     #[arg(long)]
     pub username: Option<String>,
+
+    /// Enable the decks.de browser bridge (localhost server for the userscript)
+    #[arg(long)]
+    pub decks_bridge: bool,
+
+    /// Port of the decks.de bridge
+    #[arg(long, default_value_t = decks_bridge::DEFAULT_PORT)]
+    pub decks_port: u16,
 }
 
 impl Args {
@@ -74,6 +84,7 @@ fn main() -> Result<()> {
     };
     args.apply_to(&mut settings);
 
+    let decks_port = args.decks_bridge.then_some(args.decks_port);
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "RecordShelf",
@@ -83,6 +94,7 @@ fn main() -> Result<()> {
                 cc.egui_ctx.clone(),
                 settings,
                 config_path,
+                decks_port,
             ))
         }),
     )

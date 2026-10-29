@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use eframe::egui;
 
+use crate::decks::{DecksEntry, search_plan};
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
@@ -24,6 +25,11 @@ pub enum Request {
     LoadRelease(u32),
     LoadFolders,
     CheckOwnership(u32),
+    /// Find Discogs releases for a decks.de entry (by catalog number etc.).
+    DecksLookup {
+        code: String,
+        entry: DecksEntry,
+    },
     AddToCollection {
         release_id: u32,
         folder_id: u32,
@@ -41,6 +47,11 @@ pub enum Response {
     Ownership {
         release_id: u32,
         result: Result<Vec<CollectionInstance>, String>,
+    },
+    Decks {
+        code: String,
+        entry: DecksEntry,
+        result: Result<Vec<SearchItem>, String>,
     },
     Added {
         release_id: u32,
@@ -170,6 +181,14 @@ impl State {
                     .and_then(|u| self.client()?.collection_instances(u, release_id))
                     .map_err(|e| format!("{e:#}")),
             },
+            Request::DecksLookup { code, entry } => {
+                let result = self.decks_lookup(&entry).map_err(|e| format!("{e:#}"));
+                Response::Decks {
+                    code,
+                    entry,
+                    result,
+                }
+            }
             Request::AddToCollection {
                 release_id,
                 folder_id,
@@ -182,6 +201,18 @@ impl State {
                     .map_err(|e| format!("{e:#}")),
             },
         })
+    }
+
+    /// Runs the search plan and returns the first non-empty result list.
+    fn decks_lookup(&self, entry: &DecksEntry) -> Result<Vec<SearchItem>> {
+        let client = self.client()?;
+        for query in search_plan(entry) {
+            let found = client.search(&query)?.results;
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+        Ok(Vec::new())
     }
 
     fn scan(&self, code: String) -> ScanResult {
