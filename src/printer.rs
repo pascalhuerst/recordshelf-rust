@@ -182,11 +182,20 @@ impl Printer {
     }
 }
 
+/// Per label adjustments of what is stored in the printer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JobOptions {
+    /// Darkness relative to the stored one (`^MD`, -30..30).
+    pub darkness: Option<i8>,
+    /// Print speed in inches per second (`^PR`); slower is blacker.
+    pub speed_ips: Option<u8>,
+}
+
 /// ZPL that prints `img` (black pixels are printed) with its top left corner
-/// at `(x, y)` dots from the label origin. `darkness` adjusts the printer's
-/// stored darkness for this label (`^MD`, -30..30, relative); everything else
-/// stored in the printer (speed, media, label length) is left alone.
-pub fn bitmap_zpl(img: &GrayImage, x: u32, y: u32, darkness: Option<i8>) -> String {
+/// at `(x, y)` dots from the label origin. `job` adjusts darkness and speed
+/// for this label only; everything else stored in the printer (media, label
+/// length) is left alone.
+pub fn bitmap_zpl(img: &GrayImage, x: u32, y: u32, job: &JobOptions) -> String {
     let bytes_per_row = img.width().div_ceil(8) as usize;
     let mut data = Vec::with_capacity(bytes_per_row * img.height() as usize);
     for row in 0..img.height() {
@@ -204,9 +213,14 @@ pub fn bitmap_zpl(img: &GrayImage, x: u32, y: u32, darkness: Option<i8>) -> Stri
     let hex: String = data.iter().map(|b| format!("{b:02X}")).collect();
     format!(
         "^XA\n^CI28\n^LH0,0\n{md}^FO{x},{y}^GFA,{n},{n},{bytes_per_row},{hex}^FS\n^PQ1\n^XZ\n",
-        md = darkness
+        md = job
+            .darkness
             .map(|d| format!("^MD{}\n", d.clamp(-30, 30)))
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            + &job
+                .speed_ips
+                .map(|v| format!("^PR{}\n", v.clamp(2, 6)))
+                .unwrap_or_default(),
         n = data.len()
     )
 }
@@ -327,7 +341,7 @@ mod tests {
         let mut img = GrayImage::from_pixel(10, 2, Luma([255]));
         img.put_pixel(0, 0, Luma([0])); // first bit of the first byte
         img.put_pixel(9, 1, Luma([0])); // bit 1 of the second byte in row 2
-        let zpl = bitmap_zpl(&img, 3, 4, None);
+        let zpl = bitmap_zpl(&img, 3, 4, &JobOptions::default());
         // 10 pixels per row -> 2 bytes per row, 4 bytes in total
         assert!(zpl.contains("^FO3,4^GFA,4,4,2,80000040"), "{zpl}");
         assert!(zpl.starts_with("^XA\n"));
@@ -338,7 +352,7 @@ mod tests {
     #[test]
     fn a_full_label_has_matching_sizes() {
         let img = GrayImage::from_pixel(408, 304, Luma([0]));
-        let zpl = bitmap_zpl(&img, 0, 0, None);
+        let zpl = bitmap_zpl(&img, 0, 0, &JobOptions::default());
         let total = 51 * 304;
         assert!(zpl.contains(&format!("^GFA,{total},{total},51,")));
         let hex_len = zpl
@@ -357,17 +371,38 @@ mod tests {
     }
 
     #[test]
-    fn zpl_only_touches_darkness_when_asked() {
+    fn zpl_only_touches_darkness_and_speed_when_asked() {
         let img = GrayImage::from_pixel(8, 8, Luma([255]));
-        assert!(bitmap_zpl(&img, 0, 0, Some(6)).contains("^MD6\n^FO"));
-        assert!(bitmap_zpl(&img, 0, 0, Some(-4)).contains("^MD-4\n"));
+        let job = |darkness, speed_ips| JobOptions {
+            darkness,
+            speed_ips,
+        };
+        assert!(bitmap_zpl(&img, 0, 0, &job(Some(6), None)).contains("^MD6\n^FO"));
+        assert!(bitmap_zpl(&img, 0, 0, &job(Some(-4), None)).contains("^MD-4\n"));
         assert!(
-            bitmap_zpl(&img, 0, 0, Some(99)).contains("^MD30\n"),
+            bitmap_zpl(&img, 0, 0, &job(Some(99), None)).contains("^MD30\n"),
             "clamped"
         );
-        assert!(!bitmap_zpl(&img, 0, 0, None).contains("^MD"));
+        assert!(bitmap_zpl(&img, 0, 0, &job(None, Some(4))).contains("^PR4\n^FO"));
+        assert!(
+            bitmap_zpl(&img, 0, 0, &job(None, Some(9))).contains("^PR6\n"),
+            "clamped to the printer's range"
+        );
+        assert!(
+            bitmap_zpl(&img, 0, 0, &job(None, Some(0))).contains("^PR2\n"),
+            "clamped"
+        );
+        let both = bitmap_zpl(&img, 0, 0, &job(Some(9), Some(3)));
+        assert!(both.contains("^MD9\n^PR3\n^FO"), "{both}");
+        let none = bitmap_zpl(&img, 0, 0, &JobOptions::default());
+        assert!(!none.contains("^MD") && !none.contains("^PR"));
         // no darkness, speed, media type, print width or label length commands
-        let zpl = bitmap_zpl(&GrayImage::from_pixel(8, 8, Luma([255])), 0, 0, None);
+        let zpl = bitmap_zpl(
+            &GrayImage::from_pixel(8, 8, Luma([255])),
+            0,
+            0,
+            &JobOptions::default(),
+        );
         for forbidden in [
             "^MD", "~SD", "^PR", "^MN", "^MT", "^PW", "^LL", "~JC", "^JU", "^PM",
         ] {

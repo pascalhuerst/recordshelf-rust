@@ -31,6 +31,10 @@ pub struct Settings {
     pub printer_port: u16,
     /// Distance of the label's top edge from the printer's print origin, in mm
     pub label_top_mm: f32,
+    /// Darkness adjustment per label, relative to the printer's own setting
+    pub printer_darkness: i8,
+    /// Print speed in inches per second; 0 keeps the printer's own setting
+    pub printer_speed_ips: u8,
 }
 
 impl Default for Settings {
@@ -47,6 +51,8 @@ impl Default for Settings {
             printer_host: String::new(),
             printer_port: crate::printer::DEFAULT_PORT,
             label_top_mm: 1.5,
+            printer_darkness: 9,
+            printer_speed_ips: 0,
         }
     }
 }
@@ -233,5 +239,33 @@ mod tests {
         assert_eq!(loaded.folder_id, 7);
         assert_eq!(loaded.username, "me");
         assert_eq!(loaded.zoom_factor, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod printer_tests {
+    use super::*;
+
+    #[test]
+    fn printer_defaults() {
+        let s = Settings::default();
+        assert_eq!(s.printer_port, 9100);
+        assert_eq!(s.printer_darkness, 9);
+        assert_eq!(s.printer_speed_ips, 0);
+        assert_eq!(s.label_top_mm, 1.5);
+    }
+
+    #[test]
+    fn printer_settings_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let s = Settings {
+            printer_host: "192.168.4.55".into(),
+            printer_darkness: -3,
+            printer_speed_ips: 4,
+            ..Settings::default()
+        };
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), s);
     }
 }

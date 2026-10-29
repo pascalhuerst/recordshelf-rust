@@ -84,6 +84,10 @@ pub struct Args {
     )]
     pub print_darkness_test: Vec<i8>,
 
+    /// Print the sample label at these print speeds in inches per second (e.g. 4,3), then exit
+    #[arg(long, value_name = "IPS,IPS,...", value_delimiter = ',')]
+    pub print_speed_test: Vec<u8>,
+
     /// Start in a normal window instead of fullscreen (F11 toggles at runtime)
     #[arg(long)]
     pub windowed: bool,
@@ -156,7 +160,12 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
             printer::centred_x(size.width),
             (settings.label_top_mm * 8.0).round() as u32,
         );
-        printer.print(&printer::bitmap_zpl(&img, x, y, None))?;
+        printer.print(&printer::bitmap_zpl(
+            &img,
+            x,
+            y,
+            &printer::JobOptions::default(),
+        ))?;
         // let the printer finish this label before the next job arrives
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
@@ -170,8 +179,39 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
             printer::centred_x(size.width),
             (settings.label_top_mm * 8.0).round() as u32,
         );
-        printer.print(&printer::bitmap_zpl(&img, x, y, Some(*delta)))?;
+        printer.print(&printer::bitmap_zpl(
+            &img,
+            x,
+            y,
+            &printer::JobOptions {
+                darkness: Some(*delta),
+                speed_ips: None,
+            },
+        ))?;
         std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    for ips in &args.print_speed_test {
+        let size = label::LabelSize::from_mm(51.0, 38.0);
+        let mut options = label::LabelOptions::new(label::CodeKind::Barcode);
+        options.caption = Some(format!(
+            "darkness {:+}  {ips} ips",
+            settings.printer_darkness
+        ));
+        let img = label::render_with(&label::sample_content(), size, &options)?;
+        println!(
+            "printing a label at {ips} ips, darkness {:+}",
+            settings.printer_darkness
+        );
+        let (x, y) = (
+            printer::centred_x(size.width),
+            (settings.label_top_mm * 8.0).round() as u32,
+        );
+        let job = printer::JobOptions {
+            darkness: Some(settings.printer_darkness),
+            speed_ips: Some(*ips),
+        };
+        printer.print(&printer::bitmap_zpl(&img, x, y, &job))?;
+        std::thread::sleep(std::time::Duration::from_secs(4));
     }
     for name in ["print.tone", "media.speed"] {
         println!(
@@ -198,6 +238,7 @@ fn main() -> Result<()> {
     if args.print_calibration
         || !args.print_barcode_test.is_empty()
         || !args.print_darkness_test.is_empty()
+        || !args.print_speed_test.is_empty()
     {
         return print_tests(&args, &settings);
     }

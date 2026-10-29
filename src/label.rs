@@ -385,7 +385,7 @@ impl LabelOptions {
     pub fn new(kind: CodeKind) -> Self {
         Self {
             kind,
-            barcode_height: 40,
+            barcode_height: 24, // 3 mm; the printed tests read fine down to 2 mm
             barcode_module: 2,
             caption: None,
         }
