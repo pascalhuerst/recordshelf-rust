@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use crate::barcode_reader::{self, BarcodeReader, ScanEvent};
+use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
 use crate::config::Settings;
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
@@ -53,6 +53,9 @@ pub struct RecordShelfApp {
     search_results: Vec<SearchItem>,
     selected_result: Option<usize>,
     selected_release: Option<Release>,
+    settings_open: bool,
+    settings_draft: Settings,
+    devices: Vec<InputDevice>,
 }
 
 impl RecordShelfApp {
@@ -82,8 +85,14 @@ impl RecordShelfApp {
             search_results: Vec::new(),
             selected_result: None,
             selected_release: None,
+            settings_open: false,
+            settings_draft: Settings::default(),
+            devices: Vec::new(),
         };
         app.configure_worker();
+        if !app.settings.has_token() {
+            app.open_settings();
+        }
         app
     }
 
@@ -116,6 +125,105 @@ impl RecordShelfApp {
         if can_load_folders {
             self.worker.send(Request::LoadFolders);
         }
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_draft = self.settings.clone();
+        self.devices = barcode_reader::list_devices();
+        self.settings_open = true;
+    }
+
+    /// Persists the edited settings and applies them without a restart.
+    fn save_settings(&mut self) {
+        let draft = self.settings_draft.clone();
+        if let Some(path) = &self.config_path {
+            if let Err(err) = draft.save(path) {
+                self.set_error(format!("{err:#}"));
+                return;
+            }
+        }
+        self.settings = draft;
+        self.scanner_stop.store(true, Ordering::SeqCst);
+        let (stop, rx, status) = start_scanner(&self.settings, &self.repaint);
+        self.scanner_stop = stop;
+        self.scanner_rx = rx;
+        self.scanner_status = status;
+        self.folders.clear();
+        self.folder_selected = None;
+        self.ownership.clear();
+        self.notice = None;
+        self.configure_worker();
+        if self.config_path.is_none() {
+            self.set_info("Settings applied (no config path, not saved)".to_string());
+        }
+    }
+
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let (mut save, mut cancel) = (false, false);
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let draft = &mut self.settings_draft;
+                egui::Grid::new("settings-grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Discogs token:");
+                        ui.add(egui::TextEdit::singleline(&mut draft.token).password(true));
+                        ui.end_row();
+                        ui.label("Discogs username:");
+                        ui.text_edit_singleline(&mut draft.username);
+                        ui.end_row();
+                        ui.label("Currency:");
+                        ui.text_edit_singleline(&mut draft.currency);
+                        ui.end_row();
+                        ui.label("User agent:");
+                        ui.text_edit_singleline(&mut draft.user_agent);
+                        ui.end_row();
+                        ui.label("Scanner name:");
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut draft.device_name);
+                            egui::ComboBox::from_id_source("scanner-device")
+                                .selected_text("Pick...")
+                                .show_ui(ui, |ui| {
+                                    for dev in &self.devices {
+                                        let label =
+                                            format!("{} ({})", dev.name, dev.path.display());
+                                        if ui.selectable_label(false, label).clicked() {
+                                            draft.device_name = dev.name.clone();
+                                        }
+                                    }
+                                });
+                            if ui.button("Refresh").clicked() {
+                                self.devices = barcode_reader::list_devices();
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Fallback device path:");
+                        ui.text_edit_singleline(&mut draft.device_path);
+                        ui.end_row();
+                    });
+                ui.label(
+                    RichText::new(
+                        "The scanner is found by name (substring match), so it keeps working \
+                         when /dev/input numbering changes. The path is only a fallback.",
+                    )
+                    .small(),
+                );
+                if let Some(path) = &self.config_path {
+                    ui.label(RichText::new(format!("Saved to {}", path.display())).small());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save = ui.button("Save").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if save {
+            self.save_settings();
+        }
+        self.settings_open = open && !save && !cancel;
     }
 
     fn set_info(&mut self, text: String) {
@@ -312,7 +420,7 @@ impl RecordShelfApp {
 
         // Keyboard handling. Skipped while typing, and on the frame a search was
         // triggered by Enter so that the same keypress does not also pick a result.
-        if !search_fields_active && !trigger_search {
+        if !search_fields_active && !trigger_search && !self.settings_open {
             self.handle_search_keys(ui.ctx());
         }
         if self.folder_picker_open {
@@ -481,6 +589,9 @@ impl eframe::App for RecordShelfApp {
                 ui.selectable_value(&mut self.tab, Tab::Search, "Search");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::widgets::global_dark_light_mode_switch(ui);
+                    if ui.button("Settings").clicked() {
+                        self.open_settings();
+                    }
                 });
             });
         });
@@ -510,6 +621,10 @@ impl eframe::App for RecordShelfApp {
             Tab::Scan => self.ui_scan(ui),
             Tab::Search => self.ui_search(ui),
         });
+
+        if self.settings_open {
+            self.show_settings(ctx);
+        }
     }
 }
 
