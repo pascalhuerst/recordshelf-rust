@@ -49,6 +49,7 @@ pub struct RecordShelfApp {
     search_artist: String,
     search_title: String,
     search_catno: String,
+    search_barcode: String,
     search_results: Vec<SearchItem>,
     selected_result: Option<usize>,
     selected_release: Option<Release>,
@@ -77,6 +78,7 @@ impl RecordShelfApp {
             search_artist: String::new(),
             search_title: String::new(),
             search_catno: String::new(),
+            search_barcode: String::new(),
             search_results: Vec::new(),
             selected_result: None,
             selected_release: None,
@@ -227,6 +229,15 @@ impl RecordShelfApp {
                     if let Some(err) = &result.error {
                         ui.colored_label(Color32::RED, format!("Error: {err}"));
                     } else if let Some(release) = &result.release {
+                        if result.matches > 1 {
+                            ui.colored_label(
+                                Color32::LIGHT_BLUE,
+                                format!(
+                                    "{} releases share this barcode; showing the first. Use Search > Barcode to see all.",
+                                    result.matches
+                                ),
+                            );
+                        }
                         render_ownership(ui, result.owned.as_deref(), &self.folders);
                         render_release(ui, release);
                     } else {
@@ -245,6 +256,7 @@ impl RecordShelfApp {
             ("Artist:", &mut self.search_artist),
             ("Release:", &mut self.search_title),
             ("Catalog No:", &mut self.search_catno),
+            ("Barcode:", &mut self.search_barcode),
         ];
         for (idx, (label, value)) in fields.into_iter().enumerate() {
             ui.horizontal(|ui| {
@@ -401,6 +413,8 @@ impl RecordShelfApp {
             artist: non_empty(&self.search_artist),
             release_title: non_empty(&self.search_title),
             catno: non_empty(&self.search_catno),
+            barcode: non_empty(&self.search_barcode),
+            kind: None,
             page: Some(1),
             per_page: Some(25),
         };
@@ -409,6 +423,7 @@ impl RecordShelfApp {
         self.search_artist.clear();
         self.search_title.clear();
         self.search_catno.clear();
+        self.search_barcode.clear();
     }
 
     fn load_selected_release(&mut self) {

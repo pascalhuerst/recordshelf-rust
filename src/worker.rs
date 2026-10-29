@@ -55,6 +55,8 @@ pub struct ScanResult {
     pub release: Option<Release>,
     /// Copies already in the collection; `None` if unknown (no username, or the check failed).
     pub owned: Option<Vec<CollectionInstance>>,
+    /// How many releases Discogs knows for a scanned barcode (1 for a release id).
+    pub matches: usize,
     pub error: Option<String>,
     pub elapsed: Duration,
 }
@@ -184,35 +186,77 @@ impl State {
 
     fn scan(&self, code: String) -> ScanResult {
         let start = Instant::now();
-        let lookup = parse_release_id(&code).and_then(|id| {
-            let release = self.client()?.release(id)?;
-            // Ownership is best effort: a failed check must not hide the release.
-            let owned = self
-                .username()
-                .and_then(|u| self.client()?.collection_instances(u, id))
-                .ok();
-            Ok((release, owned))
-        });
+        let lookup = self.lookup_scan(&code);
+        let elapsed = start.elapsed();
         match lookup {
-            Ok((release, owned)) => ScanResult {
+            Ok((release, owned, matches)) => ScanResult {
                 barcode: code,
                 release: Some(release),
                 owned,
+                matches,
                 error: None,
-                elapsed: start.elapsed(),
+                elapsed,
             },
             Err(err) => ScanResult {
                 barcode: code,
                 release: None,
                 owned: None,
+                matches: 0,
                 error: Some(format!("{err:#}")),
-                elapsed: start.elapsed(),
+                elapsed,
             },
         }
     }
+
+    fn lookup_scan(&self, code: &str) -> Result<(Release, Option<Vec<CollectionInstance>>, usize)> {
+        let client = self.client()?;
+        let (id, matches) = match ScanCode::classify(code)? {
+            ScanCode::ReleaseId(id) => (id, 1),
+            ScanCode::Barcode(barcode) => {
+                let found = client.search(&SearchQuery {
+                    barcode: Some(barcode.clone()),
+                    kind: Some("release".to_string()),
+                    per_page: Some(10),
+                    ..Default::default()
+                })?;
+                let id = found
+                    .results
+                    .iter()
+                    .find_map(|item| item.id)
+                    .with_context(|| format!("no release found for barcode {barcode}"))?;
+                (id, found.results.len())
+            }
+        };
+        let release = client.release(id)?;
+        // Ownership is best effort: a failed check must not hide the release.
+        let owned = self
+            .username()
+            .and_then(|u| client.collection_instances(u, id))
+            .ok();
+        Ok((release, owned, matches))
+    }
 }
 
-fn parse_release_id(code: &str) -> Result<u32> {
-    code.parse()
-        .with_context(|| format!("invalid numeric barcode: {code}"))
+/// What a scanned code refers to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanCode {
+    /// A Discogs release id (short numbers, e.g. from a printed label).
+    ReleaseId(u32),
+    /// A UPC/EAN printed on the record sleeve (12-14 digits).
+    Barcode(String),
+}
+
+impl ScanCode {
+    pub fn classify(code: &str) -> Result<Self> {
+        let code = code.trim();
+        if !code.is_empty()
+            && code.bytes().all(|b| b.is_ascii_digit())
+            && (12..=14).contains(&code.len())
+        {
+            return Ok(Self::Barcode(code.to_string()));
+        }
+        code.parse()
+            .map(Self::ReleaseId)
+            .with_context(|| format!("not a release id or UPC/EAN barcode: {code}"))
+    }
 }
