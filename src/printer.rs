@@ -127,6 +127,41 @@ impl Printer {
         Status::parse(&String::from_utf8_lossy(&response))
     }
 
+    /// Reads a printer setting with a Zebra `getvar` command (e.g. `print.tone`,
+    /// the darkness). Changes nothing.
+    pub fn get_var(&self, name: &str) -> Result<String> {
+        let mut stream = self.connect()?;
+        stream.write_all(format!("! U1 getvar \"{name}\"\r\n").as_bytes())?;
+        let mut response = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    // the answer is one quoted value; the printer keeps the connection open
+                    if response.iter().filter(|b| **b == b'"').count() >= 2 {
+                        break;
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e).context("read printer setting"),
+            }
+        }
+        let text = String::from_utf8_lossy(&response);
+        text.split('"')
+            .nth(1)
+            .map(str::to_string)
+            .with_context(|| format!("unexpected answer for {name}: {text:?}"))
+    }
+
     /// Sends ZPL to the printer.
     pub fn send(&self, zpl: &str) -> Result<()> {
         let mut stream = self.connect()?;
@@ -148,9 +183,10 @@ impl Printer {
 }
 
 /// ZPL that prints `img` (black pixels are printed) with its top left corner
-/// at `(x, y)` dots from the label origin. The printer's stored settings
-/// (darkness, speed, media, label length) are left alone.
-pub fn bitmap_zpl(img: &GrayImage, x: u32, y: u32) -> String {
+/// at `(x, y)` dots from the label origin. `darkness` adjusts the printer's
+/// stored darkness for this label (`^MD`, -30..30, relative); everything else
+/// stored in the printer (speed, media, label length) is left alone.
+pub fn bitmap_zpl(img: &GrayImage, x: u32, y: u32, darkness: Option<i8>) -> String {
     let bytes_per_row = img.width().div_ceil(8) as usize;
     let mut data = Vec::with_capacity(bytes_per_row * img.height() as usize);
     for row in 0..img.height() {
@@ -167,7 +203,10 @@ pub fn bitmap_zpl(img: &GrayImage, x: u32, y: u32) -> String {
     }
     let hex: String = data.iter().map(|b| format!("{b:02X}")).collect();
     format!(
-        "^XA\n^CI28\n^LH0,0\n^FO{x},{y}^GFA,{n},{n},{bytes_per_row},{hex}^FS\n^PQ1\n^XZ\n",
+        "^XA\n^CI28\n^LH0,0\n{md}^FO{x},{y}^GFA,{n},{n},{bytes_per_row},{hex}^FS\n^PQ1\n^XZ\n",
+        md = darkness
+            .map(|d| format!("^MD{}\n", d.clamp(-30, 30)))
+            .unwrap_or_default(),
         n = data.len()
     )
 }
@@ -288,7 +327,7 @@ mod tests {
         let mut img = GrayImage::from_pixel(10, 2, Luma([255]));
         img.put_pixel(0, 0, Luma([0])); // first bit of the first byte
         img.put_pixel(9, 1, Luma([0])); // bit 1 of the second byte in row 2
-        let zpl = bitmap_zpl(&img, 3, 4);
+        let zpl = bitmap_zpl(&img, 3, 4, None);
         // 10 pixels per row -> 2 bytes per row, 4 bytes in total
         assert!(zpl.contains("^FO3,4^GFA,4,4,2,80000040"), "{zpl}");
         assert!(zpl.starts_with("^XA\n"));
@@ -299,7 +338,7 @@ mod tests {
     #[test]
     fn a_full_label_has_matching_sizes() {
         let img = GrayImage::from_pixel(408, 304, Luma([0]));
-        let zpl = bitmap_zpl(&img, 0, 0);
+        let zpl = bitmap_zpl(&img, 0, 0, None);
         let total = 51 * 304;
         assert!(zpl.contains(&format!("^GFA,{total},{total},51,")));
         let hex_len = zpl
@@ -318,9 +357,17 @@ mod tests {
     }
 
     #[test]
-    fn zpl_does_not_change_the_printer_settings() {
+    fn zpl_only_touches_darkness_when_asked() {
+        let img = GrayImage::from_pixel(8, 8, Luma([255]));
+        assert!(bitmap_zpl(&img, 0, 0, Some(6)).contains("^MD6\n^FO"));
+        assert!(bitmap_zpl(&img, 0, 0, Some(-4)).contains("^MD-4\n"));
+        assert!(
+            bitmap_zpl(&img, 0, 0, Some(99)).contains("^MD30\n"),
+            "clamped"
+        );
+        assert!(!bitmap_zpl(&img, 0, 0, None).contains("^MD"));
         // no darkness, speed, media type, print width or label length commands
-        let zpl = bitmap_zpl(&GrayImage::from_pixel(8, 8, Luma([255])), 0, 0);
+        let zpl = bitmap_zpl(&GrayImage::from_pixel(8, 8, Luma([255])), 0, 0, None);
         for forbidden in [
             "^MD", "~SD", "^PR", "^MN", "^MT", "^PW", "^LL", "~JC", "^JU", "^PM",
         ] {
@@ -433,5 +480,28 @@ mod tests {
         assert_eq!(centred_x(416), 16, "52 mm label: 2 mm each side");
         assert_eq!(centred_x(448), 0);
         assert_eq!(centred_x(500), 0, "wider than the print area");
+    }
+
+    #[test]
+    fn reads_a_printer_setting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = [0u8; 256];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(b"\"10.0\"").unwrap();
+            // like the real printer, keep the connection open for a moment
+            thread::sleep(Duration::from_millis(300));
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let value = Printer::new("127.0.0.1", port)
+            .get_var("print.tone")
+            .unwrap();
+        assert_eq!(value, "10.0");
+        assert_eq!(server.join().unwrap(), "! U1 getvar \"print.tone\"\r\n");
     }
 }

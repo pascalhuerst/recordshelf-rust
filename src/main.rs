@@ -75,6 +75,15 @@ pub struct Args {
     #[arg(long, value_name = "MM,MM,...", value_delimiter = ',')]
     pub print_barcode_test: Vec<f32>,
 
+    /// Print the sample label at these darkness adjustments (e.g. 3,6,9), then exit
+    #[arg(
+        long,
+        value_name = "N,N,...",
+        value_delimiter = ',',
+        allow_negative_numbers = true
+    )]
+    pub print_darkness_test: Vec<i8>,
+
     /// Start in a normal window instead of fullscreen (F11 toggles at runtime)
     #[arg(long)]
     pub windowed: bool,
@@ -147,9 +156,28 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
             printer::centred_x(size.width),
             (settings.label_top_mm * 8.0).round() as u32,
         );
-        printer.print(&printer::bitmap_zpl(&img, x, y))?;
+        printer.print(&printer::bitmap_zpl(&img, x, y, None))?;
         // let the printer finish this label before the next job arrives
         std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    for delta in &args.print_darkness_test {
+        let size = label::LabelSize::from_mm(51.0, 38.0);
+        let mut options = label::LabelOptions::new(label::CodeKind::Barcode);
+        options.caption = Some(format!("darkness {delta:+}"));
+        let img = label::render_with(&label::sample_content(), size, &options)?;
+        println!("printing a label with darkness adjusted by {delta:+}");
+        let (x, y) = (
+            printer::centred_x(size.width),
+            (settings.label_top_mm * 8.0).round() as u32,
+        );
+        printer.print(&printer::bitmap_zpl(&img, x, y, Some(*delta)))?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    for name in ["print.tone", "media.speed"] {
+        println!(
+            "printer setting {name} afterwards: {}",
+            printer.get_var(name)?
+        );
     }
     Ok(())
 }
@@ -167,7 +195,10 @@ fn main() -> Result<()> {
     if let Some(port) = args.printer_port {
         settings.printer_port = port;
     }
-    if args.print_calibration || !args.print_barcode_test.is_empty() {
+    if args.print_calibration
+        || !args.print_barcode_test.is_empty()
+        || !args.print_darkness_test.is_empty()
+    {
         return print_tests(&args, &settings);
     }
 
