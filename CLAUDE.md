@@ -10,6 +10,7 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 ## Configuration
 - Settings file: `~/.config/recordshelf/config.toml` (`config.rs`, written with mode 0600). Editable in the in-app Settings window; saving applies immediately (restarts scanner, reconfigures worker).
 - CLI flags override the file for one run; token also via `DISCOGS_TOKEN`. Never hardcode credentials.
+- UI zoom (egui's built-in Ctrl +/-/0) is saved as `zoom_factor` on every change via `Settings::save_zoom`, which only rewrites that key on disk (CLI overrides are not persisted).
 - Scanner is found by device **name** (substring, case-insensitive); `device_path` is only a fallback.
 
 ## Architecture (src/)

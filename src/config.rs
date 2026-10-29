@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Persistent user settings, stored as TOML in the user's config directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Discogs personal access token
@@ -22,6 +22,8 @@ pub struct Settings {
     pub device_name: String,
     /// Fallback device path, used when no device matches `device_name`
     pub device_path: String,
+    /// UI zoom (Ctrl +/- in the window); remembered between runs
+    pub zoom_factor: f32,
 }
 
 impl Default for Settings {
@@ -33,11 +35,33 @@ impl Default for Settings {
             currency: "EUR".to_string(),
             device_name: String::new(),
             device_path: String::new(),
+            zoom_factor: 1.0,
         }
     }
 }
 
+/// Zoom limits, kept sane in case the file is edited by hand.
+pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=4.0;
+
 impl Settings {
+    /// The stored zoom, clamped to a usable range (NaN becomes 1.0).
+    pub fn zoom(&self) -> f32 {
+        if self.zoom_factor.is_finite() {
+            self.zoom_factor
+                .clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
+        } else {
+            1.0
+        }
+    }
+
+    /// Stores only the zoom in the settings file, leaving everything else as
+    /// it is on disk (so command line overrides are not persisted).
+    pub fn save_zoom(path: &Path, zoom: f32) -> Result<()> {
+        let mut on_disk = Self::load(path)?;
+        on_disk.zoom_factor = zoom;
+        on_disk.save(path)
+    }
+
     /// Default location: `$XDG_CONFIG_HOME/recordshelf/config.toml`.
     pub fn default_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("recordshelf").join("config.toml"))
@@ -140,5 +164,42 @@ mod tests {
             ..Settings::default()
         };
         assert!(!settings.has_token());
+    }
+
+    #[test]
+    fn zoom_defaults_to_one_and_is_clamped() {
+        let mut s = Settings::default();
+        assert_eq!(s.zoom(), 1.0);
+        s.zoom_factor = 10.0;
+        assert_eq!(s.zoom(), 4.0);
+        s.zoom_factor = 0.0;
+        assert_eq!(s.zoom(), 0.5);
+        s.zoom_factor = f32::NAN;
+        assert_eq!(s.zoom(), 1.0);
+    }
+
+    #[test]
+    fn save_zoom_keeps_other_settings_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let on_disk = Settings {
+            username: "me".into(),
+            token: "disk-token".into(),
+            ..Settings::default()
+        };
+        on_disk.save(&path).unwrap();
+        Settings::save_zoom(&path, 1.5).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.zoom_factor, 1.5);
+        assert_eq!(loaded.token, "disk-token");
+        assert_eq!(loaded.username, "me");
+    }
+
+    #[test]
+    fn save_zoom_creates_the_file_if_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("config.toml");
+        Settings::save_zoom(&path, 2.0).unwrap();
+        assert_eq!(Settings::load(&path).unwrap().zoom_factor, 2.0);
     }
 }

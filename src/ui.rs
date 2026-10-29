@@ -91,6 +91,7 @@ impl RecordShelfApp {
         decks_port: Option<u16>,
     ) -> Self {
         egui_extras::install_image_loaders(&repaint);
+        repaint.set_zoom_factor(settings.zoom());
         let (scanner_stop, scanner_rx, scanner_status) = start_scanner(&settings, &repaint);
         let mut app = Self {
             worker: Worker::spawn(repaint.clone()),
@@ -264,6 +265,20 @@ impl RecordShelfApp {
         self.releases.get(&self.selected_id()?)
     }
 
+    /// Remembers zoom changes (Ctrl +/-) in the settings file.
+    fn persist_zoom(&mut self, ctx: &egui::Context) {
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.settings.zoom_factor).abs() < 1e-3 {
+            return;
+        }
+        self.settings.zoom_factor = zoom;
+        if let Some(path) = &self.config_path
+            && let Err(err) = Settings::save_zoom(path, zoom)
+        {
+            self.set_error(format!("{err:#}"));
+        }
+    }
+
     /// Loads the selected release once the selection has settled.
     fn sync_selection(&mut self, ctx: &egui::Context) {
         let id = self.selected_id();
@@ -297,7 +312,9 @@ impl RecordShelfApp {
 
     /// Persists the edited settings and applies them without a restart.
     fn save_settings(&mut self) {
-        let draft = self.settings_draft.clone();
+        let mut draft = self.settings_draft.clone();
+        // Zoom changes live (Ctrl +/-); do not let a stale copy in the draft undo it.
+        draft.zoom_factor = self.settings.zoom_factor;
         if let Some(path) = &self.config_path
             && let Err(err) = draft.save(path)
         {
@@ -810,6 +827,7 @@ impl eframe::App for RecordShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.sync_selection(ctx);
+        self.persist_zoom(ctx);
         if self.decks.is_some() {
             // Keeps the "browser connected" indicator fresh.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
