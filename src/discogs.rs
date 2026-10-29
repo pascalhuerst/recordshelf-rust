@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -36,19 +36,26 @@ impl DiscogsClient {
         })
     }
 
+    fn get<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        params: &[(&str, String)],
+        what: &str,
+    ) -> Result<T> {
+        self.http
+            .get(url)
+            .query(params)
+            .send()
+            .with_context(|| format!("send {what} request"))?
+            .error_for_status()
+            .with_context(|| format!("Discogs {what} error response"))?
+            .json()
+            .with_context(|| format!("decode {what} response"))
+    }
+
     pub fn release(&self, id: u32) -> Result<Release> {
         let url = format!("{}/releases/{}", self.base, id);
-        let resp = self
-            .http
-            .get(url)
-            .query(&[("curr_abbr", &self.currency)])
-            .send()
-            .context("send request")?
-            .error_for_status()
-            .context("Discogs error response")?;
-
-        let release: Release = resp.json().context("decode release response")?;
-        Ok(release)
+        self.get(&url, &[("curr_abbr", self.currency.clone())], "release")
     }
 
     pub fn add_to_collection(&self, username: &str, folder_id: u32, release_id: u32) -> Result<()> {
@@ -66,33 +73,13 @@ impl DiscogsClient {
         Ok(())
     }
 
-    pub fn collection_folders(&self, username: &str) -> Result<CollectionFolders> {
+    pub fn collection_folders(&self, username: &str) -> Result<Vec<CollectionFolder>> {
         let url = format!("{}/users/{}/collection/folders", self.base, username);
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .context("send collection folders request")?
-            .error_for_status()
-            .context("Discogs collection folders error response")?;
-
-        let raw: serde_json::Value = resp.json().context("decode collection folders response")?;
-        let mut out = CollectionFolders {
-            folders: Vec::new(),
-        };
-        if let Some(folders) = raw.get("folders").and_then(|v| v.as_array()) {
-            for f in folders {
-                let id = f.get("id").and_then(val_to_u32);
-                let name = f.get("name").and_then(val_to_string).unwrap_or_default();
-                let count = f.get("count").and_then(val_to_u32);
-                if let Some(id) = id {
-                    out.folders.push(CollectionFolder { id, name, count });
-                }
-            }
-        }
-        Ok(out)
+        let resp: CollectionFoldersResponse = self.get(&url, &[], "collection folders")?;
+        Ok(resp.folders)
     }
 
+    /// Every copy of `release_id` in the user's collection (empty if not owned).
     pub fn collection_instances(
         &self,
         username: &str,
@@ -102,122 +89,13 @@ impl DiscogsClient {
             "{}/users/{}/collection/releases/{}",
             self.base, username, release_id
         );
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .context("send collection instances request")?
-            .error_for_status()
-            .context("Discogs collection instances error response")?;
-
-        let raw: serde_json::Value = resp
-            .json()
-            .context("decode collection instances response")?;
-
-        let mut out = Vec::new();
-
-        if let Some(instances) = raw.get("instances").and_then(|v| v.as_array()) {
-            for inst in instances {
-                let instance_id = inst
-                    .get("instance_id")
-                    .and_then(val_to_u32)
-                    .or_else(|| inst.get("id").and_then(val_to_u32));
-                let folder_id = inst.get("folder_id").and_then(val_to_u32);
-                if let (Some(instance_id), Some(_folder_id)) = (instance_id, folder_id) {
-                    out.push(CollectionInstance { instance_id });
-                }
-            }
-        } else if let Some(releases) = raw.get("releases").and_then(|v| v.as_array()) {
-            for rel in releases {
-                if let (Some(instance_id), Some(_folder_id)) = (
-                    rel.get("instance_id").and_then(val_to_u32),
-                    rel.get("folder_id").and_then(val_to_u32),
-                ) {
-                    out.push(CollectionInstance { instance_id });
-                    continue;
-                }
-                if let Some(instances) = rel.get("instances").and_then(|v| v.as_array()) {
-                    for inst in instances {
-                        let instance_id = inst
-                            .get("instance_id")
-                            .and_then(val_to_u32)
-                            .or_else(|| inst.get("id").and_then(val_to_u32));
-                        let folder_id = inst.get("folder_id").and_then(val_to_u32);
-                        if let (Some(instance_id), Some(_folder_id)) = (instance_id, folder_id) {
-                            out.push(CollectionInstance { instance_id });
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(out)
+        let resp: CollectionInstancesResponse = self.get(&url, &[], "collection instances")?;
+        Ok(resp.releases)
     }
 
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResponse> {
         let url = format!("{}/database/search", self.base);
-        let mut params: Vec<(&str, String)> = Vec::new();
-        params.push(("curr_abbr", self.currency.clone()));
-
-        if let Some(q) = &query.query {
-            params.push(("q", q.clone()));
-        }
-        if let Some(artist) = &query.artist {
-            params.push(("artist", artist.clone()));
-        }
-        if let Some(title) = &query.release_title {
-            params.push(("release_title", title.clone()));
-        }
-        if let Some(catno) = &query.catno {
-            params.push(("catno", catno.clone()));
-        }
-        if let Some(page) = query.page {
-            params.push(("page", page.to_string()));
-        }
-        if let Some(per_page) = query.per_page {
-            params.push(("per_page", per_page.to_string()));
-        }
-
-        let resp = self
-            .http
-            .get(url)
-            .query(&params)
-            .send()
-            .context("send search request")?
-            .error_for_status()
-            .context("Discogs search error response")?;
-
-        let raw: serde_json::Value = resp.json().context("decode search response body")?;
-        let mut out = SearchResponse::default();
-        if let Some(results) = raw.get("results").and_then(|v| v.as_array()) {
-            for v in results {
-                let id = v.get("id").and_then(val_to_u32);
-                let title = v.get("title").and_then(val_to_string);
-                let artist = v.get("artist").and_then(val_to_string);
-                let year = v.get("year").and_then(val_to_u32);
-                let country = v.get("country").and_then(val_to_string);
-                let label = v.get("label").and_then(val_to_string_vec);
-                let catno = v.get("catno").and_then(val_to_string);
-                let format_descriptions = v.get("format").and_then(val_to_string_vec);
-                let uri = v.get("uri").and_then(val_to_string);
-
-                if let Some(id) = id {
-                    out.results.push(SearchItem {
-                        id: Some(id),
-                        title,
-                        artist,
-                        year,
-                        country,
-                        label,
-                        catno,
-                        format_descriptions,
-                        uri,
-                    });
-                }
-            }
-        }
-
-        Ok(out)
+        self.get(&url, &query.params(&self.currency), "search")
     }
 }
 
@@ -231,30 +109,57 @@ pub struct SearchQuery {
     pub per_page: Option<u32>,
 }
 
+impl SearchQuery {
+    fn params(&self, currency: &str) -> Vec<(&'static str, String)> {
+        let mut params = vec![("curr_abbr", currency.to_string())];
+        let optional = [
+            ("q", self.query.clone()),
+            ("artist", self.artist.clone()),
+            ("release_title", self.release_title.clone()),
+            ("catno", self.catno.clone()),
+            ("page", self.page.map(|p| p.to_string())),
+            ("per_page", self.per_page.map(|p| p.to_string())),
+        ];
+        params.extend(optional.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))));
+        params
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct SearchResponse {
     #[serde(default)]
     pub results: Vec<SearchItem>,
 }
 
-#[derive(Debug, Clone)]
-pub struct CollectionFolders {
-    pub folders: Vec<CollectionFolder>,
+#[derive(Debug, Deserialize)]
+struct CollectionFoldersResponse {
+    #[serde(default)]
+    folders: Vec<CollectionFolder>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Deserialize)]
+struct CollectionInstancesResponse {
+    #[serde(default)]
+    releases: Vec<CollectionInstance>,
+}
+
+/// One copy of a release in the user's collection.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct CollectionInstance {
     pub instance_id: u32,
+    pub folder_id: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct CollectionFolder {
     pub id: u32,
     pub name: String,
-    pub count: Option<u32>,
+    #[serde(default)]
+    pub count: u32,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct SearchItem {
     #[serde(deserialize_with = "deserialize_opt_u32")]
     pub id: Option<u32>,
@@ -318,39 +223,6 @@ impl SearchItem {
     }
 }
 
-fn val_to_string(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
-fn val_to_u32(v: &serde_json::Value) -> Option<u32> {
-    match v {
-        serde_json::Value::Number(n) => n.as_u64().and_then(|u| u.try_into().ok()),
-        serde_json::Value::String(s) => s.parse::<u32>().ok(),
-        serde_json::Value::Bool(b) => Some(if *b { 1 } else { 0 }),
-        _ => None,
-    }
-}
-
-fn val_to_string_vec(v: &serde_json::Value) -> Option<Vec<String>> {
-    match v {
-        serde_json::Value::Array(arr) => {
-            let mut out = Vec::new();
-            for item in arr {
-                if let Some(s) = val_to_string(item) {
-                    out.push(s);
-                }
-            }
-            Some(out)
-        }
-        _ => val_to_string(v).map(|s| vec![s]),
-    }
-}
-
 fn deserialize_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -407,6 +279,7 @@ where
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Release {
+    pub id: Option<u32>,
     pub title: Option<String>,
     pub artists: Option<Vec<Artist>>,
     pub labels: Option<Vec<Label>>,

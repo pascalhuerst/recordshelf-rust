@@ -7,14 +7,12 @@ use std::{
         mpsc::Sender,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context as AnyhowContext, Result};
 use eframe::egui::Context as EguiContext;
 use evdev::{Device, EventSummary, KeyCode};
-
-use crate::discogs::{DiscogsClient, Release};
 
 fn emit(tx: &Sender<ScanEvent>, repaint: &Option<EguiContext>, event: ScanEvent) {
     let _ = tx.send(event);
@@ -23,18 +21,12 @@ fn emit(tx: &Sender<ScanEvent>, repaint: &Option<EguiContext>, event: ScanEvent)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ScanResult {
-    pub barcode: String,
-    pub release: Option<Release>,
-    pub error: Option<String>,
-    pub elapsed: Duration,
-}
-
+/// Events from the scanner thread. Lookups happen elsewhere; the scanner
+/// only reports what it read.
 #[derive(Debug)]
 pub enum ScanEvent {
     Info(String),
-    Result(ScanResult),
+    Code(String),
 }
 
 /// An input device that could be a barcode scanner (it reports digit keys and Enter).
@@ -82,14 +74,13 @@ pub struct BarcodeReader;
 impl BarcodeReader {
     pub fn spawn(
         device_path: PathBuf,
-        discogs: DiscogsClient,
         stop: Arc<AtomicBool>,
         tx: Sender<ScanEvent>,
         repaint: Option<EguiContext>,
     ) -> Result<()> {
         thread::Builder::new()
             .name("barcode-scanner".to_string())
-            .spawn(move || scanner_loop(device_path, discogs, stop, tx, repaint))
+            .spawn(move || scanner_loop(device_path, stop, tx, repaint))
             .context("spawn barcode scanner thread")?;
         Ok(())
     }
@@ -97,7 +88,6 @@ impl BarcodeReader {
 
 fn scanner_loop(
     device_path: PathBuf,
-    discogs: DiscogsClient,
     stop: Arc<AtomicBool>,
     tx: Sender<ScanEvent>,
     repaint: Option<EguiContext>,
@@ -148,33 +138,7 @@ fn scanner_loop(
                             if code.is_empty() {
                                 continue;
                             }
-                            let start = Instant::now();
-                            match lookup_release(&discogs, &code) {
-                                Ok(release) => {
-                                    emit(
-                                        &tx,
-                                        &repaint,
-                                        ScanEvent::Result(ScanResult {
-                                            barcode: code,
-                                            release: Some(release),
-                                            error: None,
-                                            elapsed: start.elapsed(),
-                                        }),
-                                    );
-                                }
-                                Err(err) => {
-                                    emit(
-                                        &tx,
-                                        &repaint,
-                                        ScanEvent::Result(ScanResult {
-                                            barcode: code,
-                                            release: None,
-                                            error: Some(err.to_string()),
-                                            elapsed: start.elapsed(),
-                                        }),
-                                    );
-                                }
-                            }
+                            emit(&tx, &repaint, ScanEvent::Code(code));
                         } else if let Some(ch) = translate_key(keycode) {
                             buffer.push(ch);
                         }
@@ -195,13 +159,6 @@ fn scanner_loop(
             }
         }
     }
-}
-
-fn lookup_release(discogs: &DiscogsClient, barcode: &str) -> Result<Release> {
-    let id: u32 = barcode
-        .parse()
-        .with_context(|| format!("invalid numeric barcode: {barcode}"))?;
-    discogs.release(id)
 }
 
 fn is_enter(code: KeyCode) -> bool {

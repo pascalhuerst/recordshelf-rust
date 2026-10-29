@@ -6,6 +6,7 @@ mod barcode_reader;
 mod config;
 mod discogs;
 mod ui;
+mod worker;
 
 use crate::config::Settings;
 use crate::ui::RecordShelfApp;

@@ -1,18 +1,20 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc::Receiver,
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
+    },
 };
 
-use std::path::PathBuf;
-
-use crate::barcode_reader::{self, BarcodeReader};
-use crate::barcode_reader::{ScanEvent, ScanResult};
+use crate::barcode_reader::{self, BarcodeReader, ScanEvent};
 use crate::config::Settings;
 use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
-use eframe::egui::{self, RichText};
+use crate::worker::{Request, Response, ScanResult, Worker};
+use eframe::egui::{self, Color32, RichText};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -20,22 +22,28 @@ pub enum Tab {
     Search,
 }
 
+/// One-line message for the status bar.
+struct Notice {
+    text: String,
+    is_error: bool,
+}
+
 pub struct RecordShelfApp {
     settings: Settings,
     config_path: Option<PathBuf>,
     repaint: egui::Context,
+    worker: Worker,
     scanner_stop: Arc<AtomicBool>,
-    discogs: DiscogsClient,
-    rx: Receiver<ScanEvent>,
-    scan_results: Vec<ScanResult>,
-    status: String,
+    scanner_rx: Receiver<ScanEvent>,
+    scanner_status: String,
+    notice: Option<Notice>,
     tab: Tab,
-    username: String,
     folders: Vec<CollectionFolder>,
     folder_picker_open: bool,
     folder_selected: Option<usize>,
-    collection_instance: Option<CollectionInstance>,
-    collection_info: Option<String>,
+    /// Known copies in the collection per release id (empty = checked, not owned).
+    ownership: HashMap<u32, Vec<CollectionInstance>>,
+    scan_result: Option<ScanResult>,
     search_focus: bool,
     search_q: String,
     search_artist: String,
@@ -44,30 +52,26 @@ pub struct RecordShelfApp {
     search_results: Vec<SearchItem>,
     selected_result: Option<usize>,
     selected_release: Option<Release>,
-    search_error: Option<String>,
 }
 
 impl RecordShelfApp {
     pub fn new(repaint: egui::Context, settings: Settings, config_path: Option<PathBuf>) -> Self {
-        let discogs = DiscogsClient::new(&settings.user_agent, &settings.token, &settings.currency)
-            .expect("build Discogs client");
-        let (scanner_stop, rx, status) = start_scanner(&settings, &discogs, &repaint);
-        Self {
-            username: settings.username.clone(),
+        let (scanner_stop, scanner_rx, scanner_status) = start_scanner(&settings, &repaint);
+        let mut app = Self {
+            worker: Worker::spawn(repaint.clone()),
             settings,
             config_path,
             repaint,
             scanner_stop,
-            discogs,
-            rx,
-            scan_results: Vec::new(),
-            status,
+            scanner_rx,
+            scanner_status,
+            notice: None,
             tab: Tab::Scan,
             folders: Vec::new(),
             folder_picker_open: false,
             folder_selected: None,
-            collection_instance: None,
-            collection_info: None,
+            ownership: HashMap::new(),
+            scan_result: None,
             search_focus: false,
             search_q: String::new(),
             search_artist: String::new(),
@@ -76,244 +80,383 @@ impl RecordShelfApp {
             search_results: Vec::new(),
             selected_result: None,
             selected_release: None,
-            search_error: None,
+        };
+        app.configure_worker();
+        app
+    }
+
+    /// Hands the current Discogs credentials to the worker and preloads folders.
+    fn configure_worker(&mut self) {
+        let client = if self.settings.has_token() {
+            match DiscogsClient::new(
+                &self.settings.user_agent,
+                &self.settings.token,
+                &self.settings.currency,
+            ) {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    self.set_error(format!("{err:#}"));
+                    None
+                }
+            }
+        } else {
+            self.set_error(
+                "No Discogs token configured (set DISCOGS_TOKEN or token in the settings file)"
+                    .to_string(),
+            );
+            None
+        };
+        let can_load_folders = client.is_some() && !self.settings.username.trim().is_empty();
+        self.worker.send(Request::Configure {
+            client,
+            username: self.settings.username.clone(),
+        });
+        if can_load_folders {
+            self.worker.send(Request::LoadFolders);
         }
     }
 
-    fn drain_events(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(ev) = self.rx.try_recv() {
-            changed = true;
+    fn set_info(&mut self, text: String) {
+        self.notice = Some(Notice {
+            text,
+            is_error: false,
+        });
+    }
+
+    fn set_error(&mut self, text: String) {
+        self.notice = Some(Notice {
+            text,
+            is_error: true,
+        });
+    }
+
+    fn selected_id(&self) -> Option<u32> {
+        self.search_results
+            .get(self.selected_result?)
+            .and_then(|item| item.id)
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(ev) = self.scanner_rx.try_recv() {
             match ev {
-                ScanEvent::Info(msg) => self.status = msg,
-                ScanEvent::Result(res) => {
-                    self.status = format!("Last scan {} ({:.0?})", res.barcode, res.elapsed);
-                    self.scan_results.clear();
-                    self.scan_results.push(res);
+                ScanEvent::Info(msg) => self.scanner_status = msg,
+                ScanEvent::Code(code) => {
+                    self.scanner_status = format!("Scanned {code}");
+                    self.worker.send(Request::Scan(code));
                 }
             }
         }
-        changed
+        for resp in self.worker.poll() {
+            self.handle_response(resp);
+        }
+    }
+
+    fn handle_response(&mut self, resp: Response) {
+        match resp {
+            Response::Scan(res) => {
+                if let (Some(id), Some(owned)) =
+                    (res.release.as_ref().and_then(|r| r.id), &res.owned)
+                {
+                    self.ownership.insert(id, owned.clone());
+                }
+                self.scanner_status = format!("Last scan {} ({:.0?})", res.barcode, res.elapsed);
+                self.scan_result = Some(res);
+            }
+            Response::Search(Ok(items)) => {
+                self.selected_result = if items.is_empty() { None } else { Some(0) };
+                self.search_focus = items.is_empty();
+                self.search_results = items;
+                self.selected_release = None;
+                self.notice = None;
+            }
+            Response::Search(Err(err)) => self.set_error(err),
+            Response::Release { id, result } => match result {
+                Ok(release) => {
+                    // Ignore answers for a result the user has already moved away from.
+                    if self.selected_id() == Some(id) {
+                        self.selected_release = Some(release);
+                        self.notice = None;
+                    }
+                }
+                Err(err) => self.set_error(err),
+            },
+            Response::Folders(Ok(folders)) => {
+                self.folders = folders;
+                self.folder_selected = match self.folder_selected {
+                    _ if self.folders.is_empty() => None,
+                    Some(i) => Some(i.min(self.folders.len() - 1)),
+                    None => Some(0),
+                };
+            }
+            Response::Folders(Err(err)) => self.set_error(err),
+            Response::Ownership { release_id, result } => match result {
+                Ok(instances) => {
+                    self.ownership.insert(release_id, instances);
+                }
+                Err(err) => self.set_error(err),
+            },
+            Response::Added {
+                release_id,
+                folder_id,
+                result,
+            } => match result {
+                Ok(()) => {
+                    let folder = self
+                        .folders
+                        .iter()
+                        .find(|f| f.id == folder_id)
+                        .map_or_else(|| format!("#{folder_id}"), |f| f.name.clone());
+                    self.set_info(format!("Added release {release_id} to folder {folder}"));
+                    // Refresh what we know: new copy count and folder item counts.
+                    self.worker.send(Request::CheckOwnership(release_id));
+                    self.worker.send(Request::LoadFolders);
+                }
+                Err(err) => self.set_error(err),
+            },
+        }
     }
 
     fn ui_scan(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for result in &self.scan_results {
-                    ui.group(|ui| {
-                        if let Some(err) = &result.error {
-                            ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
-                        } else if let Some(release) = &result.release {
-                            render_release(ui, release);
-                        } else {
-                            ui.label("No data");
-                        }
-                    });
-                    ui.add_space(6.0);
-                }
+                let Some(result) = &self.scan_result else {
+                    return;
+                };
+                ui.group(|ui| {
+                    if let Some(err) = &result.error {
+                        ui.colored_label(Color32::RED, format!("Error: {err}"));
+                    } else if let Some(release) = &result.release {
+                        render_ownership(ui, result.owned.as_deref(), &self.folders);
+                        render_release(ui, release);
+                    } else {
+                        ui.label("No data");
+                    }
+                });
             });
     }
 
     fn ui_search(&mut self, ui: &mut egui::Ui) {
         let mut trigger_search = false;
         let mut search_fields_active = false;
-        ui.vertical(|ui| {
+        let focus = std::mem::take(&mut self.search_focus);
+        let fields = [
+            ("Query:", &mut self.search_q),
+            ("Artist:", &mut self.search_artist),
+            ("Release:", &mut self.search_title),
+            ("Catalog No:", &mut self.search_catno),
+        ];
+        for (idx, (label, value)) in fields.into_iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label("Query:");
-                let resp = ui.text_edit_singleline(&mut self.search_q);
-                if self.search_focus {
+                ui.label(label);
+                let resp = ui.text_edit_singleline(value);
+                if idx == 0 && focus {
                     resp.request_focus();
-                    self.search_focus = false;
                 }
-                if resp.has_focus() {
-                    search_fields_active = true;
-                }
+                search_fields_active |= resp.has_focus();
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     trigger_search = true;
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Artist:");
-                let resp = ui.text_edit_singleline(&mut self.search_artist);
-                if resp.has_focus() {
-                    search_fields_active = true;
-                }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    trigger_search = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Release:");
-                let resp = ui.text_edit_singleline(&mut self.search_title);
-                if resp.has_focus() {
-                    search_fields_active = true;
-                }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    trigger_search = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Catalog No:");
-                let resp = ui.text_edit_singleline(&mut self.search_catno);
-                if resp.has_focus() {
-                    search_fields_active = true;
-                }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    trigger_search = true;
-                }
-            });
+        }
+        if trigger_search {
+            self.perform_search();
+        }
 
-            if trigger_search {
-                self.perform_search();
-            }
+        ui.separator();
 
-            if let Some(err) = &self.search_error {
-                ui.colored_label(egui::Color32::RED, err);
-            }
-
-            ui.separator();
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let up_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
-                    let down_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-                    let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    let a_pressed = ui.input(|i| i.key_pressed(egui::Key::A));
-
-                    for (idx, item) in self.search_results.iter().enumerate() {
-                        let title = item.title_display();
-                        let artist = item.artist_display();
-                        let label = item.label_display();
-                        let formats = item.format_display();
-                        let year = item.year.map(|y| y.to_string()).unwrap_or_default();
-                        let country = item.country.clone().unwrap_or_default();
-                        let line = format!(
-                            "{title} | {artist} | {label} | {year} | {country} | {formats}"
-                        );
-                        let selected = self.selected_result == Some(idx);
-                        if ui.selectable_label(selected, line).clicked() {
-                            self.selected_result = Some(idx);
-                        }
-                    }
-
-                    if a_pressed && !search_fields_active {
-                        if self.selected_result.is_none() {
-                            self.search_error =
-                                Some("Select a result before choosing a folder".to_string());
-                        } else if !self.folder_picker_open {
-                            self.prepare_folder_picker();
-                        } else {
-                            self.add_selected_to_collection();
-                        }
-                    }
-
-                    if self.folder_picker_open {
-                        if up_pressed {
-                            if let Some(sel) = self.folder_selected {
-                                if sel > 0 {
-                                    self.folder_selected = Some(sel - 1);
-                                }
-                            }
-                        }
-                        if down_pressed {
-                            let len = self.folders.len();
-                            if len > 0 {
-                                let sel = self.folder_selected.unwrap_or(0);
-                                if sel + 1 < len {
-                                    self.folder_selected = Some(sel + 1);
-                                }
-                            }
-                        }
-                        if enter_pressed {
-                            self.add_selected_to_collection();
-                        }
-                        if esc_pressed {
-                            self.folder_picker_open = false;
-                            self.collection_instance = None;
-                            self.collection_info = None;
-                        }
+        egui::ScrollArea::vertical()
+            .id_source("search-results")
+            .max_height(ui.available_height() * 0.5)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (idx, item) in self.search_results.iter().enumerate() {
+                    let line = format!(
+                        "{} | {} | {} | {} | {} | {}",
+                        item.title_display(),
+                        item.artist_display(),
+                        item.label_display(),
+                        item.year.map(|y| y.to_string()).unwrap_or_default(),
+                        item.country.clone().unwrap_or_default(),
+                        item.format_display()
+                    );
+                    let owned = item
+                        .id
+                        .and_then(|id| self.ownership.get(&id))
+                        .is_some_and(|o| !o.is_empty());
+                    let text = if owned {
+                        RichText::new(format!("\u{2713} {line}")).color(Color32::LIGHT_GREEN)
                     } else {
-                        if up_pressed {
-                            if let Some(sel) = self.selected_result {
-                                if sel > 0 {
-                                    self.selected_result = Some(sel - 1);
-                                }
-                            }
-                        }
-                        if down_pressed {
-                            let len = self.search_results.len();
-                            if len > 0 {
-                                let sel = self.selected_result.unwrap_or(0);
-                                if sel + 1 < len {
-                                    self.selected_result = Some(sel + 1);
-                                }
-                            }
-                        }
-                        if enter_pressed {
-                            self.load_selected_release();
-                        }
-                        if esc_pressed {
-                            self.selected_result = None;
-                            self.selected_release = None;
-                            self.search_focus = true;
-                        }
+                        RichText::new(line)
+                    };
+                    if ui
+                        .selectable_label(self.selected_result == Some(idx), text)
+                        .clicked()
+                    {
+                        self.selected_result = Some(idx);
                     }
-                });
-
-            if self.folder_picker_open {
-                let ctx = ui.ctx().clone();
-                let esc_picker = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-                if esc_picker {
-                    self.folder_picker_open = false;
-                    self.collection_instance = None;
-                    self.collection_info = None;
-                } else {
-                    let mut open = true;
-                    egui::Window::new("Add to folder")
-                        .open(&mut open)
-                        .collapsible(false)
-                        .show(&ctx, |ui| {
-                            if let Some(info) = &self.collection_info {
-                                ui.colored_label(egui::Color32::YELLOW, info);
-                            }
-                            for (idx, folder) in self.folders.iter().enumerate() {
-                                let selected = self.folder_selected == Some(idx);
-                                let label = format!(
-                                    "{} ({} items)",
-                                    folder.name,
-                                    folder.count.unwrap_or(0)
-                                );
-                                if ui.selectable_label(selected, label).clicked() {
-                                    self.folder_selected = Some(idx);
-                                }
-                            }
-                        });
-                    self.folder_picker_open = open;
                 }
-            }
+            });
 
-            if !self.folder_picker_open && self.search_focus {
-                // focus will be applied on next frame
-            }
+        // Keyboard handling. Skipped while typing, and on the frame a search was
+        // triggered by Enter so that the same keypress does not also pick a result.
+        if !search_fields_active && !trigger_search {
+            self.handle_search_keys(ui.ctx());
+        }
+        if self.folder_picker_open {
+            self.show_folder_picker(ui.ctx());
+        }
 
-            ui.separator();
+        ui.separator();
 
-            if let Some(release) = &self.selected_release {
-                render_release(ui, release);
+        egui::ScrollArea::vertical()
+            .id_source("search-release")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some(release) = &self.selected_release {
+                    let owned = release.id.and_then(|id| self.ownership.get(&id));
+                    render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
+                    render_release(ui, release);
+                }
+            });
+    }
+
+    fn handle_search_keys(&mut self, ctx: &egui::Context) {
+        let pressed = |key| ctx.input(|i| i.key_pressed(key));
+        let (up, down) = (pressed(egui::Key::ArrowUp), pressed(egui::Key::ArrowDown));
+        let (enter, esc) = (pressed(egui::Key::Enter), pressed(egui::Key::Escape));
+
+        if pressed(egui::Key::A) {
+            if self.folder_picker_open {
+                self.add_selected_to_collection();
+            } else {
+                self.open_folder_picker();
             }
+            return;
+        }
+
+        if self.folder_picker_open {
+            step(&mut self.folder_selected, self.folders.len(), up, down);
+            if enter {
+                self.add_selected_to_collection();
+            }
+            if esc {
+                self.folder_picker_open = false;
+            }
+        } else {
+            step(
+                &mut self.selected_result,
+                self.search_results.len(),
+                up,
+                down,
+            );
+            if enter {
+                self.load_selected_release();
+            }
+            if esc {
+                self.selected_result = None;
+                self.selected_release = None;
+                self.search_focus = true;
+            }
+        }
+    }
+
+    fn show_folder_picker(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("Add to folder")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let owned = self.selected_id().and_then(|id| self.ownership.get(&id));
+                if let Some(owned) = owned.filter(|o| !o.is_empty()) {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        format!(
+                            "Already in your collection ({}x). You can still add another copy.",
+                            owned.len()
+                        ),
+                    );
+                }
+                if self.folders.is_empty() {
+                    ui.label("Loading folders...");
+                }
+                for (idx, folder) in self.folders.iter().enumerate() {
+                    let label = format!("{} ({} items)", folder.name, folder.count);
+                    if ui
+                        .selectable_label(self.folder_selected == Some(idx), label)
+                        .clicked()
+                    {
+                        self.folder_selected = Some(idx);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Up/Down: select  Enter or A: add  Esc: cancel").small());
+            });
+        self.folder_picker_open = open;
+    }
+
+    fn perform_search(&mut self) {
+        let query = SearchQuery {
+            query: non_empty(&self.search_q),
+            artist: non_empty(&self.search_artist),
+            release_title: non_empty(&self.search_title),
+            catno: non_empty(&self.search_catno),
+            page: Some(1),
+            per_page: Some(25),
+        };
+        self.worker.send(Request::Search(query));
+        self.search_q.clear();
+        self.search_artist.clear();
+        self.search_title.clear();
+        self.search_catno.clear();
+    }
+
+    fn load_selected_release(&mut self) {
+        match self.selected_id() {
+            Some(id) => {
+                self.worker.send(Request::LoadRelease(id));
+                self.worker.send(Request::CheckOwnership(id));
+            }
+            None => self.set_error("Select a result first".to_string()),
+        }
+    }
+
+    fn open_folder_picker(&mut self) {
+        let Some(id) = self.selected_id() else {
+            self.set_error("Select a result before choosing a folder".to_string());
+            return;
+        };
+        if self.folders.is_empty() {
+            self.worker.send(Request::LoadFolders);
+        }
+        // Always refresh: the collection may have changed on discogs.com.
+        self.worker.send(Request::CheckOwnership(id));
+        if self.folder_selected.is_none() && !self.folders.is_empty() {
+            self.folder_selected = Some(0);
+        }
+        self.folder_picker_open = true;
+    }
+
+    fn add_selected_to_collection(&mut self) {
+        let Some(id) = self.selected_id() else {
+            self.set_error("Select a result first".to_string());
+            return;
+        };
+        let Some(folder) = self.folder_selected.and_then(|i| self.folders.get(i)) else {
+            self.set_error("Select a folder first".to_string());
+            return;
+        };
+        self.worker.send(Request::AddToCollection {
+            release_id: id,
+            folder_id: folder.id,
         });
+        self.folder_picker_open = false;
     }
 }
 
 impl eframe::App for RecordShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let updated = self.drain_events();
-        if updated {
-            ctx.request_repaint();
-        }
+        self.drain_events();
 
         egui::TopBottomPanel::top("top-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -323,6 +466,27 @@ impl eframe::App for RecordShelfApp {
                 ui.selectable_value(&mut self.tab, Tab::Search, "Search");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::widgets::global_dark_light_mode_switch(ui);
+                });
+            });
+        });
+
+        egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(&self.scanner_status);
+                if let Some(notice) = &self.notice {
+                    ui.separator();
+                    let color = if notice.is_error {
+                        Color32::RED
+                    } else {
+                        Color32::LIGHT_GREEN
+                    };
+                    ui.colored_label(color, &notice.text);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.worker.pending() > 0 {
+                        ui.label("Contacting Discogs...");
+                        ui.spinner();
+                    }
                 });
             });
         });
@@ -340,214 +504,39 @@ impl Drop for RecordShelfApp {
     }
 }
 
-impl RecordShelfApp {
-    fn perform_search(&mut self) {
-        let query = SearchQuery {
-            query: non_empty(&self.search_q),
-            artist: non_empty(&self.search_artist),
-            release_title: non_empty(&self.search_title),
-            catno: non_empty(&self.search_catno),
-            page: Some(1),
-            per_page: Some(25),
+/// Moves a list selection up or down, staying within `0..len`.
+fn step(selected: &mut Option<usize>, len: usize, up: bool, down: bool) {
+    if len == 0 {
+        return;
+    }
+    if up {
+        *selected = selected.map(|s| s.saturating_sub(1));
+    }
+    if down {
+        *selected = Some(selected.map_or(0, |s| (s + 1).min(len - 1)));
+    }
+}
+
+/// Starts the scanner thread for the configured device. Returns its stop flag,
+/// the event receiver and an initial status line.
+fn start_scanner(
+    settings: &Settings,
+    repaint: &egui::Context,
+) -> (Arc<AtomicBool>, Receiver<ScanEvent>, String) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let devices = barcode_reader::list_devices();
+    let status =
+        match barcode_reader::pick_device(&devices, &settings.device_name, &settings.device_path) {
+            Some(path) => {
+                match BarcodeReader::spawn(path, stop.clone(), tx, Some(repaint.clone())) {
+                    Ok(()) => "Waiting for scans...".to_string(),
+                    Err(err) => format!("Scanner not started: {err}"),
+                }
+            }
+            None => "No scanner configured (set device_name in the settings file)".to_string(),
         };
-
-        match self.discogs.search(&query) {
-            Ok(resp) => {
-                self.search_results = resp.results;
-                self.selected_result = if self.search_results.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                };
-                self.selected_release = None;
-                self.search_error = None;
-            }
-            Err(err) => {
-                self.search_error = Some(err.to_string());
-            }
-        }
-
-        self.search_q.clear();
-        self.search_artist.clear();
-        self.search_title.clear();
-        self.search_catno.clear();
-        self.search_focus = self.search_results.is_empty();
-    }
-
-    fn load_selected_release(&mut self) {
-        if let Some(idx) = self.selected_result {
-            if let Some(item) = self.search_results.get(idx) {
-                if let Some(id) = item.id {
-                    match self.discogs.release(id) {
-                        Ok(rel) => {
-                            self.selected_release = Some(rel);
-                            self.search_error = None;
-                        }
-                        Err(err) => {
-                            self.search_error = Some(err.to_string());
-                        }
-                    }
-                } else {
-                    self.search_error = Some("Selected item missing id".to_string());
-                }
-            }
-        }
-    }
-
-    fn ensure_folders_loaded(&mut self) -> bool {
-        if self.username.trim().is_empty() {
-            self.search_error = Some("Collection: username required".to_string());
-            return false;
-        }
-        if self.folders.is_empty() {
-            match self.discogs.collection_folders(&self.username) {
-                Ok(resp) => {
-                    self.folders = resp.folders;
-                }
-                Err(err) => {
-                    self.search_error = Some(err.to_string());
-                    return false;
-                }
-            }
-        }
-        if self.folders.is_empty() {
-            self.search_error = Some("No folders found".to_string());
-            return false;
-        }
-        if self.folder_selected.is_none() {
-            self.folder_selected = Some(0);
-        }
-        true
-    }
-
-    fn prepare_folder_picker(&mut self) {
-        if !self.ensure_folders_loaded() {
-            return;
-        }
-        self.collection_instance = None;
-        self.collection_info = None;
-        if let Some(idx) = self.selected_result {
-            if let Some(item) = self.search_results.get(idx) {
-                if let Some(id) = item.id {
-                    match self.discogs.collection_instances(&self.username, id) {
-                        Ok(instances) => {
-                            if let Some(inst) = instances.first() {
-                                let url = item
-                                    .uri
-                                    .as_ref()
-                                    .map(|u| {
-                                        if u.starts_with("http") {
-                                            u.clone()
-                                        } else {
-                                            format!("https://www.discogs.com{u}")
-                                        }
-                                    })
-                                    .unwrap_or_else(|| {
-                                        format!("https://www.discogs.com/release/{id}")
-                                    });
-                                match open::that(&url) {
-                                    Ok(_) => {
-                                        self.search_error = Some(format!(
-                                            "Release already in collection (instance {}). Opened release page to move manually.",
-                                            inst.instance_id
-                                        ));
-                                    }
-                                    Err(err) => {
-                                        self.search_error = Some(format!(
-                                            "Release already in collection; failed to open browser: {err}"
-                                        ));
-                                    }
-                                }
-                                self.folder_picker_open = false;
-                                self.collection_instance = None;
-                                self.collection_info = None;
-                                return;
-                            }
-                        }
-                        Err(err) => {
-                            self.search_error = Some(err.to_string());
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        self.folder_picker_open = true;
-    }
-
-    fn add_selected_to_collection(&mut self) {
-        if self.username.trim().is_empty() {
-            self.search_error = Some("Collection: username required".to_string());
-            return;
-        }
-        let folder_idx = match self.folder_selected {
-            Some(idx) => idx,
-            None => {
-                self.search_error = Some("Select a folder first".to_string());
-                return;
-            }
-        };
-        let folder = match self.folders.get(folder_idx) {
-            Some(f) => f,
-            None => {
-                self.search_error = Some("Select a valid folder".to_string());
-                return;
-            }
-        };
-        if let Some(idx) = self.selected_result {
-            if let Some(item) = self.search_results.get(idx) {
-                if let Some(id) = item.id {
-                    if let Some(inst) = &self.collection_instance {
-                        let url = item
-                            .uri
-                            .as_ref()
-                            .map(|u| {
-                                if u.starts_with("http") {
-                                    u.clone()
-                                } else {
-                                    format!("https://www.discogs.com{u}")
-                                }
-                            })
-                            .unwrap_or_else(|| format!("https://www.discogs.com/release/{id}"));
-                        match open::that(&url) {
-                            Ok(_) => {
-                                self.search_error = Some(format!(
-                                    "Release already in collection (instance {}). Opened release page in browser to move manually.",
-                                    inst.instance_id
-                                ));
-                            }
-                            Err(err) => {
-                                self.search_error = Some(format!(
-                                    "Release already in collection; failed to open browser: {err}"
-                                ));
-                            }
-                        }
-                        self.folder_picker_open = false;
-                        self.collection_instance = None;
-                        self.collection_info = None;
-                    } else {
-                        match self
-                            .discogs
-                            .add_to_collection(&self.username, folder.id, id)
-                        {
-                            Ok(_) => {
-                                let msg = format!("Added release {id} to folder {}", folder.name);
-                                self.search_error = Some(msg);
-                                self.folder_picker_open = false;
-                                self.collection_instance = None;
-                                self.collection_info = None;
-                            }
-                            Err(err) => {
-                                self.search_error = Some(err.to_string());
-                            }
-                        }
-                    }
-                } else {
-                    self.search_error = Some("Selected item missing id".to_string());
-                }
-            }
-        }
-    }
+    (stop, rx, status)
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -557,6 +546,40 @@ fn non_empty(s: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Shows whether (and where) a release is already in the collection.
+fn render_ownership(
+    ui: &mut egui::Ui,
+    owned: Option<&[CollectionInstance]>,
+    folders: &[CollectionFolder],
+) {
+    match owned {
+        None => {}
+        Some([]) => {
+            ui.colored_label(Color32::GRAY, "Not in your collection");
+        }
+        Some(instances) => {
+            let names: Vec<String> = instances
+                .iter()
+                .map(|inst| {
+                    folders
+                        .iter()
+                        .find(|f| f.id == inst.folder_id)
+                        .map_or_else(|| format!("#{}", inst.folder_id), |f| f.name.clone())
+                })
+                .collect();
+            ui.colored_label(
+                Color32::YELLOW,
+                format!(
+                    "\u{26A0} Already in your collection ({}x): {}",
+                    instances.len(),
+                    names.join(", ")
+                ),
+            );
+        }
+    }
+    ui.add_space(4.0);
 }
 
 fn render_release(ui: &mut egui::Ui, release: &Release) {
@@ -667,33 +690,4 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
             ui.hyperlink(uri);
         }
     }
-}
-
-/// Starts the scanner thread for the configured device. Returns its stop flag,
-/// the event receiver and an initial status line.
-fn start_scanner(
-    settings: &Settings,
-    discogs: &DiscogsClient,
-    repaint: &egui::Context,
-) -> (Arc<AtomicBool>, Receiver<ScanEvent>, String) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let devices = barcode_reader::list_devices();
-    let status =
-        match barcode_reader::pick_device(&devices, &settings.device_name, &settings.device_path) {
-            Some(path) => {
-                match BarcodeReader::spawn(
-                    path,
-                    discogs.clone(),
-                    stop.clone(),
-                    tx,
-                    Some(repaint.clone()),
-                ) {
-                    Ok(()) => "Waiting for scans...".to_string(),
-                    Err(err) => format!("Scanner not started: {err}"),
-                }
-            }
-            None => "No scanner configured (set device_name in the settings file)".to_string(),
-        };
-    (stop, rx, status)
 }
