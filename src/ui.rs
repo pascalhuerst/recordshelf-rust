@@ -821,3 +821,49 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_moves_within_bounds() {
+        let mut sel = Some(1);
+        step(&mut sel, 3, false, true);
+        assert_eq!(sel, Some(2));
+        step(&mut sel, 3, false, true);
+        assert_eq!(sel, Some(2), "stays on the last entry");
+        step(&mut sel, 3, true, false);
+        step(&mut sel, 3, true, false);
+        step(&mut sel, 3, true, false);
+        assert_eq!(sel, Some(0), "stays on the first entry");
+    }
+
+    #[test]
+    fn step_down_without_selection_selects_first() {
+        let mut sel = None;
+        step(&mut sel, 3, false, true);
+        assert_eq!(sel, Some(0));
+    }
+
+    #[test]
+    fn step_up_without_selection_stays_empty() {
+        let mut sel = None;
+        step(&mut sel, 3, true, false);
+        assert_eq!(sel, None);
+    }
+
+    #[test]
+    fn step_on_empty_list_does_nothing() {
+        let mut sel = None;
+        step(&mut sel, 0, false, true);
+        assert_eq!(sel, None);
+    }
+
+    #[test]
+    fn non_empty_trims_and_drops_blanks() {
+        assert_eq!(non_empty("  abc "), Some("abc".to_string()));
+        assert_eq!(non_empty("   "), None);
+        assert_eq!(non_empty(""), None);
+    }
+}

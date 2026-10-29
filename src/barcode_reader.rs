@@ -186,3 +186,78 @@ fn translate_key(code: KeyCode) -> Option<char> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(path: &str, name: &str) -> InputDevice {
+        InputDevice {
+            path: PathBuf::from(path),
+            name: name.to_string(),
+        }
+    }
+
+    fn devices() -> Vec<InputDevice> {
+        vec![
+            dev("/dev/input/event3", "AT Translated Set 2 keyboard"),
+            dev("/dev/input/event17", "Newtologic NT-1228BL Barcode Scanner"),
+        ]
+    }
+
+    #[test]
+    fn picks_device_by_name_even_if_renumbered() {
+        let mut devs = devices();
+        assert_eq!(
+            pick_device(&devs, "barcode scanner", ""),
+            Some(PathBuf::from("/dev/input/event17"))
+        );
+        devs[1].path = PathBuf::from("/dev/input/event5");
+        assert_eq!(
+            pick_device(&devs, "Barcode Scanner", ""),
+            Some(PathBuf::from("/dev/input/event5"))
+        );
+    }
+
+    #[test]
+    fn name_takes_precedence_over_fallback_path() {
+        assert_eq!(
+            pick_device(&devices(), "NT-1228", "/dev/input/event99"),
+            Some(PathBuf::from("/dev/input/event17"))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_path_when_name_does_not_match() {
+        assert_eq!(
+            pick_device(&devices(), "unplugged", "/dev/input/event9"),
+            Some(PathBuf::from("/dev/input/event9"))
+        );
+        assert_eq!(
+            pick_device(&[], "", "/dev/input/event9"),
+            Some(PathBuf::from("/dev/input/event9"))
+        );
+    }
+
+    #[test]
+    fn nothing_configured_picks_nothing() {
+        assert_eq!(pick_device(&devices(), "", ""), None);
+        assert_eq!(pick_device(&devices(), "  ", "  "), None);
+        assert_eq!(pick_device(&devices(), "unplugged", ""), None);
+    }
+
+    #[test]
+    fn translates_digits_and_punctuation() {
+        assert_eq!(translate_key(KeyCode::KEY_7), Some('7'));
+        assert_eq!(translate_key(KeyCode::KEY_KP0), Some('0'));
+        assert_eq!(translate_key(KeyCode::KEY_MINUS), Some('-'));
+        assert_eq!(translate_key(KeyCode::KEY_A), None);
+    }
+
+    #[test]
+    fn recognises_enter_keys() {
+        assert!(is_enter(KeyCode::KEY_ENTER));
+        assert!(is_enter(KeyCode::KEY_KPENTER));
+        assert!(!is_enter(KeyCode::KEY_SPACE));
+    }
+}

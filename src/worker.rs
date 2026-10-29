@@ -260,3 +260,90 @@ impl ScanCode {
             .with_context(|| format!("not a release id or UPC/EAN barcode: {code}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_numbers_are_release_ids() {
+        assert_eq!(
+            ScanCode::classify("249504").unwrap(),
+            ScanCode::ReleaseId(249504)
+        );
+        assert_eq!(
+            ScanCode::classify("35000000").unwrap(),
+            ScanCode::ReleaseId(35_000_000)
+        );
+    }
+
+    #[test]
+    fn twelve_to_fourteen_digits_are_barcodes() {
+        for code in ["012345678905", "5012345678900", "15012345678907"] {
+            assert_eq!(
+                ScanCode::classify(code).unwrap(),
+                ScanCode::Barcode(code.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_is_ignored() {
+        assert_eq!(
+            ScanCode::classify(" 5012345678900\n").unwrap(),
+            ScanCode::Barcode("5012345678900".to_string())
+        );
+    }
+
+    #[test]
+    fn garbage_is_rejected() {
+        assert!(ScanCode::classify("").is_err());
+        assert!(ScanCode::classify("12-34").is_err());
+        assert!(ScanCode::classify("abc").is_err());
+        // too long for a barcode and too big for a release id
+        assert!(ScanCode::classify("123456789012345").is_err());
+    }
+
+    #[test]
+    fn requests_without_client_report_missing_token() {
+        let mut state = State {
+            client: None,
+            username: "me".into(),
+        };
+        match state.handle(Request::LoadRelease(1)) {
+            Some(Response::Release {
+                id: 1,
+                result: Err(msg),
+            }) => {
+                assert!(msg.contains("token"), "{msg}")
+            }
+            _ => panic!("expected an error response"),
+        }
+    }
+
+    #[test]
+    fn collection_requests_need_a_username() {
+        let mut state = State {
+            client: None,
+            username: "  ".into(),
+        };
+        match state.handle(Request::LoadFolders) {
+            Some(Response::Folders(Err(msg))) => assert!(msg.contains("username"), "{msg}"),
+            _ => panic!("expected an error response"),
+        }
+    }
+
+    #[test]
+    fn configure_has_no_response() {
+        let mut state = State {
+            client: None,
+            username: String::new(),
+        };
+        let resp = state.handle(Request::Configure {
+            client: None,
+            username: "new".into(),
+        });
+        assert!(resp.is_none());
+        assert_eq!(state.username, "new");
+    }
+}

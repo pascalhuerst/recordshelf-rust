@@ -76,3 +76,69 @@ impl Settings {
         !self.token.trim().is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::load(&dir.path().join("nope.toml")).unwrap();
+        assert_eq!(settings, Settings::default());
+        assert!(!settings.has_token());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_creating_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        let settings = Settings {
+            token: "secret".into(),
+            username: "someone".into(),
+            device_name: "Barcode Reader".into(),
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), settings);
+        assert!(settings.has_token());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings::default().save(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn partial_file_fills_in_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "username = \"me\"\n").unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.username, "me");
+        assert_eq!(settings.currency, "EUR");
+    }
+
+    #[test]
+    fn invalid_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "this is = not [valid").unwrap();
+        assert!(Settings::load(&path).is_err());
+    }
+
+    #[test]
+    fn blank_token_counts_as_missing() {
+        let settings = Settings {
+            token: "   ".into(),
+            ..Settings::default()
+        };
+        assert!(!settings.has_token());
+    }
+}

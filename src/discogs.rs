@@ -320,3 +320,211 @@ pub struct Track {
     pub title: Option<String>,
     pub duration: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    /// Serves one canned HTTP response and returns the raw request it received.
+    fn serve_once(status: &str, body: &str) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        (base, handle)
+    }
+
+    fn client(base: &str) -> DiscogsClient {
+        let mut c = DiscogsClient::new("test-agent", "tok", "EUR").unwrap();
+        c.base = base.to_string();
+        c
+    }
+
+    #[test]
+    fn rejects_invalid_header_values() {
+        assert!(DiscogsClient::new("bad\nagent", "tok", "EUR").is_err());
+        assert!(DiscogsClient::new("ok", "bad\ntoken", "EUR").is_err());
+    }
+
+    #[test]
+    fn release_request_has_auth_and_currency() {
+        let (base, server) = serve_once("200 OK", r#"{"id": 42, "title": "Blue", "year": 1971}"#);
+        let release = client(&base).release(42).unwrap();
+        assert_eq!(release.id, Some(42));
+        assert_eq!(release.title.as_deref(), Some("Blue"));
+        let req = server.join().unwrap().to_lowercase();
+        assert!(req.starts_with("get /releases/42?curr_abbr=eur"), "{req}");
+        assert!(req.contains("authorization: discogs token=tok"), "{req}");
+        assert!(req.contains("user-agent: test-agent"), "{req}");
+    }
+
+    #[test]
+    fn http_errors_are_reported() {
+        let (base, _server) = serve_once("404 Not Found", r#"{"message": "nope"}"#);
+        assert!(client(&base).release(1).is_err());
+    }
+
+    #[test]
+    fn add_to_collection_posts_to_folder() {
+        let (base, server) = serve_once("201 Created", "{}");
+        client(&base).add_to_collection("me", 7, 99).unwrap();
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /users/me/collection/folders/7/releases/99?quantity=1"),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn collection_instances_lists_every_copy() {
+        let body = r#"{"pagination": {"items": 2}, "releases": [
+            {"id": 5, "instance_id": 11, "folder_id": 1, "rating": 0},
+            {"id": 5, "instance_id": 12, "folder_id": 3}
+        ]}"#;
+        let (base, server) = serve_once("200 OK", body);
+        let owned = client(&base).collection_instances("me", 5).unwrap();
+        assert_eq!(
+            owned,
+            vec![
+                CollectionInstance {
+                    instance_id: 11,
+                    folder_id: 1
+                },
+                CollectionInstance {
+                    instance_id: 12,
+                    folder_id: 3
+                },
+            ]
+        );
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("GET /users/me/collection/releases/5")
+        );
+    }
+
+    #[test]
+    fn collection_instances_empty_when_not_owned() {
+        let (base, _server) =
+            serve_once("200 OK", r#"{"pagination": {"items": 0}, "releases": []}"#);
+        assert!(
+            client(&base)
+                .collection_instances("me", 5)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn collection_folders_are_parsed() {
+        let body = r#"{"folders": [
+            {"id": 0, "name": "All", "count": 10, "resource_url": "x"},
+            {"id": 1, "name": "Uncategorized", "count": 4}
+        ]}"#;
+        let (base, _server) = serve_once("200 OK", body);
+        let folders = client(&base).collection_folders("me").unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(
+            folders[1],
+            CollectionFolder {
+                id: 1,
+                name: "Uncategorized".into(),
+                count: 4
+            }
+        );
+    }
+
+    #[test]
+    fn search_sends_only_set_parameters() {
+        let (base, server) = serve_once("200 OK", r#"{"results": []}"#);
+        let query = SearchQuery {
+            barcode: Some("5012345678900".into()),
+            kind: Some("release".into()),
+            per_page: Some(10),
+            ..Default::default()
+        };
+        assert!(client(&base).search(&query).unwrap().results.is_empty());
+        let req = server.join().unwrap();
+        let line = req.lines().next().unwrap();
+        assert!(line.contains("barcode=5012345678900"), "{line}");
+        assert!(line.contains("type=release"), "{line}");
+        assert!(line.contains("per_page=10"), "{line}");
+        assert!(line.contains("curr_abbr=EUR"), "{line}");
+        assert!(!line.contains("artist="), "{line}");
+        assert!(!line.contains("&page="), "{line}");
+    }
+
+    #[test]
+    fn search_response_tolerates_inconsistent_types() {
+        let body = r#"{"results": [
+            {"id": "123", "title": "Artist - Album", "year": "1999", "label": "Solo",
+             "catno": 42, "format": ["Vinyl", "LP"], "country": "DE", "uri": "/release/123"},
+            {"id": 456, "title": "Other", "year": 2001, "label": ["A", "B"]},
+            {"title": "no id at all"}
+        ]}"#;
+        let (base, _server) = serve_once("200 OK", body);
+        let results = client(&base)
+            .search(&SearchQuery::default())
+            .unwrap()
+            .results;
+        assert_eq!(results[0].id, Some(123));
+        assert_eq!(results[0].year, Some(1999));
+        assert_eq!(results[0].label, Some(vec!["Solo".to_string()]));
+        assert_eq!(results[0].catno.as_deref(), Some("42"));
+        assert_eq!(results[1].label_display(), "A, B");
+        assert_eq!(results[2].id, None);
+    }
+
+    fn item(json: &str) -> SearchItem {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn artist_falls_back_to_title_prefix() {
+        let it = item(r#"{"id": 1, "title": "Miles Davis - Kind of Blue"}"#);
+        assert_eq!(it.artist_display(), "Miles Davis");
+        let it = item(r#"{"id": 1, "title": "Kind of Blue", "artist": "Miles Davis"}"#);
+        assert_eq!(it.artist_display(), "Miles Davis");
+        let it = item(r#"{"id": 1, "title": "Untitled"}"#);
+        assert_eq!(it.artist_display(), "");
+    }
+
+    #[test]
+    fn display_helpers_join_fields() {
+        let it = item(
+            r#"{"id": 1, "label": ["Blue Note", "Other"], "catno": "BLP 1", "format": ["Vinyl", "LP"]}"#,
+        );
+        assert_eq!(it.label_display(), "Blue Note, Other (BLP 1)");
+        assert_eq!(it.format_display(), "Vinyl, LP");
+        assert_eq!(item(r#"{"id": 1}"#).label_display(), "");
+    }
+
+    #[test]
+    fn release_model_decodes_nested_data() {
+        let body = r#"{"id": 9, "title": "T", "artists": [{"name": "A"}],
+            "labels": [{"name": "L", "catno": "C-1"}], "year": 1990,
+            "formats": [{"name": "Vinyl", "descriptions": ["LP"]}],
+            "genres": ["Jazz"], "styles": ["Bop"],
+            "tracklist": [{"position": "A1", "title": "One", "duration": "3:00"}],
+            "uri": "https://www.discogs.com/release/9"}"#;
+        let r: Release = serde_json::from_str(body).unwrap();
+        assert_eq!(r.artists.unwrap()[0].name.as_deref(), Some("A"));
+        assert_eq!(r.labels.unwrap()[0].catno.as_deref(), Some("C-1"));
+        assert_eq!(r.tracklist.unwrap()[0].duration.as_deref(), Some("3:00"));
+    }
+}

@@ -89,3 +89,53 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!(e.to_string()))
     .context("run UI")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        Args::parse_from(std::iter::once("recordshelf-rust").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn no_flags_leave_settings_untouched() {
+        let mut settings = Settings {
+            username: "file-user".into(),
+            ..Settings::default()
+        };
+        let before = settings.clone();
+        parse(&[]).apply_to(&mut settings);
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn flags_override_settings() {
+        let mut settings = Settings {
+            username: "file-user".into(),
+            currency: "EUR".into(),
+            ..Settings::default()
+        };
+        parse(&[
+            "--username",
+            "cli-user",
+            "--device",
+            "/dev/input/event3",
+            "--device-name",
+            "Scanner",
+            "--token",
+            "abc",
+            "--currency",
+            "USD",
+            "--user-agent",
+            "UA",
+        ])
+        .apply_to(&mut settings);
+        assert_eq!(settings.username, "cli-user");
+        assert_eq!(settings.device_path, "/dev/input/event3");
+        assert_eq!(settings.device_name, "Scanner");
+        assert_eq!(settings.token, "abc");
+        assert_eq!(settings.currency, "USD");
+        assert_eq!(settings.user_agent, "UA");
+    }
+}
