@@ -366,19 +366,26 @@ impl RecordShelfApp {
             ("Catalog No:", &mut self.search_catno),
             ("Barcode:", &mut self.search_barcode),
         ];
-        for (idx, (label, value)) in fields.into_iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(label);
-                let resp = ui.text_edit_singleline(value);
-                if idx == 0 && focus {
-                    resp.request_focus();
-                }
-                search_fields_active |= resp.has_focus();
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    trigger_search = true;
+        // Two-column grid: labels share one column, so all inputs start at the
+        // same x and stretch to the right edge of the window.
+        egui::Grid::new("search-fields")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                for (idx, (label, value)) in fields.into_iter().enumerate() {
+                    ui.label(label);
+                    let resp =
+                        ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+                    if idx == 0 && focus {
+                        resp.request_focus();
+                    }
+                    search_fields_active |= resp.has_focus();
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        trigger_search = true;
+                    }
+                    ui.end_row();
                 }
             });
-        }
         if trigger_search {
             self.perform_search();
         }
