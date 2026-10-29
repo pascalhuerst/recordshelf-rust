@@ -24,6 +24,8 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 
 - `shops.rs`, `decks.rs`, `hhv.rs`, `shop_bridge.rs` – lookups of decks.de / hhv.de label codes via a browser userscript (`--shop-bridge`); `ShopEntry` → Discogs search plan (barcode, catno+label, catno, artist+title). 6-7 digit numbers are treated as hhv article numbers while the bridge runs. See `shops.md`. Personal tool, never to be published.
 
+- `db/` – PostgreSQL schema for our own catalogue (setup.sql, numbered migrations, `test.sh` + `tests/schema.sql`), see `db/README.md` for the schema, conventions and how Discogs data maps onto it. Not wired into the app yet.
+
 ## Conventions
 - All Discogs searches are restricted to `format=Vinyl` (only vinyl is of interest); this is applied in `SearchQuery::params`.
 - Errors: `anyhow` with `.context(...)`; worker turns them into `String`s for the UI; the UI shows them as a `Notice` in the status bar.
