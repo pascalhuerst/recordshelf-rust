@@ -8,6 +8,7 @@ mod controls;
 mod decks;
 mod discogs;
 mod hhv;
+mod label;
 mod shop_bridge;
 mod shops;
 mod ui;
@@ -48,6 +49,14 @@ pub struct Args {
     /// Discogs username for collection actions
     #[arg(long)]
     pub username: Option<String>,
+
+    /// Write label previews (PNG) into this directory and exit
+    #[arg(long, value_name = "DIR")]
+    pub label_preview: Option<PathBuf>,
+
+    /// Release id for --label-preview (fetched from Discogs); a built-in sample otherwise
+    #[arg(long, value_name = "ID", requires = "label_preview")]
+    pub label_release: Option<u32>,
 
     /// Start in a normal window instead of fullscreen (F11 toggles at runtime)
     #[arg(long)]
@@ -90,6 +99,24 @@ fn main() -> Result<()> {
         None => Settings::default(),
     };
     args.apply_to(&mut settings);
+
+    if let Some(dir) = &args.label_preview {
+        let content = match args.label_release {
+            Some(id) => {
+                let client = discogs::DiscogsClient::new(
+                    &settings.user_agent,
+                    &settings.token,
+                    &settings.currency,
+                )?;
+                label::LabelContent::from_release(id, &client.release(id)?)
+            }
+            None => label::sample_content(),
+        };
+        for file in label::write_previews(dir, &content)? {
+            println!("{}", file.display());
+        }
+        return Ok(());
+    }
 
     let bridge_port = args.shop_bridge.then_some(args.shop_port);
     let native_options = eframe::NativeOptions {

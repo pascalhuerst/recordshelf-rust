@@ -26,6 +26,8 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 
 - `db/` – PostgreSQL schema for our own catalogue (setup.sql, numbered migrations, `test.sh` + `tests/schema.sql`), see `db/README.md` for the schema, conventions and how Discogs data maps onto it. Not wired into the app yet.
 
+- `label.rs` – sleeve sticker (52x39 mm, test labels 51x38) drawn into a 1-bit bitmap at 203 dpi: size, label / catalog number, artist, title, tracks, plus the bare Discogs release id as QR (version 1, 4 dots per module) or Code 128 (set C). Fonts: DejaVu Sans Condensed in `assets/fonts`. `--label-preview DIR [--label-release ID]` writes PNG previews (3x). Tests decode the rendered codes with rxing. Printing (ZPL over TCP 9100 to the ZD411) is planned, not built yet.
+
 ## Conventions
 - All Discogs searches are restricted to `format=Vinyl` (only vinyl is of interest); this is applied in `SearchQuery::params`.
 - Errors: `anyhow` with `.context(...)`; worker turns them into `String`s for the UI; the UI shows them as a `Notice` in the status bar.
