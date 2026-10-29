@@ -5,6 +5,10 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 DB=./db.sh
+# the real migrations; the tests add their own after these
+N=$(ls migrations/*.sql | wc -l)
+NEXT=$(printf '%04d' $((N + 1)))
+NEXT2=$(printf '%04d' $((N + 2)))
 failures=0
 checks=0
 
@@ -28,7 +32,7 @@ expect_eq 0 "$code" "fresh bootstrap exit code"
 expect_in "created role t1_role" "$out" "role created"
 expect_in "created database t1" "$out" "database created"
 expect_in "applying 0001_init.sql" "$out" "migration applied"
-expect_in "applied 1 migration(s)" "$out" "summary"
+expect_in "applied $N migration(s)" "$out" "summary"
 expect_in "postgres://t1_role:" "$out" "connection string"
 SETTINGS="$XDG_CONFIG_HOME/recordshelf/config.toml"
 expect_in "wrote database_url to $SETTINGS" "$out" "settings file written"
@@ -43,8 +47,9 @@ expect_eq "t|t" "$(sql postgres "select rolcanlogin, rolpassword is not null fro
 expect_eq "t1_role" "$(sql postgres "select pg_get_userbyid(datdba) from pg_database where datname = 't1'")" "database owner"
 expect_eq "t1_role" "$(sql t1 "select tableowner from pg_tables where tablename = 'releases'")" "tables are owned by the role"
 expect_eq "t1_role" "$(sql t1 "select tableowner from pg_tables where tablename = 'schema_migrations'")" "bookkeeping table owner"
-expect_eq "1|0001_init.sql" "$(sql t1 "select version, name from schema_migrations")" "recorded migration"
-expect_eq 64 "$(sql t1 "select length(checksum) from schema_migrations")" "checksum recorded"
+expect_eq "1|0001_init.sql" "$(sql t1 "select version, name from schema_migrations where version = 1")" "recorded migration"
+expect_eq "$N" "$(sql t1 "select count(*) from schema_migrations")" "all migrations recorded"
+expect_eq "$N" "$(sql t1 "select count(*) from schema_migrations where length(checksum) = 64")" "checksums recorded"
 expect_eq "t" "$(sql t1 "select count(*) > 10 from pg_tables where schemaname = 'public'")" "tables created"
 
 # --- running it again changes nothing ------------------------------------------
@@ -57,7 +62,7 @@ expect_in "the role already existed" "$out" "no credentials for an existing role
 expect_not_in "$password" "$out" "the old password must not reappear"
 expect_not_in "wrote database_url" "$out" "an existing role's settings are left alone"
 expect_in "t1_role:$password@" "$(cat "$SETTINGS")" "settings still hold the credentials"
-expect_eq 1 "$(sql t1 "select count(*) from schema_migrations")" "no duplicate bookkeeping rows"
+expect_eq "$N" "$(sql t1 "select count(*) from schema_migrations")" "no duplicate bookkeeping rows"
 
 # --- status ------------------------------------------------------------------------
 out=$($DB status -U postgres -d t1 2>&1)
@@ -67,15 +72,16 @@ expect_in "applied  0001_init.sql" "$out" "status of an applied migration"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cp migrations/*.sql "$tmp"/
-echo "ALTER TABLE releases ADD COLUMN test_col text;" >"$tmp/0002_add_test_col.sql"
+echo "ALTER TABLE releases ADD COLUMN test_col text;" >"$tmp/${NEXT}_add_test_col.sql"
 out=$(RECORDSHELF_MIGRATIONS_DIR=$tmp $DB status -U postgres -d t1 2>&1)
-expect_in "pending  0002_add_test_col.sql" "$out" "status of a pending migration"
+expect_in "pending  ${NEXT}_add_test_col.sql" "$out" "status of a pending migration"
 out=$(RECORDSHELF_MIGRATIONS_DIR=$tmp $DB migrate -U postgres -d t1 2>&1); code=$?
 expect_eq 0 "$code" "migrate exit code"
-expect_in "applying 0002_add_test_col.sql" "$out" "new migration applied"
+expect_in "applying ${NEXT}_add_test_col.sql" "$out" "new migration applied"
 expect_not_in "applying 0001" "$out" "old migration not repeated"
+expect_not_in "applying 0002" "$out" "old migration not repeated (2)"
 expect_eq "test_col" "$(sql t1 "select column_name from information_schema.columns where table_name = 'releases' and column_name = 'test_col'")" "column added"
-expect_eq 2 "$(sql t1 "select count(*) from schema_migrations")" "bookkeeping rows"
+expect_eq $((N + 1)) "$(sql t1 "select count(*) from schema_migrations")" "bookkeeping rows"
 
 # --- an edited migration is refused ----------------------------------------------
 echo "-- edited later" >>"$tmp/0001_init.sql"
@@ -85,16 +91,16 @@ expect_in "was changed after it was applied" "$out" "edited migration message"
 cp migrations/0001_init.sql "$tmp/0001_init.sql"
 
 # --- a failing migration leaves nothing behind -----------------------------------
-printf 'CREATE TABLE half_done (id integer);\nSELECT this_is_not_valid;\n' >"$tmp/0003_broken.sql"
+printf 'CREATE TABLE half_done (id integer);\nSELECT this_is_not_valid;\n' >"$tmp/${NEXT2}_broken.sql"
 out=$(RECORDSHELF_MIGRATIONS_DIR=$tmp $DB migrate -U postgres -d t1 2>&1); code=$?
 expect_eq 1 "$code" "failing migration exit code"
-expect_in "migration 0003_broken.sql failed" "$out" "failing migration message"
+expect_in "migration ${NEXT2}_broken.sql failed" "$out" "failing migration message"
 expect_eq "" "$(sql t1 "select to_regclass('half_done')")" "partial changes are rolled back"
-expect_eq 2 "$(sql t1 "select count(*) from schema_migrations")" "failed migration is not recorded"
-printf 'CREATE TABLE half_done (id integer);\n' >"$tmp/0003_broken.sql"
+expect_eq $((N + 1)) "$(sql t1 "select count(*) from schema_migrations")" "failed migration is not recorded"
+printf 'CREATE TABLE half_done (id integer);\n' >"$tmp/${NEXT2}_broken.sql"
 out=$(RECORDSHELF_MIGRATIONS_DIR=$tmp $DB migrate -U postgres -d t1 2>&1); code=$?
 expect_eq 0 "$code" "fixed migration exit code"
-expect_in "applying 0003_broken.sql" "$out" "fixed migration is applied"
+expect_in "applying ${NEXT2}_broken.sql" "$out" "fixed migration is applied"
 
 # --- password from the environment is used and never echoed ----------------------
 out=$(RECORDSHELF_DB_PASSWORD=sup3rsecret $DB bootstrap -U postgres -d t2 -r t2_role 2>&1); code=$?

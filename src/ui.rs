@@ -542,7 +542,12 @@ impl RecordShelfApp {
                         );
                         if existed {
                             let title = self.title_of(release_id);
-                            self.set_info(format!("Removed from the library: {title}"));
+                            let note = if self.tab == Tab::Collection {
+                                " (still in your Discogs collection)"
+                            } else {
+                                ""
+                            };
+                            self.set_info(format!("Removed from the library: {title}{note}"));
                         }
                     }
                     Err(err) => self.set_error(format!("Library sync failed: {err}")),
@@ -553,6 +558,7 @@ impl RecordShelfApp {
             response @ (LibraryResponse::List(_)
             | LibraryResponse::Details { .. }
             | LibraryResponse::Image { .. }
+            | LibraryResponse::Notes { .. }
             | LibraryResponse::Thumbs { .. }) => self.handle_collection_response(response),
             LibraryResponse::Cover { release_id, result } => match result {
                 Ok(true) => {
@@ -573,6 +579,13 @@ impl RecordShelfApp {
             .map(SearchItem::title_display)
             .filter(|t| !t.is_empty())
             .or_else(|| self.releases.get(&id).and_then(|r| r.title.clone()))
+            .or_else(|| {
+                self.collection
+                    .rows
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| format!("{} - {}", r.artists, r.title))
+            })
             .unwrap_or_else(|| format!("release {id}"))
     }
 

@@ -37,6 +37,11 @@ pub enum LibraryRequest {
     },
     /// The stored cover image of a record. Not counted as pending work.
     Image(u32),
+    /// Our own notes for a record (blank clears them).
+    SetNotes {
+        id: u32,
+        notes: String,
+    },
     /// Stored thumbnails for list rows. Not counted as pending work.
     Thumbs(Vec<u32>),
     /// Store a downloaded cover for a release that is in the database.
@@ -94,6 +99,11 @@ pub enum LibraryResponse {
     Image {
         id: u32,
         result: Result<Option<Vec<u8>>, String>,
+    },
+    /// Whether the record was found and its notes set.
+    Notes {
+        id: u32,
+        result: Result<bool, String>,
     },
     Thumbs {
         ids: Vec<u32>,
@@ -225,6 +235,12 @@ impl LibraryState {
                     .connection()
                     .and_then(|l| l.get_image(id).map_err(|e| format!("{e:#}")));
                 LibraryResponse::Image { id, result }
+            }
+            LibraryRequest::SetNotes { id, notes } => {
+                let result = self
+                    .connection()
+                    .and_then(|l| l.set_notes(id, &notes).map_err(|e| format!("{e:#}")));
+                LibraryResponse::Notes { id, result }
             }
             LibraryRequest::Thumbs(ids) => {
                 let result = self
@@ -892,7 +908,7 @@ mod tests {
         let url = server.new_database("w_life");
         assert!(matches!(
             state.handle(LibraryRequest::Configure { url }),
-            LibraryResponse::Ready { migrated: 1 }
+            LibraryResponse::Ready { migrated: 2 }
         ));
 
         // not there yet
@@ -1218,5 +1234,48 @@ mod tests {
             0,
             "only the counted requests were subtracted"
         );
+    }
+
+    #[test]
+    fn the_library_thread_stores_notes() {
+        let Some(server) = crate::library::testing::server() else {
+            return;
+        };
+        let mut state = LibraryState::default();
+        state.handle(LibraryRequest::Configure {
+            url: server.new_database("w_notes"),
+        });
+        state.handle(save_job(7, 1));
+        match state.handle(LibraryRequest::SetNotes {
+            id: 7,
+            notes: "  signed ".into(),
+        }) {
+            LibraryResponse::Notes { id: 7, result } => assert!(result.unwrap()),
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::Details {
+            id: 7,
+            for_scan: false,
+        }) {
+            LibraryResponse::Details { result, .. } => {
+                assert_eq!(result.unwrap().unwrap().my_notes.as_deref(), Some("signed"));
+            }
+            _ => panic!(),
+        }
+        match state.handle(LibraryRequest::SetNotes {
+            id: 404,
+            notes: "x".into(),
+        }) {
+            LibraryResponse::Notes { result, .. } => assert!(!result.unwrap()),
+            _ => panic!(),
+        }
+        let mut offline = LibraryState::default();
+        match offline.handle(LibraryRequest::SetNotes {
+            id: 1,
+            notes: "x".into(),
+        }) {
+            LibraryResponse::Notes { result, .. } => assert!(result.is_err()),
+            _ => panic!(),
+        }
     }
 }

@@ -46,6 +46,19 @@ BEGIN
 END
 $$;
 
+-- our own notes are optional, and separate from the Discogs notes
+INSERT INTO releases (id, title, notes) VALUES (11, 'Notes test', 'from discogs');
+UPDATE releases SET my_notes = 'mine' WHERE id = 11;
+DO $$
+BEGIN
+    IF (SELECT my_notes FROM releases WHERE id = 10) IS NOT NULL THEN RAISE EXCEPTION 'my_notes should default to NULL'; END IF;
+    IF (SELECT notes || '/' || my_notes FROM releases WHERE id = 11) <> 'from discogs/mine' THEN
+        RAISE EXCEPTION 'notes and my_notes must be separate columns';
+    END IF;
+END
+$$;
+DELETE FROM releases WHERE id = 11;
+
 -- updated_at moves on update, created_at does not
 UPDATE releases SET created_at = now() - interval '1 day', updated_at = now() - interval '1 day' WHERE id = 10;
 UPDATE releases SET title = 'Speicher 95 Tribute EP (renamed)' WHERE id = 10;

@@ -2,7 +2,7 @@
 //! database, and look up a scanned sticker there (never on Discogs).
 
 use super::*;
-use crate::collection::ListState;
+use crate::collection::{ListState, NotesEditor};
 use crate::library::StoredRelease;
 use crate::worker::ScanCode;
 
@@ -157,6 +157,19 @@ impl RecordShelfApp {
                 }
                 Err(err) => self.set_error(format!("Database: {err}")),
             },
+            LibraryResponse::Notes { id, result } => match result {
+                Ok(true) => {
+                    self.set_info("Notes saved".to_string());
+                    // show them, and make them searchable
+                    if self.collection.selected_id == Some(id) {
+                        self.collection.details = None;
+                        self.collection.details_requested = None;
+                    }
+                    self.collection_changed();
+                }
+                Ok(false) => self.set_error(format!("Release {id} is not in the library any more")),
+                Err(err) => self.set_error(format!("Notes not saved: {err}")),
+            },
             LibraryResponse::Image { id, result } => {
                 let state = match result {
                     Ok(Some(bytes)) => ImageState::Ready(bytes.into()),
@@ -227,6 +240,129 @@ impl RecordShelfApp {
         self.set_info("Printing label...".to_string());
     }
 
+    /// D: ask before deleting the selected record from the library.
+    fn ask_delete(&mut self) {
+        let Some(row) = self.collection.selected_row() else {
+            self.set_error("Select a record first".to_string());
+            return;
+        };
+        let title = if row.artists.is_empty() {
+            row.title.clone()
+        } else {
+            format!("{} - {}", row.artists, row.title)
+        };
+        self.collection.confirm_delete = Some((row.id, title));
+    }
+
+    fn confirm_delete(&mut self) {
+        let Some((id, _)) = self.collection.confirm_delete.take() else {
+            return;
+        };
+        self.library_busy.insert(id);
+        self.worker
+            .send(Request::Library(LibraryRequest::Sync(Box::new(
+                SyncJob::Remove { release_id: id },
+            ))));
+    }
+
+    /// E: edit our own notes for the selected record.
+    fn start_edit(&mut self) {
+        let Some(record) = self
+            .collection
+            .details
+            .as_ref()
+            .filter(|d| Some(d.id) == self.collection.selected_id)
+        else {
+            self.set_info("The record is still loading; press E again".to_string());
+            return;
+        };
+        let title = match record.artist_display().as_str() {
+            "" => record.title.clone(),
+            artists => format!("{artists} - {}", record.title),
+        };
+        self.collection.editor = Some(NotesEditor {
+            release_id: record.id,
+            title,
+            text: record.my_notes.clone().unwrap_or_default(),
+            focus: true,
+        });
+    }
+
+    fn save_notes(&mut self) {
+        let Some(editor) = self.collection.editor.take() else {
+            return;
+        };
+        self.worker.send(Request::Library(LibraryRequest::SetNotes {
+            id: editor.release_id,
+            notes: editor.text,
+        }));
+    }
+
+    /// The delete confirmation and the notes editor.
+    fn show_collection_dialogs(&mut self, ctx: &egui::Context) {
+        let pressed = |key| ctx.input(|i| i.key_pressed(key));
+        if let Some((_, title)) = self.collection.confirm_delete.clone() {
+            let (mut yes, mut no) = (false, false);
+            egui::Window::new("Delete from the library")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(format!("Delete \"{title}\" from the library?"));
+                    ui.label(
+                        RichText::new(
+                            "Only our database is changed. The record stays in your Discogs collection, \
+                             so auto sync may add it again.",
+                        )
+                        .small(),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        yes = ui.button("Delete  [Enter]").clicked();
+                        no = ui.button("Cancel  [Esc]").clicked();
+                    });
+                });
+            if yes || pressed(egui::Key::Enter) || pressed(egui::Key::Y) {
+                self.confirm_delete();
+            } else if no || pressed(egui::Key::Escape) || pressed(egui::Key::N) {
+                self.collection.confirm_delete = None;
+            }
+            return;
+        }
+        if let Some(mut editor) = self.collection.editor.take() {
+            let (mut save, mut cancel) = (false, false);
+            egui::Window::new(format!("Notes: {}", editor.title))
+                .collapsible(false)
+                .default_width(440.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    let response = ui.add(
+                        egui::TextEdit::multiline(&mut editor.text)
+                            .desired_rows(6)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Your own notes about this record"),
+                    );
+                    if std::mem::take(&mut editor.focus) {
+                        response.request_focus();
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        save = ui.button("Save  [Ctrl+Enter]").clicked();
+                        cancel = ui.button("Cancel  [Esc]").clicked();
+                    });
+                });
+            let ctrl_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+            if save || ctrl_enter {
+                self.collection.editor = Some(editor);
+                self.save_notes();
+            } else if cancel || pressed(egui::Key::Escape) {
+                // discarded
+            } else {
+                self.collection.editor = Some(editor);
+            }
+        }
+    }
+
     fn open_stored(&mut self) {
         let Some(id) = self.collection.selected_id else {
             self.set_error("Select a record first".to_string());
@@ -262,6 +398,12 @@ impl RecordShelfApp {
         }
         if pressed(Command::Open.key()) {
             self.open_stored();
+        }
+        if pressed(egui::Key::D) {
+            self.ask_delete();
+        }
+        if pressed(egui::Key::E) {
+            self.start_edit();
         }
         if pressed(Command::Quit.key()) {
             self.run_command(Command::Quit);
@@ -318,9 +460,10 @@ impl RecordShelfApp {
             }
         });
 
-        if !search_active {
+        if !search_active && !self.collection.dialog_open() {
             self.handle_collection_keys(ui.ctx());
         }
+        self.show_collection_dialogs(ui.ctx());
 
         match &self.collection.list {
             ListState::NotLoaded | ListState::Loading => {
@@ -425,12 +568,19 @@ impl RecordShelfApp {
 
     fn collection_details(&mut self, ui: &mut egui::Ui) {
         let mut action = None;
+        let (mut edit, mut delete) = (false, false);
         ui.horizontal(|ui| {
             if ui.button("Print label  [P]").clicked() {
                 action = Some(Command::Print);
             }
             if ui.button("Open in browser  [O]").clicked() {
                 action = Some(Command::Open);
+            }
+            if ui.button("Edit notes  [E]").clicked() {
+                edit = true;
+            }
+            if ui.button("Delete  [D]").clicked() {
+                delete = true;
             }
             if ui.button("Quit  [Q]").clicked() {
                 action = Some(Command::Quit);
@@ -442,6 +592,12 @@ impl RecordShelfApp {
             Some(Command::Open) => self.open_stored(),
             Some(Command::Quit) => self.run_command(Command::Quit),
             _ => {}
+        }
+        if edit {
+            self.start_edit();
+        }
+        if delete {
+            self.ask_delete();
         }
         let selected = self.collection.selected_id;
         egui::ScrollArea::vertical()
@@ -507,6 +663,9 @@ fn render_stored(ui: &mut egui::Ui, record: &StoredRelease) {
         ui.label(RichText::new(format!("Format: {format}")).strong());
     }
     ui.label(RichText::new(format!("Copies: {}", record.copies)).strong());
+    if let Some(notes) = &record.my_notes {
+        ui.label(RichText::new(format!("My notes: {notes}")).color(Color32::LIGHT_BLUE));
+    }
     ui.add_space(6.0);
     if let Some(country) = &record.country {
         ui.label(RichText::new(format!("Country: {country}")).small());
@@ -583,6 +742,7 @@ mod tests {
             genres: vec!["Electronic".into()],
             styles: vec!["Techno".into()],
             notes: Some("Pressed in DE".into()),
+            my_notes: Some("Signed at the fair".into()),
             discogs_uri: Some("https://www.discogs.com/release/1".into()),
             copies: 2,
             artists: vec![("Altone".into(), Some("&".into())), ("Björk".into(), None)],
@@ -1118,5 +1278,218 @@ mod tests {
         let before = app.worker.pending();
         app.route_scan("5012345678900".into());
         assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    // --- delete (D) -------------------------------------------------------------
+
+    #[test]
+    fn d_asks_before_deleting_and_names_the_record() {
+        let mut app = loaded_app(); // record 1 (Altone - Wonderscape) selected
+        let before = app.worker.pending();
+        app.ask_delete();
+        assert_eq!(
+            app.collection.confirm_delete,
+            Some((1, "Altone - Wonderscape".to_string()))
+        );
+        assert_eq!(
+            app.worker.pending(),
+            before,
+            "nothing happens before the answer"
+        );
+        assert!(app.collection.dialog_open());
+    }
+
+    #[test]
+    fn declining_keeps_the_record() {
+        let mut app = loaded_app();
+        app.ask_delete();
+        let before = app.worker.pending();
+        app.collection.confirm_delete = None; // Esc / No
+        assert_eq!(app.worker.pending(), before);
+        assert!(app.library_busy.is_empty());
+        assert!(!app.collection.dialog_open());
+    }
+
+    #[test]
+    fn confirming_removes_it_from_the_library_only() {
+        let mut app = loaded_app();
+        app.ask_delete();
+        let before = app.worker.pending();
+        app.confirm_delete();
+        assert_eq!(
+            app.worker.pending(),
+            before + 1,
+            "one request to the database"
+        );
+        assert!(app.library_busy.contains(&1));
+        assert!(app.collection.confirm_delete.is_none());
+        // the Discogs side is not touched: no collection request was sent, and the
+        // answer says so
+        app.handle_library_response(LibraryResponse::Synced {
+            release_id: 1,
+            result: Ok(SyncOutcome::Removed { existed: true }),
+        });
+        let notice = app.notice.as_ref().unwrap();
+        assert!(!notice.is_error);
+        assert!(
+            notice.text.contains("Removed from the library")
+                && notice.text.contains("Altone - Wonderscape")
+        );
+        assert!(notice.text.contains("still in your Discogs collection"));
+        assert_eq!(
+            app.library[&1].copies, 0,
+            "the Add tab now knows it is not in the library"
+        );
+        assert!(
+            app.collection.stale || app.collection.list == ListState::Loading,
+            "the list is reloaded"
+        );
+    }
+
+    #[test]
+    fn d_needs_a_selected_record() {
+        let mut app = app();
+        app.collection.set_rows(Vec::new());
+        app.ask_delete();
+        assert!(app.collection.confirm_delete.is_none());
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
+    }
+
+    #[test]
+    fn a_deleted_record_is_added_again_by_auto_sync_when_it_is_still_owned() {
+        // the documented consequence of "library only"
+        let mut app = loaded_app();
+        app.settings.library_auto_sync = true;
+        app.releases.insert(1, Release::default());
+        app.ownership.insert(
+            1,
+            vec![CollectionInstance {
+                instance_id: 5,
+                folder_id: 1,
+            }],
+        );
+        app.handle_library_response(LibraryResponse::Synced {
+            release_id: 1,
+            result: Ok(SyncOutcome::Removed { existed: true }),
+        });
+        assert!(
+            app.library_busy.contains(&1),
+            "a new sync is already on its way"
+        );
+    }
+
+    // --- notes (E) -----------------------------------------------------------------
+
+    #[test]
+    fn e_opens_the_editor_with_the_current_notes() {
+        let mut app = loaded_app();
+        app.collection.details = Some(stored(1));
+        app.start_edit();
+        let editor = app.collection.editor.as_ref().unwrap();
+        assert_eq!(editor.release_id, 1);
+        assert_eq!(editor.text, "Signed at the fair");
+        assert_eq!(editor.title, "Altone & Björk - Title 1");
+        assert!(editor.focus, "the text field gets the focus");
+        assert!(app.collection.dialog_open());
+    }
+
+    #[test]
+    fn e_waits_for_the_record_to_load() {
+        let mut app = loaded_app();
+        app.start_edit();
+        assert!(app.collection.editor.is_none());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("still loading"))
+        );
+        // details of another record do not count
+        app.collection.details = Some(stored(3));
+        app.start_edit();
+        assert!(app.collection.editor.is_none());
+    }
+
+    #[test]
+    fn saving_sends_the_text_and_closes_the_editor() {
+        let mut app = loaded_app();
+        app.collection.details = Some(stored(1));
+        app.start_edit();
+        app.collection.editor.as_mut().unwrap().text = "new text".into();
+        let before = app.worker.pending();
+        app.save_notes();
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(app.collection.editor.is_none());
+    }
+
+    #[test]
+    fn saved_notes_are_reloaded_and_the_list_is_refreshed() {
+        let mut app = loaded_app();
+        app.collection.details = Some(stored(1));
+        app.handle_library_response(LibraryResponse::Notes {
+            id: 1,
+            result: Ok(true),
+        });
+        assert!(
+            app.collection.details.is_none(),
+            "the details are fetched again with the new notes"
+        );
+        assert!(app.collection.details_requested.is_none());
+        assert!(app.notice.as_ref().is_some_and(|n| n.text == "Notes saved"));
+        assert!(
+            app.collection.stale || app.collection.list == ListState::Loading,
+            "the search must know the new notes"
+        );
+        // errors are reported
+        app.handle_library_response(LibraryResponse::Notes {
+            id: 1,
+            result: Err("lost".into()),
+        });
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("lost"))
+        );
+        app.handle_library_response(LibraryResponse::Notes {
+            id: 1,
+            result: Ok(false),
+        });
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
+    }
+
+    #[test]
+    fn the_keys_of_the_list_are_off_while_a_dialog_is_open() {
+        let mut app = loaded_app();
+        assert!(!app.collection.dialog_open());
+        app.collection.editor = Some(NotesEditor {
+            release_id: 1,
+            title: "t".into(),
+            text: String::new(),
+            focus: false,
+        });
+        assert!(app.collection.dialog_open());
+        app.collection.editor = None;
+        app.collection.confirm_delete = Some((1, "t".into()));
+        assert!(app.collection.dialog_open());
+    }
+
+    #[test]
+    fn the_dialogs_and_the_notes_can_be_drawn() {
+        let mut app = loaded_app();
+        app.collection.details = Some(stored(1));
+        render(&mut app); // details with notes
+        app.collection.confirm_delete = Some((1, "Altone - Wonderscape".into()));
+        render(&mut app);
+        app.collection.confirm_delete = None;
+        app.start_edit();
+        render(&mut app);
+        render(&mut app);
+        assert!(
+            app.collection.editor.is_some(),
+            "the editor stays open while nobody answers"
+        );
+        assert!(
+            !app.collection.editor.as_ref().unwrap().focus,
+            "the focus was given once"
+        );
     }
 }

@@ -15,11 +15,18 @@ pub const THUMB_SIZE: u32 = 150;
 /// The migrations this version of the app knows, in order. They are the same
 /// files `db/db.sh` applies, with the same checksum (sha256 of the file).
 /// `every_migration_file_is_embedded` fails when a file is missing here.
-const MIGRATIONS: &[(i32, &str, &str)] = &[(
-    1,
-    "0001_init.sql",
-    include_str!("../db/migrations/0001_init.sql"),
-)];
+const MIGRATIONS: &[(i32, &str, &str)] = &[
+    (
+        1,
+        "0001_init.sql",
+        include_str!("../db/migrations/0001_init.sql"),
+    ),
+    (
+        2,
+        "0002_add_my_notes.sql",
+        include_str!("../db/migrations/0002_add_my_notes.sql"),
+    ),
+];
 
 fn checksum(sql: &str) -> String {
     Sha256::digest(sql.as_bytes())
@@ -132,7 +139,10 @@ pub struct StoredRelease {
     pub country: Option<String>,
     pub genres: Vec<String>,
     pub styles: Vec<String>,
+    /// Discogs release notes (refreshed by every sync).
     pub notes: Option<String>,
+    /// Our own notes, never touched by a sync.
+    pub my_notes: Option<String>,
     pub discogs_uri: Option<String>,
     pub copies: i16,
     /// (name, what the sleeve puts after the name)
@@ -175,6 +185,7 @@ impl StoredRelease {
             genres: c.genres.clone(),
             styles: c.styles.clone(),
             notes: c.notes.clone(),
+            my_notes: None,
             discogs_uri: c.discogs_uri.clone(),
             copies: c.copies,
             artists: c
@@ -449,7 +460,7 @@ impl Library {
     pub fn list(&mut self) -> Result<Vec<RecordRow>> {
         use std::collections::BTreeMap;
         let base = self.client.query(
-            "SELECT r.id, r.title, r.year, r.country, r.genres, r.styles, r.copies, (c.release_id IS NOT NULL)
+            "SELECT r.id, r.title, r.year, r.country, r.genres, r.styles, r.copies, (c.release_id IS NOT NULL), r.my_notes
                FROM releases r LEFT JOIN release_covers c ON c.release_id = r.id",
             &[],
         )?;
@@ -505,6 +516,7 @@ impl Library {
                 let country: Option<String> = row.get(3);
                 let genres: Vec<String> = row.get(4);
                 let styles: Vec<String> = row.get(5);
+                let my_notes: Option<String> = row.get(8);
                 let artist_list = artists.get(&id).cloned().unwrap_or_default();
                 let label_list = labels.get(&id).cloned().unwrap_or_default();
                 let artists_text =
@@ -520,12 +532,13 @@ impl Library {
                     })
                     .unwrap_or_default();
                 let haystack = fold(&format!(
-                    "{title} {artists_text} {labels_text} {} {} {} {} {format} {}",
+                    "{title} {artists_text} {labels_text} {} {} {} {} {format} {} {}",
                     year.map(|y| y.to_string()).unwrap_or_default(),
                     country.unwrap_or_default(),
                     genres.join(" "),
                     styles.join(" "),
                     tracks.get(&id).cloned().unwrap_or_default(),
+                    my_notes.unwrap_or_default(),
                 ));
                 RecordRow {
                     id: id as u32,
@@ -549,7 +562,7 @@ impl Library {
         let db_id = i32::try_from(id).context("release id out of range")?;
         let Some(base) = self.client.query_opt(
             "SELECT title, master_id, released_on::text, released_precision::text, year, country,
-                    genres, styles, notes, discogs_uri, copies
+                    genres, styles, notes, discogs_uri, copies, my_notes
                FROM releases WHERE id = $1",
             &[&db_id],
         )?
@@ -628,6 +641,7 @@ impl Library {
             genres: base.get(6),
             styles: base.get(7),
             notes: base.get(8),
+            my_notes: base.get(11),
             discogs_uri: base.get(9),
             copies: base.get(10),
             artists,
@@ -665,6 +679,18 @@ impl Library {
             .iter()
             .map(|row| (row.get::<_, i32>(0) as u32, row.get(1)))
             .collect())
+    }
+
+    /// Sets our own notes for a record; blank notes clear them. False if the
+    /// record is not in the database.
+    pub fn set_notes(&mut self, id: u32, notes: &str) -> Result<bool> {
+        let id = i32::try_from(id).context("release id out of range")?;
+        let notes = notes.trim();
+        let notes = (!notes.is_empty()).then_some(notes);
+        Ok(self.client.execute(
+            "UPDATE releases SET my_notes = $2 WHERE id = $1",
+            &[&id, &notes],
+        )? > 0)
     }
 
     /// Removes a release and everything that belongs to it. False if it was not there.
@@ -974,12 +1000,14 @@ mod tests {
             "CREATE TABLE schema_migrations (version integer PRIMARY KEY, name text NOT NULL, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())",
         )
         .unwrap();
-        c.batch_execute(MIGRATIONS[0].2).unwrap();
-        c.execute(
-            "INSERT INTO schema_migrations (version, name, checksum) VALUES (1, '0001_init.sql', $1)",
-            &[&checksum(MIGRATIONS[0].2)],
-        )
-        .unwrap();
+        for (version, name, sql) in MIGRATIONS {
+            c.batch_execute(sql).unwrap();
+            c.execute(
+                "INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)",
+                &[version, &name.to_string(), &checksum(sql)],
+            )
+            .unwrap();
+        }
         assert_eq!(Library::connect(&url).unwrap().1, 0);
     }
 
@@ -1537,6 +1565,83 @@ mod tests {
         assert_eq!(
             f(3, None, None, "stereo", None, None, &["LP"]).summary(),
             "3 x LP"
+        );
+    }
+
+    #[test]
+    fn my_notes_are_ours_and_survive_every_sync() {
+        let Some((mut library, _)) = library("t_my_notes") else {
+            return;
+        };
+        library.save_release(&mapped(FULL, 1)).unwrap();
+        assert_eq!(library.get_release(9).unwrap().unwrap().my_notes, None);
+        assert!(
+            library
+                .set_notes(9, "  Bought at the fair, signed.  ")
+                .unwrap()
+        );
+        let record = library.get_release(9).unwrap().unwrap();
+        assert_eq!(
+            record.my_notes.as_deref(),
+            Some("Bought at the fair, signed."),
+            "trimmed"
+        );
+        assert_eq!(
+            record.notes.as_deref(),
+            Some("Pressed in DE"),
+            "the Discogs notes are separate"
+        );
+        // a sync refreshes everything from Discogs, but not our notes
+        library.save_release(&mapped(FULL, 3)).unwrap();
+        let record = library.get_release(9).unwrap().unwrap();
+        assert_eq!(
+            record.my_notes.as_deref(),
+            Some("Bought at the fair, signed.")
+        );
+        assert_eq!(record.copies, 3);
+        // multi line notes are kept as they are
+        library.set_notes(9, "line one\nline two").unwrap();
+        assert_eq!(
+            library.get_release(9).unwrap().unwrap().my_notes.as_deref(),
+            Some("line one\nline two")
+        );
+        // blank notes clear them
+        library.set_notes(9, "  \n ").unwrap();
+        assert_eq!(library.get_release(9).unwrap().unwrap().my_notes, None);
+        // unknown records
+        assert!(!library.set_notes(404, "x").unwrap());
+    }
+
+    #[test]
+    fn my_notes_can_be_searched() {
+        let Some((mut library, _)) = library("t_my_notes_search") else {
+            return;
+        };
+        library.save_release(&mapped(FULL, 1)).unwrap();
+        library
+            .set_notes(9, "Signed by Laurent at Rex Club")
+            .unwrap();
+        let rows = library.list().unwrap();
+        assert!(
+            rows[0].haystack.contains("rex club"),
+            "{}",
+            rows[0].haystack
+        );
+    }
+
+    #[test]
+    fn deleting_a_record_takes_its_notes_along() {
+        let Some((mut library, _)) = library("t_my_notes_delete") else {
+            return;
+        };
+        library.save_release(&mapped(FULL, 1)).unwrap();
+        library.set_notes(9, "keep?").unwrap();
+        assert!(library.delete_release(9).unwrap());
+        library.save_release(&mapped(FULL, 1)).unwrap();
+        assert_eq!(
+            library.get_release(9).unwrap().unwrap().my_notes,
+            None,
+            "a record stored again starts without notes"
         );
     }
 }

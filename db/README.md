@@ -28,14 +28,14 @@ With `database_url` set, the app connects at startup, brings the schema up to da
 - **Sync rule.** For a release whose data and collection status are known: if you own copies on Discogs, the release is stored with `copies` = that number (data refreshed from Discogs); if you own none and it is in the database, it is deleted (cascade). Releases you do not own are never stored.
 - **Auto sync** (default; setting `library_auto_sync`, key `U`): this happens by itself for the results of every scan or search, and after adding or removing a copy with `A`/`R`. **Manual** mode: press `S` to sync the selected release (also refreshes its data). The status bar shows the mode; the details show "In the library (2x)" or what differs.
 - **Covers.** After a release is stored, its main cover is downloaded (with the Discogs credentials) and stored as downloaded plus a 150 px JPEG thumbnail in `release_covers`.
-- **Search Collection tab** lists everything in the database (loaded at once, searched in memory, so it is instant for a few thousand records), shows the stored details and covers, prints labels from the stored data and looks up scanned stickers (the number on our labels is the release id) in the database only.
+- **Search Collection tab** lists everything in the database (loaded at once, searched in memory, so it is instant for a few thousand records), shows the stored details and covers, prints labels from the stored data and looks up scanned stickers (the number on our labels is the release id) in the database only. **E** edits `my_notes`; **D** deletes a record from the library only (it stays in the Discogs collection, so auto sync can add it again).
 - **Mapping.** Done by `src/catalogue.rs` as described below; the SQL is in `src/library.rs`. The migrations are embedded in the app (`MIGRATIONS` in `library.rs`): **a new migration file must be added to that list too** (a test fails if one is missing).
 - **Tests.** The Rust tests start a throwaway PostgreSQL from the server binaries on the machine (and stop it with the test run); without them those tests are skipped.
 
 ## Schema
 | Table | Purpose |
 |---|---|
-| `releases` | one row per release we own: Discogs `id`, `master_id`, title, `released_on` + `released_precision`, generated `year`, country, genres, styles, notes, `copies`, timestamps |
+| `releases` | one row per release we own: Discogs `id`, `master_id`, title, `released_on` + `released_precision`, generated `year`, country, genres, styles, `notes` (Discogs pressing notes, refreshed by sync), `my_notes` (our own, never touched by sync), `copies`, timestamps |
 | `release_covers` | our own copy of the cover (`image`) and a thumbnail (`thumb`) |
 | `artists`, `release_artists` | artists in sleeve order; `join_text` is what the sleeve puts after the name ("&", ",", "feat.") |
 | `labels`, `release_labels` | labels and catalog numbers (a release can have several of either) |

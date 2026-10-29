@@ -7,6 +7,16 @@ use std::collections::HashSet;
 use crate::catalogue::fold;
 use crate::library::{RecordRow, StoredRelease};
 
+/// The window for editing our own notes of a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotesEditor {
+    pub release_id: u32,
+    pub title: String,
+    pub text: String,
+    /// The text field takes the keyboard focus when the window opens.
+    pub focus: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListState {
     NotLoaded,
@@ -39,6 +49,9 @@ pub struct Collection {
     pub cover_requested: HashSet<u32>,
     /// The database changed while the list was loading: load it again afterwards.
     pub reload_pending: bool,
+    /// Waiting for a yes/no: delete this record (id, title) from the library.
+    pub confirm_delete: Option<(u32, String)>,
+    pub editor: Option<NotesEditor>,
 }
 
 impl Default for Collection {
@@ -61,6 +74,8 @@ impl Default for Collection {
             thumbs_requested: HashSet::new(),
             cover_requested: HashSet::new(),
             reload_pending: false,
+            confirm_delete: None,
+            editor: None,
         }
     }
 }
@@ -177,6 +192,11 @@ impl Collection {
         self.selected_id = Some(id);
         self.refilter();
         self.scroll_to = Some(0.0);
+    }
+
+    /// A dialog is open, so the list's keys must not react.
+    pub fn dialog_open(&self) -> bool {
+        self.confirm_delete.is_some() || self.editor.is_some()
     }
 
     pub fn count_text(&self) -> String {
@@ -417,5 +437,21 @@ mod tests {
         );
         assert_eq!(c.row_at(0).map(|r| r.id), Some(1));
         assert!(c.row_at(10).is_none());
+    }
+
+    #[test]
+    fn dialogs_block_the_list_keys() {
+        let mut c = sample();
+        assert!(!c.dialog_open());
+        c.confirm_delete = Some((1, "x".into()));
+        assert!(c.dialog_open());
+        c.confirm_delete = None;
+        c.editor = Some(NotesEditor {
+            release_id: 1,
+            title: "x".into(),
+            text: String::new(),
+            focus: true,
+        });
+        assert!(c.dialog_open());
     }
 }
