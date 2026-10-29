@@ -658,6 +658,24 @@ impl RecordShelfApp {
                             RichText::new("Printing is switched off while the host is empty.").small(),
                         );
 
+                        ui.add_space(8.0);
+                        ui.heading("Database");
+                        ui.horizontal(|ui| {
+                            ui.label("URL:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.database_url)
+                                    .password(true)
+                                    .hint_text("postgres://recordshelf:...@host/recordshelf")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Written by db/db.sh bootstrap. The app does not use the database yet.",
+                            )
+                            .small(),
+                        );
+
                         ui.add_space(6.0);
                         if let Some(path) = &config_path {
                             ui.label(RichText::new(format!("Saved to {}", path.display())).small());
@@ -2723,5 +2741,36 @@ mod tests {
         let before = app.worker.pending();
         app.run_command(Command::Print);
         assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    #[test]
+    fn the_database_url_is_saved_from_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings_draft.database_url =
+            " postgres://recordshelf:pw@lightdesk.local/recordshelf ".into();
+        app.save_settings();
+        let saved = Settings::load(&dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            saved.database_url,
+            "postgres://recordshelf:pw@lightdesk.local/recordshelf"
+        );
+    }
+
+    #[test]
+    fn saving_from_the_dialog_keeps_settings_it_does_not_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "token = \"tok\"\nfuture_setting = 42\n").unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings = Settings::load(&path).unwrap();
+        app.open_settings();
+        app.settings_draft.username = "me".into();
+        app.save_settings();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("future_setting = 42")
+        );
     }
 }

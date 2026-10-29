@@ -30,8 +30,15 @@ expect_in "created database t1" "$out" "database created"
 expect_in "applying 0001_init.sql" "$out" "migration applied"
 expect_in "applied 1 migration(s)" "$out" "summary"
 expect_in "postgres://t1_role:" "$out" "connection string"
-password=$(grep -o 'postgres://t1_role:[0-9a-f]*@' <<<"$out" | sed 's|postgres://t1_role:||; s|@||')
-expect_eq 36 "${#password}" "generated password length"
+SETTINGS="$XDG_CONFIG_HOME/recordshelf/config.toml"
+expect_in "wrote database_url to $SETTINGS" "$out" "settings file written"
+expect_in "postgres://t1_role:<password>@" "$out" "masked connection string"
+password=$(sed -n 's|^database_url = "postgres://t1_role:\([0-9a-f]*\)@.*|\1|p' "$SETTINGS")
+expect_eq 36 "${#password}" "generated password length (read back from the settings file)"
+expect_not_in "$password" "$out" "the password is not printed when it is stored"
+expect_eq "600" "$(stat -c %a "$SETTINGS")" "settings file is private"
+expect_eq 1 "$(grep -c '^database_url' "$SETTINGS")" "exactly one database_url"
+expect_in "/t1\"" "$(grep '^database_url' "$SETTINGS")" "url points at the database"
 expect_eq "t|t" "$(sql postgres "select rolcanlogin, rolpassword is not null from pg_roles where rolname = 't1_role'")" "role can log in and has a password"
 expect_eq "t1_role" "$(sql postgres "select pg_get_userbyid(datdba) from pg_database where datname = 't1'")" "database owner"
 expect_eq "t1_role" "$(sql t1 "select tableowner from pg_tables where tablename = 'releases'")" "tables are owned by the role"
@@ -46,8 +53,10 @@ expect_eq 0 "$code" "second bootstrap exit code"
 expect_in "role t1_role exists (password left unchanged)" "$out" "role kept"
 expect_in "database t1 exists" "$out" "database kept"
 expect_in "database is up to date" "$out" "nothing to apply"
-expect_in "postgres://t1_role:<password>@" "$out" "no password printed again"
+expect_in "the role already existed" "$out" "no credentials for an existing role"
 expect_not_in "$password" "$out" "the old password must not reappear"
+expect_not_in "wrote database_url" "$out" "an existing role's settings are left alone"
+expect_in "t1_role:$password@" "$(cat "$SETTINGS")" "settings still hold the credentials"
 expect_eq 1 "$(sql t1 "select count(*) from schema_migrations")" "no duplicate bookkeeping rows"
 
 # --- status ------------------------------------------------------------------------
@@ -91,7 +100,9 @@ expect_in "applying 0003_broken.sql" "$out" "fixed migration is applied"
 out=$(RECORDSHELF_DB_PASSWORD=sup3rsecret $DB bootstrap -U postgres -d t2 -r t2_role 2>&1); code=$?
 expect_eq 0 "$code" "bootstrap with a given password"
 expect_not_in "sup3rsecret" "$out" "a given password is not echoed"
-expect_in "postgres://t2_role:<password>@" "$out" "placeholder in the connection string"
+expect_in "wrote database_url to" "$out" "given password is stored too"
+expect_in "t2_role:sup3rsecret@" "$(cat "$SETTINGS")" "given password in the settings file"
+expect_eq 1 "$(grep -c '^database_url' "$SETTINGS")" "the new url replaces the old one"
 expect_eq "t" "$(sql postgres "select rolpassword is not null from pg_roles where rolname = 't2_role'")" "given password was set"
 
 # --- bad input is rejected before anything is touched ------------------------------
@@ -122,6 +133,53 @@ echo "SELECT 1;" >"$empty/0001_a.sql"; echo "SELECT 2;" >"$empty/0001_b.sql"
 out=$(RECORDSHELF_MIGRATIONS_DIR=$empty $DB migrate -U postgres -d t1 2>&1)
 expect_in "used twice" "$out" "duplicate migration number"
 rm -rf "$empty"
+
+# --- the settings file ------------------------------------------------------------
+printf 'username = "me"\nzoom_factor = 1.5\n' >"$SETTINGS"
+$DB bootstrap -U postgres -d s1 -r s1_role >/dev/null 2>&1
+expect_in 'username = "me"' "$(cat "$SETTINGS")" "other settings are kept"
+expect_in "zoom_factor = 1.5" "$(cat "$SETTINGS")" "other settings are kept (2)"
+expect_in 'database_url = "postgres://s1_role:' "$(cat "$SETTINGS")" "url added to an existing file"
+
+# characters that are special in a URL are encoded
+out=$(RECORDSHELF_DB_PASSWORD='p@ss/w:rd#1 %' $DB bootstrap -U postgres -d s2 -r s2_role 2>&1)
+expect_in "s2_role:p%40ss%2Fw%3Ard%231%20%25@" "$(cat "$SETTINGS")" "password is percent-encoded"
+expect_not_in "p@ss" "$out" "special password is not printed"
+
+# --no-settings leaves the file alone and shows the connection string once
+before=$(sha256sum "$SETTINGS")
+out=$($DB bootstrap -U postgres -d s3 -r s3_role --no-settings 2>&1)
+expect_eq "$before" "$(sha256sum "$SETTINGS")" "--no-settings does not touch the file"
+expect_in "connection string for the settings file" "$out" "--no-settings prints the url"
+expect_in "postgres://s3_role:" "$out" "--no-settings shows the generated password"
+expect_in "keep it" "$out" "--no-settings warns to keep the password"
+
+# --settings chooses another file
+other="$XDG_CONFIG_HOME/other/config.toml"
+$DB bootstrap -U postgres -d s4 -r s4_role --settings "$other" >/dev/null 2>&1
+expect_in 'database_url = "postgres://s4_role:' "$(cat "$other")" "--settings FILE"
+expect_eq "600" "$(stat -c %a "$other")" "created file is private"
+expect_not_in "s4_role" "$(cat "$SETTINGS")" "the default file was not touched"
+
+# a value with quotes or backslashes cannot break the line
+RECORDSHELF_DB_PASSWORD='q"u\ote' $DB bootstrap -U postgres -d s5 -r s5_role --settings "$other" >/dev/null 2>&1
+expect_eq 1 "$(grep -c '^database_url' "$other")" "still one url line"
+expect_in "s5_role:q%22u%5Cote@" "$(cat "$other")" "quote and backslash are encoded"
+
+# dropping removes the matching url, keeps the rest, and mentions a different one
+$DB drop -U postgres -d s1 -r s1_role --confirm s1 --settings "$other" >/dev/null 2>&1
+expect_in "s5_role" "$(cat "$other")" "an url for another database stays"
+out=$($DB drop -U postgres -d s5 -r s5_role --confirm s5 --settings "$other" 2>&1)
+expect_in "removed database_url" "$out" "matching url removed on drop"
+expect_not_in "database_url" "$(cat "$other")" "settings file no longer has the url"
+printf 'username = "me"\ndatabase_url = "postgres://someone:pw@elsewhere/s2"\n' >"$other"
+out=$($DB drop -U postgres -d s2 -r s2_role --confirm s2 --settings "$other" 2>&1)
+expect_in "still points at s2" "$out" "note for an url that does not match the role"
+expect_in "elsewhere/s2" "$(cat "$other")" "non-matching url is kept"
+expect_in 'username = "me"' "$(cat "$other")" "other settings survive a drop"
+out=$($DB drop -U postgres -d s3 -r s3_role --confirm s3 --no-settings --settings "$other" 2>&1)
+expect_in "elsewhere/s2" "$(cat "$other")" "--no-settings leaves the file on drop"
+for d in s1 s2 s3 s4 s5; do $DB drop -U postgres -d $d -r ${d}_role --confirm $d --no-settings >/dev/null 2>&1; done
 
 # --- drop ------------------------------------------------------------------------
 $DB bootstrap -U postgres -d d1 -r d1_role >/dev/null 2>&1

@@ -40,6 +40,12 @@ pub struct Settings {
     pub label_height_mm: f32,
     /// Code on the label: "barcode" (Code 128) or "qr"
     pub label_code: String,
+    /// PostgreSQL connection string of our own database (written by `db/db.sh bootstrap`)
+    pub database_url: String,
+    /// Settings this version does not know (hand written, or from a newer
+    /// version) are kept when saving instead of being dropped.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, toml::Value>,
 }
 
 impl Default for Settings {
@@ -61,6 +67,8 @@ impl Default for Settings {
             label_width_mm: 51.0,
             label_height_mm: 38.0,
             label_code: "barcode".to_string(),
+            database_url: String::new(),
+            extra: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -143,6 +151,7 @@ impl Settings {
             &mut self.device_name,
             &mut self.device_path,
             &mut self.printer_host,
+            &mut self.database_url,
         ] {
             *text = text.trim().to_string();
         }
@@ -373,5 +382,49 @@ mod printer_tests {
             ..Settings::default()
         };
         assert_eq!(tuned.clone().normalized(), tuned);
+    }
+
+    #[test]
+    fn unknown_settings_survive_loading_and_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "username = \"me\"\nfuture_setting = 42\nnotes = \"keep me\"\n",
+        )
+        .unwrap();
+        let mut s = Settings::load(&path).unwrap();
+        assert_eq!(s.username, "me");
+        s.zoom_factor = 1.5;
+        s.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("future_setting = 42"), "{text}");
+        assert!(text.contains("notes = \"keep me\""), "{text}");
+        assert!(text.contains("zoom_factor = 1.5"), "{text}");
+        // and Settings::update_on_disk (used for zoom and folder) keeps them too
+        Settings::save_zoom(&path, 2.0).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("future_setting = 42")
+        );
+    }
+
+    #[test]
+    fn database_url_roundtrips_and_is_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let s = Settings {
+            database_url: "postgres://recordshelf:pw@lightdesk.local/recordshelf".into(),
+            ..Settings::default()
+        };
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap().database_url, s.database_url);
+        let padded = Settings {
+            database_url: "  postgres://x/y \n".into(),
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(padded.database_url, "postgres://x/y");
     }
 }

@@ -13,12 +13,16 @@
 # bootstrap needs a superuser (e.g. -U postgres). It is safe to run again: it
 # only creates what is missing and applies migrations that are still pending.
 # The role is created with a generated password unless RECORDSHELF_DB_PASSWORD
-# is set; a generated password is printed once, at the end.
+# is set. The connection string (database_url) is written into the app's
+# settings file, ~/.config/recordshelf/config.toml, so nothing has to be
+# copied by hand; --settings FILE chooses another file, --no-settings prints
+# the connection string instead (a generated password is shown once, then).
 #
 # drop needs a superuser as well. It shows what will be deleted and asks you
 # to type the database name; --confirm NAME does that without a prompt (for
 # scripts). Everything in the database is lost. The role is dropped too unless
-# --keep-role is given or it owns other databases.
+# --keep-role is given or it owns other databases. A database_url in the
+# settings file that points at the dropped database is removed.
 #
 # Migrations (db/migrations/NNNN_name.sql) are applied in order, each in its
 # own transaction together with its entry in schema_migrations. A migration
@@ -55,6 +59,8 @@ DB_NAME=recordshelf
 ROLE=recordshelf
 CONFIRM=
 KEEP_ROLE=
+NO_SETTINGS=
+SETTINGS_FILE=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -65,10 +71,14 @@ while [ $# -gt 0 ]; do
         -r|--role) ROLE=${2:?missing role name}; shift 2 ;;
         --confirm) CONFIRM=${2:?missing database name}; shift 2 ;;
         --keep-role) KEEP_ROLE=1; shift ;;
+        --settings) SETTINGS_FILE=${2:?missing settings file}; shift 2 ;;
+        --no-settings) NO_SETTINGS=1; shift ;;
         --help) usage 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
+
+SETTINGS_FILE=${SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/recordshelf/config.toml}
 
 # Names end up in SQL, so keep them boring.
 name_ok() { [[ $1 =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; }
@@ -102,6 +112,60 @@ check_connection() {
         exit 1
     }
     rm -f "${TMPDIR:-/tmp}/rsdb.$$"
+}
+
+# --- settings file -------------------------------------------------------
+# The app's settings file is flat `key = "value"` TOML, so single lines can
+# be set and removed here without a TOML parser.
+
+urlencode() {
+    local LC_ALL=C
+    local text=$1 out= char i
+    for ((i = 0; i < ${#text}; i++)); do
+        char=${text:i:1}
+        case $char in
+            [a-zA-Z0-9.~_-]) out+=$char ;;
+            *) out+=$(printf '%%%02X' "'$char") ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# settings_set KEY VALUE: replaces the line of KEY or appends one. The file
+# is created readable by the owner only (it holds credentials).
+settings_set() {
+    local key=$1 value=$2 file=$SETTINGS_FILE escaped line tmp
+    escaped=$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    line="$key = \"$escaped\""
+    mkdir -p "$(dirname "$file")"
+    tmp=$(umask 077 && mktemp "$file.XXXXXX")
+    if [ -f "$file" ]; then
+        LINE=$line KEY=$key awk '
+            BEGIN { done = 0; key = ENVIRON["KEY"]; line = ENVIRON["LINE"] }
+            $0 ~ "^" key "[ \t]*=" { if (!done) print line; done = 1; next }
+            { print }
+            END { if (!done) print line }
+        ' "$file" >"$tmp"
+    else
+        printf '%s\n' "$line" >"$tmp"
+    fi
+    chmod 600 "$tmp"
+    mv "$tmp" "$file"
+}
+
+# settings_get KEY: the string value of KEY, if set.
+settings_get() {
+    [ -f "$SETTINGS_FILE" ] || return 0
+    sed -n "s/^$1[[:space:]]*=[[:space:]]*\"\(.*\)\"[[:space:]]*\$/\1/p" "$SETTINGS_FILE" | head -n 1
+}
+
+# settings_remove KEY: deletes the line of KEY.
+settings_remove() {
+    local tmp
+    tmp=$(umask 077 && mktemp "$SETTINGS_FILE.XXXXXX")
+    grep -v "^$1[[:space:]]*=" "$SETTINGS_FILE" >"$tmp" || true
+    chmod 600 "$tmp"
+    mv "$tmp" "$SETTINGS_FILE"
 }
 
 # --- migrations ----------------------------------------------------------
@@ -193,7 +257,7 @@ cmd_bootstrap() {
     superuser=$(query postgres -c "select rolsuper from pg_roles where rolname = current_user")
     [ "$superuser" = "t" ] || die "bootstrap needs a superuser (-U postgres); ${USER_NAME:-the current user} is not one"
 
-    local generated=
+    local generated= created=
     local password=${RECORDSHELF_DB_PASSWORD:-}
     local role_exists
     role_exists=$(query postgres -c "select 1 from pg_roles where rolname = '$ROLE'")
@@ -208,6 +272,7 @@ cmd_bootstrap() {
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'role', :'pw') \gexec
 SQL
         echo "created role $ROLE"
+        created=1
     else
         echo "role $ROLE exists (password left unchanged)"
     fi
@@ -226,12 +291,26 @@ SQL
     PGOPTIONS="-c role=$ROLE ${PGOPTIONS:-}" migrate_as_role
 
     echo
-    echo "connection string for the settings file (database_url):"
-    if [ -n "$generated" ]; then
-        echo "  postgres://$ROLE:$password@${HOST:-localhost}${PORT:+:$PORT}/$DB_NAME"
-        echo "the password was generated just now and is not stored anywhere else; keep it."
+    local host_part="${HOST:-localhost}${PORT:+:$PORT}"
+    if [ -z "$created" ]; then
+        echo "the role already existed, so its password is not known here."
+        echo "put the connection string into the settings file yourself (database_url):"
+        echo "  postgres://$ROLE:<password>@$host_part/$DB_NAME"
+    elif [ -n "$NO_SETTINGS" ]; then
+        echo "connection string for the settings file (database_url):"
+        if [ -n "$generated" ]; then
+            echo "  postgres://$ROLE:$(urlencode "$password")@$host_part/$DB_NAME"
+            echo "the password was generated just now and is not stored anywhere else; keep it."
+        else
+            echo "  postgres://$ROLE:<password>@$host_part/$DB_NAME"
+        fi
     else
-        echo "  postgres://$ROLE:<password>@${HOST:-localhost}${PORT:+:$PORT}/$DB_NAME"
+        settings_set database_url "postgres://$ROLE:$(urlencode "$password")@$host_part/$DB_NAME"
+        echo "wrote database_url to $SETTINGS_FILE"
+        echo "  postgres://$ROLE:<password>@$host_part/$DB_NAME"
+        if [ -n "$generated" ]; then
+            echo "the password was generated just now; it is only stored in that file."
+        fi
     fi
 }
 
@@ -297,6 +376,21 @@ cmd_drop() {
         echo "dropped role $ROLE"
     elif [ -n "$role_exists" ]; then
         echo "kept role $ROLE"
+    fi
+
+    # a connection string for the database that no longer exists is useless
+    if [ -z "$NO_SETTINGS" ]; then
+        local url
+        url=$(settings_get database_url)
+        case "$url" in
+            postgres://"$ROLE":*/"$DB_NAME"|postgres://"$ROLE":*/"$DB_NAME"\?*)
+                settings_remove database_url
+                echo "removed database_url from $SETTINGS_FILE"
+                ;;
+            *"/$DB_NAME"|*"/$DB_NAME?"*)
+                echo "note: database_url in $SETTINGS_FILE still points at $DB_NAME"
+                ;;
+        esac
     fi
 }
 

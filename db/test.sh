@@ -9,6 +9,8 @@ cd "$(dirname "$0")"
 dir=$(mktemp -d)
 export PGPORT=${PGTESTPORT:-54329}
 export PGHOST=$dir
+# the tooling writes the connection string to the settings file: keep it away from the real one
+export XDG_CONFIG_HOME=$dir/config
 trap 'pg_ctl -D "$dir/data" -m immediate stop >/dev/null 2>&1 || true; rm -rf "$dir"' EXIT
 
 initdb -D "$dir/data" -U postgres --auth=trust >/dev/null
