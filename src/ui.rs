@@ -551,7 +551,7 @@ impl RecordShelfApp {
                                 }
                             }
                             None => {
-                                ui.allocate_space(egui::vec2(THUMB_SIZE, THUMB_SIZE));
+                                draw_placeholder(ui, THUMB_SIZE);
                             }
                         }
                         if ui
@@ -841,7 +841,8 @@ fn start_scanner(
     (stop, rx, status)
 }
 
-/// Draws a downloaded picture (or an empty placeholder of the same size).
+/// Draws a downloaded picture, or a placeholder box, always occupying exactly
+/// `size` x `size` so that rows and layouts do not shift.
 /// Returns whether the URL is already known, i.e. needs no fetch.
 fn draw_image(
     ui: &mut egui::Ui,
@@ -851,22 +852,41 @@ fn draw_image(
 ) -> bool {
     match images.get(url) {
         Some(ImageState::Ready(bytes)) => {
-            ui.add(
+            let rect = placeholder_rect(ui, size);
+            ui.put(
+                rect,
                 egui::Image::from_bytes(format!("bytes://{url}"), bytes.clone())
-                    .max_size(egui::vec2(size, size))
+                    .fit_to_exact_size(rect.size())
                     .rounding(3.0),
             );
             true
         }
         Some(_) => {
-            ui.allocate_space(egui::vec2(size, size));
+            draw_placeholder(ui, size);
             true
         }
         None => {
-            ui.allocate_space(egui::vec2(size, size));
+            draw_placeholder(ui, size);
             false
         }
     }
+}
+
+fn placeholder_rect(ui: &mut egui::Ui, size: f32) -> egui::Rect {
+    ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover())
+        .0
+}
+
+/// Empty box shown while a picture is loading or when there is none.
+fn draw_placeholder(ui: &mut egui::Ui, size: f32) {
+    let rect = placeholder_rect(ui, size);
+    ui.painter()
+        .rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
 }
 
 fn non_empty(s: &str) -> Option<String> {
