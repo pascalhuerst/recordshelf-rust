@@ -136,11 +136,11 @@ impl RecordShelfApp {
     /// Persists the edited settings and applies them without a restart.
     fn save_settings(&mut self) {
         let draft = self.settings_draft.clone();
-        if let Some(path) = &self.config_path {
-            if let Err(err) = draft.save(path) {
-                self.set_error(format!("{err:#}"));
-                return;
-            }
+        if let Some(path) = &self.config_path
+            && let Err(err) = draft.save(path)
+        {
+            self.set_error(format!("{err:#}"));
+            return;
         }
         self.settings = draft;
         self.scanner_stop.store(true, Ordering::SeqCst);
@@ -717,108 +717,108 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
     if let Some(title) = &release.title {
         ui.label(RichText::new(format!("Title: {title}")).strong());
     }
-    if let Some(artists) = &release.artists {
-        if !artists.is_empty() {
-            let names = artists
-                .iter()
-                .filter_map(|a| a.name.as_deref())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if !names.is_empty() {
-                ui.label(RichText::new(format!("Artist: {names}")).strong());
-            }
+    if let Some(artists) = &release.artists
+        && !artists.is_empty()
+    {
+        let names = artists
+            .iter()
+            .filter_map(|a| a.name.as_deref())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !names.is_empty() {
+            ui.label(RichText::new(format!("Artist: {names}")).strong());
         }
     }
-    if let Some(labels) = &release.labels {
-        if !labels.is_empty() {
-            let labels_str = labels
-                .iter()
-                .map(|l| {
-                    let name = l.name.as_deref().unwrap_or("");
-                    let catno = l.catno.as_deref().unwrap_or("");
-                    if catno.is_empty() {
-                        name.to_string()
-                    } else {
-                        format!("{name} ({catno})")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            if !labels_str.is_empty() {
-                ui.label(RichText::new(format!("Label: {labels_str}")).strong());
-            }
+    if let Some(labels) = &release.labels
+        && !labels.is_empty()
+    {
+        let labels_str = labels
+            .iter()
+            .map(|l| {
+                let name = l.name.as_deref().unwrap_or("");
+                let catno = l.catno.as_deref().unwrap_or("");
+                if catno.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} ({catno})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !labels_str.is_empty() {
+            ui.label(RichText::new(format!("Label: {labels_str}")).strong());
         }
     }
-    if let Some(year) = release.year {
-        if year > 0 {
-            ui.label(RichText::new(format!("Year: {year}")).strong());
-        }
+    if let Some(year) = release.year
+        && year > 0
+    {
+        ui.label(RichText::new(format!("Year: {year}")).strong());
     }
 
     ui.add_space(8.0);
 
     // Secondary info
-    if let Some(country) = &release.country {
-        if !country.is_empty() {
-            ui.label(RichText::new(format!("Country: {country}")).small());
-        }
+    if let Some(country) = &release.country
+        && !country.is_empty()
+    {
+        ui.label(RichText::new(format!("Country: {country}")).small());
     }
-    if let Some(formats) = &release.formats {
-        if !formats.is_empty() {
-            let formats_str = formats
-                .iter()
-                .map(|f| {
-                    let name = f.name.as_deref().unwrap_or("").to_string();
-                    match f.descriptions.as_ref() {
-                        Some(descs) if !descs.is_empty() => {
-                            format!("{name} ({})", descs.join(", "))
-                        }
-                        _ => name,
+    if let Some(formats) = &release.formats
+        && !formats.is_empty()
+    {
+        let formats_str = formats
+            .iter()
+            .map(|f| {
+                let name = f.name.as_deref().unwrap_or("").to_string();
+                match f.descriptions.as_ref() {
+                    Some(descs) if !descs.is_empty() => {
+                        format!("{name} ({})", descs.join(", "))
                     }
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            if !formats_str.is_empty() {
-                ui.label(RichText::new(format!("Format: {formats_str}")).small());
-            }
+                    _ => name,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !formats_str.is_empty() {
+            ui.label(RichText::new(format!("Format: {formats_str}")).small());
         }
     }
-    if let Some(genres) = &release.genres {
-        if !genres.is_empty() {
-            ui.label(RichText::new(format!("Genres: {}", genres.join(", "))).small());
-        }
+    if let Some(genres) = &release.genres
+        && !genres.is_empty()
+    {
+        ui.label(RichText::new(format!("Genres: {}", genres.join(", "))).small());
     }
-    if let Some(styles) = &release.styles {
-        if !styles.is_empty() {
-            ui.label(RichText::new(format!("Styles: {}", styles.join(", "))).small());
-        }
+    if let Some(styles) = &release.styles
+        && !styles.is_empty()
+    {
+        ui.label(RichText::new(format!("Styles: {}", styles.join(", "))).small());
     }
 
     ui.add_space(8.0);
 
     // Tracklist
-    if let Some(tracks) = &release.tracklist {
-        if !tracks.is_empty() {
-            ui.label(RichText::new("Tracklist:").strong());
-            for track in tracks {
-                let mut title = track.title.clone().unwrap_or_default();
-                if let Some(duration) = &track.duration {
-                    if !duration.is_empty() {
-                        title.push_str(&format!(" [{duration}]"));
-                    }
-                }
-                let pos = track.position.as_deref().unwrap_or("");
-                ui.label(RichText::new(format!("  {pos} {title}")).small());
+    if let Some(tracks) = &release.tracklist
+        && !tracks.is_empty()
+    {
+        ui.label(RichText::new("Tracklist:").strong());
+        for track in tracks {
+            let mut title = track.title.clone().unwrap_or_default();
+            if let Some(duration) = &track.duration
+                && !duration.is_empty()
+            {
+                title.push_str(&format!(" [{duration}]"));
             }
+            let pos = track.position.as_deref().unwrap_or("");
+            ui.label(RichText::new(format!("  {pos} {title}")).small());
         }
     }
 
     ui.add_space(8.0);
 
-    if let Some(uri) = &release.uri {
-        if !uri.is_empty() {
-            ui.hyperlink(uri);
-        }
+    if let Some(uri) = &release.uri
+        && !uri.is_empty()
+    {
+        ui.hyperlink(uri);
     }
 }
 

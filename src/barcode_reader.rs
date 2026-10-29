@@ -57,13 +57,12 @@ pub fn list_devices() -> Vec<InputDevice> {
 /// (case-insensitive), otherwise `fallback_path` if set.
 pub fn pick_device(devices: &[InputDevice], name: &str, fallback_path: &str) -> Option<PathBuf> {
     let name = name.trim().to_lowercase();
-    if !name.is_empty() {
-        if let Some(dev) = devices
+    if !name.is_empty()
+        && let Some(dev) = devices
             .iter()
             .find(|d| d.name.to_lowercase().contains(&name))
-        {
-            return Some(dev.path.clone());
-        }
+    {
+        return Some(dev.path.clone());
     }
     let fallback = fallback_path.trim();
     (!fallback.is_empty()).then(|| PathBuf::from(fallback))

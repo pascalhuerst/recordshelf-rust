@@ -191,31 +191,31 @@ impl SearchItem {
     }
 
     pub fn artist_display(&self) -> String {
-        if let Some(a) = &self.artist {
-            if !a.is_empty() {
-                return a.clone();
-            }
+        if let Some(a) = &self.artist
+            && !a.is_empty()
+        {
+            return a.clone();
         }
         // Fallback: derive from title "Artist - Title"
-        if let Some(t) = &self.title {
-            if let Some((artist, _)) = t.split_once(" - ") {
-                return artist.trim().to_string();
-            }
+        if let Some(t) = &self.title
+            && let Some((artist, _)) = t.split_once(" - ")
+        {
+            return artist.trim().to_string();
         }
         String::new()
     }
 
     pub fn label_display(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(labels) = &self.label {
-            if !labels.is_empty() {
-                parts.push(labels.join(", "));
-            }
+        if let Some(labels) = &self.label
+            && !labels.is_empty()
+        {
+            parts.push(labels.join(", "));
         }
-        if let Some(cat) = &self.catno {
-            if !cat.is_empty() {
-                parts.push(format!("({})", cat));
-            }
+        if let Some(cat) = &self.catno
+            && !cat.is_empty()
+        {
+            parts.push(format!("({})", cat));
         }
         parts.join(" ").trim().to_string()
     }
