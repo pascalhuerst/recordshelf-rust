@@ -1252,18 +1252,15 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
-/// Shows whether (and where) a release is already in the collection.
-fn render_ownership(
-    ui: &mut egui::Ui,
+/// Text for the collection status of a release: "Nx in your collection: folders"
+/// or "Not in your collection". `None` while the status is unknown.
+fn ownership_text(
     owned: Option<&[CollectionInstance]>,
     folders: &[CollectionFolder],
-) {
-    match owned {
-        None => {}
-        Some([]) => {
-            ui.colored_label(Color32::GRAY, "Not in your collection");
-        }
-        Some(instances) => {
+) -> Option<(String, bool)> {
+    match owned? {
+        [] => Some(("Not in your collection".to_string(), false)),
+        instances => {
             let names: Vec<String> = instances
                 .iter()
                 .map(|inst| {
@@ -1273,15 +1270,32 @@ fn render_ownership(
                         .map_or_else(|| format!("#{}", inst.folder_id), |f| f.name.clone())
                 })
                 .collect();
-            ui.colored_label(
-                Color32::YELLOW,
+            Some((
                 format!(
-                    "\u{26A0} Already in your collection ({}x): {}",
+                    "{}x in your collection: {}",
                     instances.len(),
                     names.join(", ")
                 ),
-            );
+                true,
+            ))
         }
+    }
+}
+
+/// Shows whether (and where) a release is already in the collection:
+/// yellow when owned, blue when not.
+fn render_ownership(
+    ui: &mut egui::Ui,
+    owned: Option<&[CollectionInstance]>,
+    folders: &[CollectionFolder],
+) {
+    if let Some((text, is_owned)) = ownership_text(owned, folders) {
+        let color = if is_owned {
+            Color32::YELLOW
+        } else {
+            Color32::LIGHT_BLUE
+        };
+        ui.colored_label(color, text);
     }
     ui.add_space(4.0);
 }
@@ -1727,6 +1741,27 @@ mod tests {
             app.worker.pending(),
             before + 2,
             "ownership check and folder reload"
+        );
+    }
+
+    #[test]
+    fn ownership_text_counts_copies() {
+        let folders = vec![folder(1, "Uncategorized"), folder(5, "Techno")];
+        assert_eq!(ownership_text(None, &folders), None);
+        assert_eq!(
+            ownership_text(Some(&[]), &folders),
+            Some(("Not in your collection".to_string(), false))
+        );
+        assert_eq!(
+            ownership_text(Some(&[copy(10, 5)]), &folders),
+            Some(("1x in your collection: Techno".to_string(), true))
+        );
+        assert_eq!(
+            ownership_text(Some(&[copy(10, 5), copy(11, 1), copy(12, 9)]), &folders),
+            Some((
+                "3x in your collection: Techno, Uncategorized, #9".to_string(),
+                true
+            ))
         );
     }
 }
