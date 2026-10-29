@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod barcode_reader;
 mod config;
+mod controls;
 mod decks;
 mod decks_bridge;
 mod discogs;

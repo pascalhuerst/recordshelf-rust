@@ -36,6 +36,11 @@ pub enum Request {
         release_id: u32,
         folder_id: u32,
     },
+    RemoveFromCollection {
+        release_id: u32,
+        folder_id: u32,
+        instance_id: u32,
+    },
 }
 
 pub enum Response {
@@ -66,6 +71,10 @@ pub enum Response {
     Added {
         release_id: u32,
         folder_id: u32,
+        result: Result<(), String>,
+    },
+    Removed {
+        release_id: u32,
         result: Result<(), String>,
     },
 }
@@ -226,6 +235,20 @@ impl State {
                     result,
                 }
             }
+            Request::RemoveFromCollection {
+                release_id,
+                folder_id,
+                instance_id,
+            } => Response::Removed {
+                release_id,
+                result: self
+                    .username()
+                    .and_then(|u| {
+                        self.client()?
+                            .remove_from_collection(u, folder_id, release_id, instance_id)
+                    })
+                    .map_err(|e| format!("{e:#}")),
+            },
             Request::AddToCollection {
                 release_id,
                 folder_id,

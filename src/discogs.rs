@@ -73,6 +73,27 @@ impl DiscogsClient {
         Ok(())
     }
 
+    /// Removes one copy (`instance_id`) of a release from a folder.
+    pub fn remove_from_collection(
+        &self,
+        username: &str,
+        folder_id: u32,
+        release_id: u32,
+        instance_id: u32,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/users/{}/collection/folders/{}/releases/{}/instances/{}",
+            self.base, username, folder_id, release_id, instance_id
+        );
+        self.http
+            .delete(url)
+            .send()
+            .context("send remove-from-collection request")?
+            .error_for_status()
+            .context("Discogs collection error response")?;
+        Ok(())
+    }
+
     pub fn collection_folders(&self, username: &str) -> Result<Vec<CollectionFolder>> {
         let url = format!("{}/users/{}/collection/folders", self.base, username);
         let resp: CollectionFoldersResponse = self.get(&url, &[], "collection folders")?;
@@ -685,5 +706,28 @@ mod tests {
         assert_eq!(it.id, Some(5));
         assert_eq!(it.title_display(), "");
         assert_eq!(it.label_display(), "");
+    }
+
+    #[test]
+    fn remove_from_collection_deletes_the_instance() {
+        let (base, server) = serve_once("204 No Content", "");
+        client(&base)
+            .remove_from_collection("me", 3, 99, 1234)
+            .unwrap();
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("DELETE /users/me/collection/folders/3/releases/99/instances/1234 "),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn remove_from_collection_reports_http_errors() {
+        let (base, _server) = serve_once("404 Not Found", r#"{"message": "nope"}"#);
+        assert!(
+            client(&base)
+                .remove_from_collection("me", 3, 99, 1)
+                .is_err()
+        );
     }
 }

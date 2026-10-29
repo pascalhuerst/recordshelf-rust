@@ -24,6 +24,8 @@ pub struct Settings {
     pub device_path: String,
     /// UI zoom (Ctrl +/- in the window); remembered between runs
     pub zoom_factor: f32,
+    /// Discogs collection folder that new releases are added to (0 = not chosen yet)
+    pub folder_id: u32,
 }
 
 impl Default for Settings {
@@ -36,6 +38,7 @@ impl Default for Settings {
             device_name: String::new(),
             device_path: String::new(),
             zoom_factor: 1.0,
+            folder_id: 0,
         }
     }
 }
@@ -54,12 +57,16 @@ impl Settings {
         }
     }
 
-    /// Stores only the zoom in the settings file, leaving everything else as
-    /// it is on disk (so command line overrides are not persisted).
-    pub fn save_zoom(path: &Path, zoom: f32) -> Result<()> {
+    /// Changes some settings in the file on disk, leaving everything else as
+    /// it is there (so command line overrides are not persisted).
+    pub fn update_on_disk(path: &Path, change: impl FnOnce(&mut Self)) -> Result<()> {
         let mut on_disk = Self::load(path)?;
-        on_disk.zoom_factor = zoom;
+        change(&mut on_disk);
         on_disk.save(path)
+    }
+
+    pub fn save_zoom(path: &Path, zoom: f32) -> Result<()> {
+        Self::update_on_disk(path, |s| s.zoom_factor = zoom)
     }
 
     /// Default location: `$XDG_CONFIG_HOME/recordshelf/config.toml`.
@@ -201,5 +208,22 @@ mod tests {
         let path = dir.path().join("sub").join("config.toml");
         Settings::save_zoom(&path, 2.0).unwrap();
         assert_eq!(Settings::load(&path).unwrap().zoom_factor, 2.0);
+    }
+
+    #[test]
+    fn update_on_disk_changes_only_what_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings {
+            username: "me".into(),
+            ..Settings::default()
+        }
+        .save(&path)
+        .unwrap();
+        Settings::update_on_disk(&path, |s| s.folder_id = 7).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.folder_id, 7);
+        assert_eq!(loaded.username, "me");
+        assert_eq!(loaded.zoom_factor, 1.0);
     }
 }

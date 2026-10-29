@@ -20,7 +20,7 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 - `worker.rs` – single background thread owning the Discogs client. UI sends `Request`s, polls `Response`s (one response per request, FIFO; `Configure` has none). `pending()` drives the status-bar spinner. `ScanCode::classify`: 12–14 digits = UPC/EAN barcode (searched via `barcode=` param), shorter numbers = release id. A scan fills the results list (all pressings for a barcode, one row for a release id) and loads the first.
 - `discogs.rs` – blocking `reqwest` client + serde models. Search items use lenient deserializers (Discogs returns mixed types). Collection instances come from `GET /users/{u}/collection/releases/{id}` (`releases[]` with `instance_id`, `folder_id`).
 - Cover pictures: scans and searches share one results list; rows show `thumb`, details show the release `images` primary cover. Fetched lazily (only visible rows) by a separate image thread in `worker.rs` (not counted in `pending()`), only from discogs.com hosts, cached by URL in `ui.rs`, drawn via egui_extras image loaders.
-- `ui.rs` – `RecordShelfApp`: single main view (search fields, results list, release details; keys: Up/Down, Enter load, `A` folder picker / confirm, Esc), folder picker window, Settings window, bottom status bar. Never do network I/O on the UI thread; send a `Request`.
+- `ui.rs` – `RecordShelfApp`: single main view (search fields, results list, release details; keys: Up/Down browse, `A` add to the current folder, `R` remove, `O` open in browser, `F` change folder, Enter reload, Esc new search; the same commands are buttons showing their keys; logic in `controls.rs`), folder picker window, Settings window, bottom status bar. Never do network I/O on the UI thread; send a `Request`.
 
 - `decks.rs`, `decks_bridge.rs` – decks.de catalog-number lookup via a browser userscript (`--decks-bridge`); see `decks.md`. Personal tool, never to be published.
 
@@ -28,6 +28,7 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 - All Discogs searches are restricted to `format=Vinyl` (only vinyl is of interest); this is applied in `SearchQuery::params`.
 - Errors: `anyhow` with `.context(...)`; worker turns them into `String`s for the UI; the UI shows them as a `Notice` in the status bar.
 - Browsing results shows details without Enter: the first `PREFETCH_LIMIT` (5) results are prefetched (release + collection status), later ones load when the selection rests for 250 ms. Releases are cached in `releases`/`requested`; Enter forces a reload. Keep this in mind for the 60 req/min Discogs limit.
+- Add/remove are optimistic (`PENDING_INSTANCE` placeholder, instance removed locally) and always followed by `resync_collection`. Adding a release that is already owned, and every removal, asks for confirmation (Enter/Y yes, Esc/N no). The target folder (never "All", id 0) is stored as `folder_id` in the settings file.
 - Owned releases are flagged (ownership cache `HashMap<release_id, Vec<CollectionInstance>>`); adding a duplicate copy is always allowed.
 - Tests live in `#[cfg(test)]` modules next to the code; Discogs HTTP is tested against a local one-shot `TcpListener` server (`DiscogsClient.base` is overridable in-crate).
 - Keep clippy and fmt clean; commit only when asked.

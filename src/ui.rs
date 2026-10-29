@@ -11,6 +11,7 @@ use std::{
 
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
 use crate::config::Settings;
+use crate::controls::{self, AddDecision, Command, PENDING_INSTANCE, RemoveDecision};
 use crate::decks;
 use crate::decks_bridge::{self, Bridge, DecksPage};
 use crate::discogs::{
@@ -35,6 +36,22 @@ const SELECTION_DEBOUNCE: Duration = Duration::from_millis(250);
 const THUMB_SIZE: f32 = 56.0;
 const COVER_SIZE: f32 = 220.0;
 
+/// A destructive or unusual action waiting for Enter (yes) or Esc (no).
+enum Confirm {
+    AddDuplicate {
+        release_id: u32,
+        folder_id: u32,
+        title: String,
+        copies: usize,
+    },
+    Remove {
+        release_id: u32,
+        instance: CollectionInstance,
+        title: String,
+        folder_name: String,
+    },
+}
+
 /// The decks.de bridge: localhost server plus the channel for its results.
 struct DecksState {
     bridge: Bridge,
@@ -58,7 +75,11 @@ pub struct RecordShelfApp {
     notice: Option<Notice>,
     folders: Vec<CollectionFolder>,
     folder_picker_open: bool,
+    /// Highlighted entry while the folder picker is open.
+    picker_cursor: Option<usize>,
+    /// Folder that releases are added to.
     folder_selected: Option<usize>,
+    confirm: Option<Confirm>,
     /// Known copies in the collection per release id (empty = checked, not owned).
     ownership: HashMap<u32, Vec<CollectionInstance>>,
     search_focus: bool,
@@ -104,7 +125,9 @@ impl RecordShelfApp {
             notice: None,
             folders: Vec::new(),
             folder_picker_open: false,
+            picker_cursor: None,
             folder_selected: None,
+            confirm: None,
             ownership: HashMap::new(),
             search_focus: false,
             search_q: String::new(),
@@ -232,6 +255,7 @@ impl RecordShelfApp {
         }
         self.notice = None;
         self.folder_picker_open = false;
+        self.confirm = None;
         self.search_results = items;
         self.selected_result = Some(0);
         self.prefetch_results();
@@ -315,6 +339,7 @@ impl RecordShelfApp {
         let mut draft = self.settings_draft.clone();
         // Zoom changes live (Ctrl +/-); do not let a stale copy in the draft undo it.
         draft.zoom_factor = self.settings.zoom_factor;
+        draft.folder_id = self.settings.folder_id;
         if let Some(path) = &self.config_path
             && let Err(err) = draft.save(path)
         {
@@ -508,12 +533,19 @@ impl RecordShelfApp {
                 };
                 self.images.insert(url, state);
             }
-            Response::Folders(Ok(folders)) => {
+            Response::Folders(Ok(mut folders)) => {
+                // Folder 0 ("All") is a view; releases cannot be added to it.
+                folders.retain(|f| f.id != 0);
                 self.folders = folders;
-                self.folder_selected = match self.folder_selected {
+                let wanted = self
+                    .folders
+                    .iter()
+                    .position(|f| f.id == self.settings.folder_id);
+                self.folder_selected = match (wanted, self.folder_selected) {
                     _ if self.folders.is_empty() => None,
-                    Some(i) => Some(i.min(self.folders.len() - 1)),
-                    None => Some(0),
+                    (Some(i), _) => Some(i),
+                    (None, Some(i)) => Some(i.min(self.folders.len() - 1)),
+                    (None, None) => Some(0),
                 };
             }
             Response::Folders(Err(err)) => self.set_error(err),
@@ -527,21 +559,37 @@ impl RecordShelfApp {
                 release_id,
                 folder_id,
                 result,
-            } => match result {
-                Ok(()) => {
-                    let folder = self
-                        .folders
-                        .iter()
-                        .find(|f| f.id == folder_id)
-                        .map_or_else(|| format!("#{folder_id}"), |f| f.name.clone());
-                    self.set_info(format!("Added release {release_id} to folder {folder}"));
-                    // Refresh what we know: new copy count and folder item counts.
-                    self.worker.send(Request::CheckOwnership(release_id));
-                    self.worker.send(Request::LoadFolders);
+            } => {
+                match result {
+                    Ok(()) => {
+                        let folder = self
+                            .folders
+                            .iter()
+                            .find(|f| f.id == folder_id)
+                            .map_or_else(|| format!("#{folder_id}"), |f| f.name.clone());
+                        self.set_info(format!("Added release {release_id} to {folder}"));
+                    }
+                    Err(err) => self.set_error(err),
                 }
-                Err(err) => self.set_error(err),
-            },
+                self.resync_collection(release_id);
+            }
+            Response::Removed { release_id, result } => {
+                match result {
+                    Ok(()) => {
+                        self.set_info(format!("Removed release {release_id} from your collection"))
+                    }
+                    Err(err) => self.set_error(err),
+                }
+                self.resync_collection(release_id);
+            }
         }
+    }
+
+    /// Reloads what we know about a release's copies and the folder counts,
+    /// replacing any optimistic guess made when the command was issued.
+    fn resync_collection(&mut self, release_id: u32) {
+        self.worker.send(Request::CheckOwnership(release_id));
+        self.worker.send(Request::LoadFolders);
     }
 
     fn ui_main(&mut self, ui: &mut egui::Ui) {
@@ -649,7 +697,12 @@ impl RecordShelfApp {
         if self.folder_picker_open {
             self.show_folder_picker(ui.ctx());
         }
+        self.show_confirm(ui.ctx());
 
+        ui.separator();
+        if let Some(cmd) = self.command_bar(ui) {
+            self.run_command(cmd);
+        }
         ui.separator();
 
         let cover = self
@@ -687,76 +740,298 @@ impl RecordShelfApp {
     }
 
     fn handle_search_keys(&mut self, ctx: &egui::Context) {
-        let pressed = |key| ctx.input(|i| i.key_pressed(key));
+        let pressed = |key| ctx.input(|i| i.key_pressed(key) && !i.modifiers.command);
         let (up, down) = (pressed(egui::Key::ArrowUp), pressed(egui::Key::ArrowDown));
         let (enter, esc) = (pressed(egui::Key::Enter), pressed(egui::Key::Escape));
 
-        if pressed(egui::Key::A) {
-            if self.folder_picker_open {
-                self.add_selected_to_collection();
-            } else {
-                self.open_folder_picker();
+        if self.confirm.is_some() {
+            if enter || pressed(egui::Key::Y) {
+                self.accept_confirm();
+            } else if esc || pressed(egui::Key::N) {
+                self.confirm = None;
             }
             return;
         }
 
         if self.folder_picker_open {
-            step(&mut self.folder_selected, self.folders.len(), up, down);
-            if enter {
-                self.add_selected_to_collection();
+            step(&mut self.picker_cursor, self.folders.len(), up, down);
+            if enter && let Some(idx) = self.picker_cursor {
+                self.choose_folder(idx);
             }
             if esc {
                 self.folder_picker_open = false;
             }
-        } else {
-            step(
-                &mut self.selected_result,
-                self.search_results.len(),
-                up,
-                down,
-            );
-            if enter {
-                self.reload_selected_release();
-            }
-            if esc {
-                self.selected_result = None;
-                self.search_focus = true;
-            }
+            return;
+        }
+
+        if let Some(cmd) = Command::ALL.into_iter().find(|c| pressed(c.key())) {
+            self.run_command(cmd);
+            return;
+        }
+        step(
+            &mut self.selected_result,
+            self.search_results.len(),
+            up,
+            down,
+        );
+        if enter {
+            self.reload_selected_release();
+        }
+        if esc {
+            self.selected_result = None;
+            self.search_focus = true;
         }
     }
 
     fn show_folder_picker(&mut self, ctx: &egui::Context) {
         let mut open = true;
-        egui::Window::new("Add to folder")
+        let mut chosen = None;
+        egui::Window::new("Choose folder")
             .open(&mut open)
             .collapsible(false)
             .show(ctx, |ui| {
-                let owned = self.selected_id().and_then(|id| self.ownership.get(&id));
-                if let Some(owned) = owned.filter(|o| !o.is_empty()) {
-                    ui.colored_label(
-                        Color32::YELLOW,
-                        format!(
-                            "Already in your collection ({}x). You can still add another copy.",
-                            owned.len()
-                        ),
-                    );
-                }
                 if self.folders.is_empty() {
                     ui.label("Loading folders...");
                 }
                 for (idx, folder) in self.folders.iter().enumerate() {
                     let label = format!("{} ({} items)", folder.name, folder.count);
                     if ui
-                        .selectable_label(self.folder_selected == Some(idx), label)
+                        .selectable_label(self.picker_cursor == Some(idx), label)
                         .clicked()
                     {
-                        self.folder_selected = Some(idx);
+                        chosen = Some(idx);
                     }
                 }
                 ui.add_space(4.0);
-                ui.label(RichText::new("Up/Down: select  Enter or A: add  Esc: cancel").small());
+                ui.label(
+                    RichText::new("Up/Down: select   Enter: use this folder   Esc: cancel").small(),
+                );
             });
-        self.folder_picker_open = open;
+        if let Some(idx) = chosen {
+            self.choose_folder(idx);
+        } else {
+            self.folder_picker_open = open;
+        }
+    }
+
+    fn show_confirm(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = &self.confirm else {
+            return;
+        };
+        let text = match confirm {
+            Confirm::AddDuplicate { title, copies, .. } => {
+                format!("You already own {copies}x \"{title}\".\nAdd another copy?")
+            }
+            Confirm::Remove {
+                title, folder_name, ..
+            } => format!("Remove one copy of \"{title}\"\nfrom folder {folder_name}?"),
+        };
+        let (mut yes, mut no) = (false, false);
+        egui::Window::new("Confirm")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(text);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    yes = ui.button("Yes  [Enter]").clicked();
+                    no = ui.button("No  [Esc]").clicked();
+                });
+            });
+        if yes {
+            self.accept_confirm();
+        } else if no {
+            self.confirm = None;
+        }
+    }
+
+    fn accept_confirm(&mut self) {
+        match self.confirm.take() {
+            Some(Confirm::AddDuplicate {
+                release_id,
+                folder_id,
+                ..
+            }) => self.send_add(release_id, folder_id),
+            Some(Confirm::Remove {
+                release_id,
+                instance,
+                ..
+            }) => {
+                // Optimistic: forget the copy now; the resync after the request corrects it.
+                if let Some(copies) = self.ownership.get_mut(&release_id) {
+                    copies.retain(|c| c.instance_id != instance.instance_id);
+                }
+                self.worker.send(Request::RemoveFromCollection {
+                    release_id,
+                    folder_id: instance.folder_id,
+                    instance_id: instance.instance_id,
+                });
+                self.set_info("Removing...".to_string());
+            }
+            None => {}
+        }
+    }
+
+    fn run_command(&mut self, cmd: Command) {
+        if cmd == Command::ChooseFolder {
+            self.open_folder_picker();
+            return;
+        }
+        let Some(id) = self.selected_id() else {
+            self.set_error("Select a release first".to_string());
+            return;
+        };
+        match cmd {
+            Command::Add => self.add_release(id),
+            Command::Remove => self.remove_release(id),
+            Command::Open => self.open_release(id),
+            Command::ChooseFolder => {}
+        }
+    }
+
+    fn current_folder(&self) -> Option<&CollectionFolder> {
+        self.folders.get(self.folder_selected?)
+    }
+
+    fn selected_title(&self) -> String {
+        self.search_results
+            .get(self.selected_result.unwrap_or(usize::MAX))
+            .map(SearchItem::title_display)
+            .unwrap_or_default()
+    }
+
+    fn add_release(&mut self, id: u32) {
+        let Some(folder_id) = self.current_folder().map(|f| f.id) else {
+            if self.folders.is_empty() {
+                self.worker.send(Request::LoadFolders);
+                self.set_error("Folders are not loaded yet; try again in a moment".to_string());
+            } else {
+                self.open_folder_picker();
+                self.set_info("Choose the folder to add to first".to_string());
+            }
+            return;
+        };
+        match controls::decide_add(self.ownership.get(&id).map(Vec::as_slice)) {
+            AddDecision::Add => self.send_add(id, folder_id),
+            AddDecision::ConfirmDuplicate(copies) => {
+                self.confirm = Some(Confirm::AddDuplicate {
+                    release_id: id,
+                    folder_id,
+                    title: self.selected_title(),
+                    copies,
+                });
+            }
+            AddDecision::NeedsCheck => {
+                self.worker.send(Request::CheckOwnership(id));
+                self.set_info("Checking your collection first; press A again".to_string());
+            }
+        }
+    }
+
+    fn send_add(&mut self, id: u32, folder_id: u32) {
+        // Optimistic: count the copy right away so a quick second press asks
+        // before adding a duplicate; the resync after the request corrects it.
+        self.ownership
+            .entry(id)
+            .or_default()
+            .push(CollectionInstance {
+                instance_id: PENDING_INSTANCE,
+                folder_id,
+            });
+        self.worker.send(Request::AddToCollection {
+            release_id: id,
+            folder_id,
+        });
+        self.set_info("Adding...".to_string());
+    }
+
+    fn remove_release(&mut self, id: u32) {
+        match controls::decide_remove(self.ownership.get(&id).map(Vec::as_slice)) {
+            RemoveDecision::Confirm(instance) => {
+                let folder_name = self
+                    .folders
+                    .iter()
+                    .find(|f| f.id == instance.folder_id)
+                    .map_or_else(|| format!("#{}", instance.folder_id), |f| f.name.clone());
+                self.confirm = Some(Confirm::Remove {
+                    release_id: id,
+                    instance,
+                    title: self.selected_title(),
+                    folder_name,
+                });
+            }
+            RemoveDecision::NotOwned => {
+                self.set_error("Not in your collection".to_string());
+            }
+            RemoveDecision::NeedsCheck => {
+                self.worker.send(Request::CheckOwnership(id));
+                self.set_info("Checking your collection first; press R again".to_string());
+            }
+        }
+    }
+
+    fn open_release(&mut self, id: u32) {
+        let uri = self
+            .search_results
+            .get(self.selected_result.unwrap_or(usize::MAX))
+            .and_then(|item| item.uri.as_deref());
+        let url = controls::release_url(uri, id);
+        match open::that(&url) {
+            Ok(()) => self.set_info(format!("Opened {url}")),
+            Err(err) => self.set_error(format!("Could not open {url}: {err}")),
+        }
+    }
+
+    fn open_folder_picker(&mut self) {
+        if self.folders.is_empty() {
+            self.worker.send(Request::LoadFolders);
+        }
+        self.picker_cursor = self.folder_selected.or(Some(0));
+        self.folder_picker_open = true;
+    }
+
+    fn choose_folder(&mut self, idx: usize) {
+        let Some(folder) = self.folders.get(idx) else {
+            return;
+        };
+        let (id, name) = (folder.id, folder.name.clone());
+        self.folder_selected = Some(idx);
+        self.folder_picker_open = false;
+        self.settings.folder_id = id;
+        if let Some(path) = &self.config_path
+            && let Err(err) = Settings::update_on_disk(path, |s| s.folder_id = id)
+        {
+            self.set_error(format!("{err:#}"));
+            return;
+        }
+        self.set_info(format!("New releases go to {name}"));
+    }
+
+    /// Row of buttons that mirror the keyboard commands and show their keys.
+    fn command_bar(&mut self, ui: &mut egui::Ui) -> Option<Command> {
+        let has_selection = self.selected_id().is_some();
+        let folder = self
+            .current_folder()
+            .map_or("?".to_string(), |f| f.name.clone());
+        let mut clicked = None;
+        ui.horizontal(|ui| {
+            for cmd in Command::ALL {
+                let label = match cmd {
+                    Command::Add => format!("Add to {folder}"),
+                    Command::Remove => "Remove".to_string(),
+                    Command::Open => "Open in browser".to_string(),
+                    Command::ChooseFolder => "Change folder".to_string(),
+                };
+                let text = format!("{label}  [{}]", cmd.key_label());
+                let enabled = has_selection || cmd == Command::ChooseFolder;
+                if ui.add_enabled(enabled, egui::Button::new(text)).clicked() {
+                    clicked = Some(cmd);
+                }
+            }
+            ui.label(RichText::new("Up/Down: browse   Esc: new search").small());
+        });
+        clicked
     }
 
     fn perform_search(&mut self) {
@@ -788,38 +1063,6 @@ impl RecordShelfApp {
             }
             None => self.set_error("Select a result first".to_string()),
         }
-    }
-
-    fn open_folder_picker(&mut self) {
-        let Some(id) = self.selected_id() else {
-            self.set_error("Select a result before choosing a folder".to_string());
-            return;
-        };
-        if self.folders.is_empty() {
-            self.worker.send(Request::LoadFolders);
-        }
-        // Always refresh: the collection may have changed on discogs.com.
-        self.worker.send(Request::CheckOwnership(id));
-        if self.folder_selected.is_none() && !self.folders.is_empty() {
-            self.folder_selected = Some(0);
-        }
-        self.folder_picker_open = true;
-    }
-
-    fn add_selected_to_collection(&mut self) {
-        let Some(id) = self.selected_id() else {
-            self.set_error("Select a result first".to_string());
-            return;
-        };
-        let Some(folder) = self.folder_selected.and_then(|i| self.folders.get(i)) else {
-            self.set_error("Select a folder first".to_string());
-            return;
-        };
-        self.worker.send(Request::AddToCollection {
-            release_id: id,
-            folder_id: folder.id,
-        });
-        self.folder_picker_open = false;
     }
 }
 
@@ -1253,5 +1496,196 @@ mod tests {
         assert_eq!(non_empty("  abc "), Some("abc".to_string()));
         assert_eq!(non_empty("   "), None);
         assert_eq!(non_empty(""), None);
+    }
+
+    fn folder(id: u32, name: &str) -> CollectionFolder {
+        CollectionFolder {
+            id,
+            name: name.into(),
+            count: 0,
+        }
+    }
+
+    fn app_ready_to_add() -> RecordShelfApp {
+        let mut app = app_with_results(2);
+        app.folders = vec![folder(1, "Uncategorized"), folder(5, "Techno")];
+        app.folder_selected = Some(1);
+        app.selected_result = Some(0);
+        app
+    }
+
+    fn copy(instance_id: u32, folder_id: u32) -> CollectionInstance {
+        CollectionInstance {
+            instance_id,
+            folder_id,
+        }
+    }
+
+    #[test]
+    fn add_sends_immediately_when_not_owned() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, Vec::new());
+        let before = app.worker.pending();
+        app.run_command(Command::Add);
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.ownership[&1], vec![copy(PENDING_INSTANCE, 5)]);
+    }
+
+    #[test]
+    fn a_second_quick_add_asks_first() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, Vec::new());
+        app.run_command(Command::Add);
+        let before = app.worker.pending();
+        app.run_command(Command::Add);
+        assert_eq!(app.worker.pending(), before, "nothing sent yet");
+        assert!(matches!(
+            app.confirm,
+            Some(Confirm::AddDuplicate {
+                copies: 1,
+                folder_id: 5,
+                ..
+            })
+        ));
+        app.accept_confirm();
+        assert_eq!(app.worker.pending(), before + 1);
+        assert_eq!(app.ownership[&1].len(), 2);
+    }
+
+    #[test]
+    fn add_with_unknown_collection_status_checks_first() {
+        let mut app = app_ready_to_add();
+        let before = app.worker.pending();
+        app.run_command(Command::Add);
+        assert_eq!(app.worker.pending(), before + 1, "only the ownership check");
+        assert!(!app.ownership.contains_key(&1));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn add_without_folders_does_not_send() {
+        let mut app = app_with_results(1);
+        app.selected_result = Some(0);
+        app.ownership.insert(1, Vec::new());
+        let before = app.worker.pending();
+        app.run_command(Command::Add);
+        assert_eq!(
+            app.worker.pending(),
+            before + 1,
+            "folder list is requested instead"
+        );
+        assert!(app.ownership[&1].is_empty());
+    }
+
+    #[test]
+    fn remove_asks_then_removes_the_last_copy() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1), copy(11, 5)]);
+        let before = app.worker.pending();
+        app.run_command(Command::Remove);
+        assert_eq!(app.worker.pending(), before);
+        match &app.confirm {
+            Some(Confirm::Remove {
+                instance,
+                folder_name,
+                ..
+            }) => {
+                assert_eq!(instance, &copy(11, 5));
+                assert_eq!(folder_name, "Techno");
+            }
+            _ => panic!("expected a remove confirmation"),
+        }
+        app.accept_confirm();
+        assert_eq!(app.worker.pending(), before + 1);
+        assert_eq!(app.ownership[&1], vec![copy(10, 1)]);
+    }
+
+    #[test]
+    fn declining_the_confirmation_changes_nothing() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.run_command(Command::Remove);
+        let before = app.worker.pending();
+        app.confirm = None;
+        assert_eq!(app.worker.pending(), before);
+        assert_eq!(app.ownership[&1], vec![copy(10, 1)]);
+    }
+
+    #[test]
+    fn remove_of_an_unowned_release_is_an_error() {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, Vec::new());
+        let before = app.worker.pending();
+        app.run_command(Command::Remove);
+        assert_eq!(app.worker.pending(), before);
+        assert!(app.confirm.is_none());
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
+    }
+
+    #[test]
+    fn commands_need_a_selection() {
+        let mut app = app_ready_to_add();
+        app.selected_result = None;
+        let before = app.worker.pending();
+        app.run_command(Command::Add);
+        app.run_command(Command::Remove);
+        app.run_command(Command::Open);
+        assert_eq!(app.worker.pending(), before);
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_error));
+    }
+
+    #[test]
+    fn folder_list_hides_all_and_restores_the_saved_choice() {
+        let mut app = app_with_results(0);
+        app.settings.folder_id = 5;
+        app.handle_response(Response::Folders(Ok(vec![
+            folder(0, "All"),
+            folder(1, "Uncategorized"),
+            folder(5, "Techno"),
+        ])));
+        assert_eq!(app.folders.len(), 2);
+        assert!(app.folders.iter().all(|f| f.id != 0));
+        assert_eq!(app.current_folder().map(|f| f.id), Some(5));
+    }
+
+    #[test]
+    fn folder_defaults_to_the_first_one() {
+        let mut app = app_with_results(0);
+        app.handle_response(Response::Folders(Ok(vec![
+            folder(0, "All"),
+            folder(1, "Uncategorized"),
+        ])));
+        assert_eq!(app.current_folder().map(|f| f.id), Some(1));
+    }
+
+    #[test]
+    fn choosing_a_folder_is_remembered_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut app = app_ready_to_add();
+        app.config_path = Some(path.clone());
+        app.open_folder_picker();
+        assert!(app.folder_picker_open);
+        app.choose_folder(0);
+        assert!(!app.folder_picker_open);
+        assert_eq!(app.current_folder().map(|f| f.id), Some(1));
+        assert_eq!(Settings::load(&path).unwrap().folder_id, 1);
+    }
+
+    #[test]
+    fn finished_add_resyncs_the_collection() {
+        let mut app = app_ready_to_add();
+        let before = app.worker.pending();
+        app.handle_response(Response::Added {
+            release_id: 1,
+            folder_id: 5,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.worker.pending(),
+            before + 2,
+            "ownership check and folder reload"
+        );
     }
 }
