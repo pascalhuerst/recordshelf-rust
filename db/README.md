@@ -3,18 +3,23 @@
 PostgreSQL. Every row in `releases` is a record we own; the data comes from Discogs. Our own database is the catalogue; the Discogs collection stays the source of truth for what we own.
 
 ## Setup
-1. Create the role and database once, as a Postgres superuser:
-   ```
-   psql -U postgres -v password="'choose-a-password'" -f db/setup.sql
-   ```
-2. Apply the migrations in order (the app's migration runner does this; by hand):
-   ```
-   for f in db/migrations/*.sql; do psql -U recordshelf -d recordshelf -v ON_ERROR_STOP=1 --single-transaction -f "$f"; done
-   ```
-3. Put the connection string in the settings file (like the Discogs token), e.g. `postgres://recordshelf:...@host/recordshelf`.
+Everything goes through `db/db.sh` (bash and `psql` are all it needs; it takes the usual psql connection options and passwords from `PGPASSWORD`, `~/.pgpass` or trust authentication).
+
+```
+db/db.sh bootstrap -h lightdesk.local -U postgres     # once: role, database, tables
+db/db.sh status    -h lightdesk.local -U postgres     # which migrations are applied
+db/db.sh migrate   -h lightdesk.local -U postgres     # apply pending migrations later
+```
+
+- **`bootstrap`** needs a superuser. It creates the role `recordshelf` (login, with a generated password that is printed once at the end, or `RECORDSHELF_DB_PASSWORD` if you set it), the database `recordshelf` owned by it, and applies all migrations. Everything the migrations create belongs to the role. It only creates what is missing, so running it again is safe and never changes an existing role's password.
+- **`migrate`** applies pending migrations; it works with the superuser or with the `recordshelf` role itself.
+- **`status`** lists every migration as `applied` or `pending`.
+- `-d` and `-r` choose another database or role name (defaults `recordshelf`).
+
+Afterwards put the connection string that `bootstrap` printed into the settings file (it is not used by the app yet).
 
 ## Tests
-`db/test.sh` creates a throwaway Postgres cluster in a temp directory, applies `setup.sql` and all migrations, and runs `db/tests/schema.sql` (defaults, constraints, triggers, cascades). It needs the Postgres server binaries and `psql`. Add checks there when a migration adds rules.
+`db/test.sh` creates a throwaway Postgres cluster in a temp directory and runs `db/tests/bootstrap.sh` (the tooling: fresh and repeated bootstrap, status, new, edited and failing migrations, passwords, bad input) and `db/tests/schema.sql` (defaults, constraints, triggers, cascades on a database made by the tooling). It needs the Postgres server binaries and `psql`. Add checks when a migration adds rules.
 
 ## Schema
 | Table | Purpose |
@@ -48,7 +53,7 @@ PostgreSQL. Every row in `releases` is a record we own; the data comes from Disc
 - Tracklist: `track_index` counts the real tracks from 0; heading and index rows are skipped. Durations "3:45" become seconds.
 
 ## Migrations
-- Files `db/migrations/NNNN_description.sql`, applied in number order, each in one transaction, forward only.
-- Never edit a migration that has been applied anywhere; add a new one.
-- The runner records what ran in `schema_migrations (version, name, checksum, applied_at)` and refuses to continue if an applied file changed.
-- `setup.sql` is not a migration: it needs superuser rights and only runs once.
+- Files `db/migrations/NNNN_description.sql` (four digits, lower case), applied in number order, forward only. Numbers must be unique.
+- Each migration runs in one transaction together with its row in `schema_migrations (version, name, checksum, applied_at)`: it is applied completely or not at all.
+- A migration that was changed after it was applied is refused (checksum). Never edit an applied migration; add a new one.
+- Run `db/test.sh` after adding one.
