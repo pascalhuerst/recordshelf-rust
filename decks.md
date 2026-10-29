@@ -46,4 +46,4 @@ If the shop changes its markup, fix `parse_results` and the fixture `tests/fixtu
 - "lookup failed (no reply)": the tab could not reach the shop (offline, or the tab is not on decks.de).
 - "browser not connected": the tab is closed, the userscript is not installed, or the token/port in the script is outdated.
 - "no exact match": the shop did not return a block with that code; search it manually.
-- "No Discogs release found": the catalog number may be formatted differently on Discogs; use the Search tab.
+- "No Discogs release found": the catalog number may be formatted differently on Discogs; search by hand with the fields above.

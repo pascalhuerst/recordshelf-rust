@@ -1,6 +1,6 @@
 # recordshelf-rust
 
-Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB barcode scanner (read as a Linux evdev keyboard device) feeds codes; a Search tab finds releases and adds them to a Discogs collection folder. Linux only (evdev). Edition 2024.
+Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB barcode scanner (read as a Linux evdev keyboard device) feeds codes; the search view finds releases and adds them to a Discogs collection folder. Linux only (evdev). Edition 2024.
 
 ## Commands
 - Run: `cargo run -- [--config PATH] [--token T] [--username U] [--device-name N] [--device PATH] [--currency C] [--user-agent UA]`
