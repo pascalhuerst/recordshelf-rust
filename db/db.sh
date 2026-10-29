@@ -4,6 +4,7 @@
 #   db/db.sh bootstrap -h HOST -U ADMIN      create role and database, apply migrations
 #   db/db.sh migrate   -h HOST -U USER       apply pending migrations
 #   db/db.sh status    -h HOST -U USER       show which migrations are applied
+#   db/db.sh drop      -h HOST -U ADMIN      delete the database and its role (asks first)
 #
 # Connection options (like psql): -h host, -p port, -U user, -d database
 # (default recordshelf). Passwords come from the usual places: PGPASSWORD,
@@ -13,6 +14,11 @@
 # only creates what is missing and applies migrations that are still pending.
 # The role is created with a generated password unless RECORDSHELF_DB_PASSWORD
 # is set; a generated password is printed once, at the end.
+#
+# drop needs a superuser as well. It shows what will be deleted and asks you
+# to type the database name; --confirm NAME does that without a prompt (for
+# scripts). Everything in the database is lost. The role is dropped too unless
+# --keep-role is given or it owns other databases.
 #
 # Migrations (db/migrations/NNNN_name.sql) are applied in order, each in its
 # own transaction together with its entry in schema_migrations. A migration
@@ -37,7 +43,7 @@ command -v sha256sum >/dev/null || die "sha256sum not found"
 COMMAND=$1
 shift
 case "$COMMAND" in
-    bootstrap|migrate|status) ;;
+    bootstrap|migrate|status|drop) ;;
     -h|--help|help) usage 0 ;;
     *) echo "unknown command: $COMMAND" >&2; usage 1 ;;
 esac
@@ -47,7 +53,8 @@ PORT=${PGPORT:-}
 USER_NAME=${PGUSER:-}
 DB_NAME=recordshelf
 ROLE=recordshelf
-SET_ROLE=
+CONFIRM=
+KEEP_ROLE=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,6 +63,8 @@ while [ $# -gt 0 ]; do
         -U|--user) USER_NAME=${2:?missing user}; shift 2 ;;
         -d|--dbname) DB_NAME=${2:?missing database name}; shift 2 ;;
         -r|--role) ROLE=${2:?missing role name}; shift 2 ;;
+        --confirm) CONFIRM=${2:?missing database name}; shift 2 ;;
+        --keep-role) KEEP_ROLE=1; shift ;;
         --help) usage 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -226,6 +235,71 @@ SQL
     fi
 }
 
+cmd_drop() {
+    case "$DB_NAME" in
+        postgres|template0|template1) die "refusing to drop the system database $DB_NAME" ;;
+    esac
+    check_connection postgres
+    local superuser
+    superuser=$(query postgres -c "select rolsuper from pg_roles where rolname = current_user")
+    [ "$superuser" = "t" ] || die "drop needs a superuser (-U postgres); ${USER_NAME:-the current user} is not one"
+
+    local db_exists role_exists
+    db_exists=$(query postgres -c "select 1 from pg_database where datname = '$DB_NAME'")
+    role_exists=$(query postgres -c "select 1 from pg_roles where rolname = '$ROLE'")
+    if [ -z "$db_exists" ] && [ -z "$role_exists" ]; then
+        echo "database $DB_NAME and role $ROLE do not exist; nothing to do"
+        return 0
+    fi
+
+    # The role is only dropped if it owns nothing but this database.
+    local drop_role=
+    if [ -n "$role_exists" ] && [ -z "$KEEP_ROLE" ]; then
+        local others
+        others=$(query postgres -c "select string_agg(datname, ', ') from pg_database where datdba = (select oid from pg_roles where rolname = '$ROLE') and datname <> '$DB_NAME'")
+        if [ -n "$others" ]; then
+            echo "note: role $ROLE also owns the database(s) $others and will be kept"
+        else
+            drop_role=1
+        fi
+    fi
+
+    echo "this will permanently delete:"
+    if [ -n "$db_exists" ]; then
+        local info
+        info=$(query postgres -c "select pg_size_pretty(pg_database_size('$DB_NAME'))")
+        local tables=
+        tables=$(query "$DB_NAME" -c "select count(*) from pg_tables where schemaname = 'public'" 2>/dev/null || true)
+        echo "  database $DB_NAME ($info${tables:+, $tables tables}) on ${HOST:-the local server}${PORT:+:$PORT}"
+    else
+        echo "  (database $DB_NAME does not exist)"
+    fi
+    [ -n "$drop_role" ] && echo "  role $ROLE"
+
+    local answer
+    if [ -n "$CONFIRM" ]; then
+        answer=$CONFIRM
+    elif [ -t 0 ]; then
+        read -r -p "type the database name ($DB_NAME) to confirm: " answer
+    else
+        die "not confirmed: run it in a terminal, or pass --confirm $DB_NAME"
+    fi
+    [ "$answer" = "$DB_NAME" ] || die "not confirmed; nothing was deleted"
+
+    if [ -n "$db_exists" ]; then
+        # disconnect everyone first (works on every server version)
+        query postgres -c "select pg_terminate_backend(pid) from pg_stat_activity where datname = '$DB_NAME' and pid <> pg_backend_pid()" >/dev/null
+        run_psql postgres -c "DROP DATABASE \"$DB_NAME\""
+        echo "dropped database $DB_NAME"
+    fi
+    if [ -n "$drop_role" ]; then
+        run_psql postgres -c "DROP ROLE \"$ROLE\""
+        echo "dropped role $ROLE"
+    elif [ -n "$role_exists" ]; then
+        echo "kept role $ROLE"
+    fi
+}
+
 migrate_as_role() {
     export PGOPTIONS
     check_connection "$DB_NAME"
@@ -236,4 +310,5 @@ case "$COMMAND" in
     bootstrap) cmd_bootstrap ;;
     migrate) cmd_migrate ;;
     status) cmd_status ;;
+    drop) cmd_drop ;;
 esac

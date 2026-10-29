@@ -123,6 +123,83 @@ out=$(RECORDSHELF_MIGRATIONS_DIR=$empty $DB migrate -U postgres -d t1 2>&1)
 expect_in "used twice" "$out" "duplicate migration number"
 rm -rf "$empty"
 
+# --- drop ------------------------------------------------------------------------
+$DB bootstrap -U postgres -d d1 -r d1_role >/dev/null 2>&1
+exists() { sql postgres "select 1 from pg_database where datname = '$1'"; }
+role_exists() { sql postgres "select 1 from pg_roles where rolname = '$1'"; }
+
+out=$($DB drop -U postgres -d d1 -r d1_role </dev/null 2>&1); code=$?
+expect_eq 1 "$code" "drop without confirmation exit code"
+expect_in "not confirmed" "$out" "drop without a terminal or --confirm"
+expect_in "database d1" "$out" "drop shows what it would delete"
+expect_eq 1 "$(exists d1)" "database survives an unconfirmed drop"
+out=$($DB drop -U postgres -d d1 -r d1_role --confirm wrong 2>&1); code=$?
+expect_eq 1 "$code" "drop with a wrong name exit code"
+expect_in "nothing was deleted" "$out" "wrong name message"
+expect_eq 1 "$(exists d1)" "database survives a wrong confirmation"
+expect_eq 1 "$(role_exists d1_role)" "role survives a wrong confirmation"
+
+# a session that is still connected does not prevent it
+(psql -X -q -h "$PGHOST" -p "$PGPORT" -U postgres -d d1 -c "select pg_sleep(30)" >/dev/null 2>&1 &)
+sleep 1
+out=$($DB drop -U postgres -d d1 -r d1_role --confirm d1 2>&1); code=$?
+expect_eq 0 "$code" "drop exit code"
+expect_in "dropped database d1" "$out" "database dropped"
+expect_in "dropped role d1_role" "$out" "role dropped"
+expect_eq "" "$(exists d1)" "database is gone"
+expect_eq "" "$(role_exists d1_role)" "role is gone"
+
+out=$($DB drop -U postgres -d d1 -r d1_role --confirm d1 2>&1); code=$?
+expect_eq 0 "$code" "drop of nothing exit code"
+expect_in "nothing to do" "$out" "drop twice"
+
+# after a drop the bootstrap starts from scratch
+out=$($DB bootstrap -U postgres -d d1 -r d1_role 2>&1); code=$?
+expect_eq 0 "$code" "bootstrap after drop"
+expect_in "created role d1_role" "$out" "role is created again"
+expect_in "applying 0001_init.sql" "$out" "migrations run again"
+
+# --keep-role
+out=$($DB drop -U postgres -d d1 -r d1_role --confirm d1 --keep-role 2>&1)
+expect_in "kept role d1_role" "$out" "role kept on request"
+expect_eq 1 "$(role_exists d1_role)" "kept role still exists"
+expect_eq "" "$(exists d1)" "database dropped even when the role is kept"
+$DB drop -U postgres -d d1 -r d1_role --confirm d1 >/dev/null 2>&1
+expect_eq "" "$(role_exists d1_role)" "a later drop removes the leftover role"
+
+# a role that owns another database is not dropped
+$DB bootstrap -U postgres -d d2 -r shared_role >/dev/null 2>&1
+sql postgres "create database d3 owner shared_role" >/dev/null
+out=$($DB drop -U postgres -d d2 -r shared_role --confirm d2 2>&1)
+expect_in "also owns the database(s) d3" "$out" "shared role note"
+expect_in "dropped database d2" "$out" "first database dropped"
+expect_eq 1 "$(role_exists shared_role)" "shared role is kept"
+expect_eq 1 "$(exists d3)" "the other database is untouched"
+
+# guard rails
+for system_db in postgres template1; do
+    out=$($DB drop -U postgres -d $system_db --confirm $system_db 2>&1); code=$?
+    expect_eq 1 "$code" "dropping $system_db exit code"
+    expect_in "refusing to drop the system database" "$out" "system database $system_db"
+done
+expect_eq 1 "$(exists postgres)" "the postgres database is still there"
+out=$($DB drop -U t1_role -d t1 --confirm t1 2>&1); code=$?
+expect_eq 1 "$code" "drop as non-superuser exit code"
+expect_in "needs a superuser" "$out" "drop as non-superuser"
+expect_eq 1 "$(exists t1)" "database survives a non-superuser drop"
+out=$($DB drop -U postgres -d 'x;y' --confirm 'x;y' 2>&1)
+expect_in "invalid database name" "$out" "drop with a bad name"
+
+# the interactive prompt, if a pseudo terminal can be made
+if command -v script >/dev/null 2>&1; then
+    $DB bootstrap -U postgres -d d4 -r d4_role >/dev/null 2>&1
+    out=$(printf 'nope\n' | script -qec "$DB drop -U postgres -d d4 -r d4_role" /dev/null 2>&1)
+    expect_in "type the database name (d4) to confirm" "$out" "interactive prompt"
+    expect_eq 1 "$(exists d4)" "a wrong answer at the prompt deletes nothing"
+    out=$(printf 'd4\n' | script -qec "$DB drop -U postgres -d d4 -r d4_role" /dev/null 2>&1)
+    expect_eq "" "$(exists d4)" "the right answer at the prompt deletes the database"
+fi
+
 out=$($DB --help 2>&1)
 expect_in "db/db.sh bootstrap" "$out" "help text"
 

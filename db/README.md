@@ -9,11 +9,13 @@ Everything goes through `db/db.sh` (bash and `psql` are all it needs; it takes t
 db/db.sh bootstrap -h lightdesk.local -U postgres     # once: role, database, tables
 db/db.sh status    -h lightdesk.local -U postgres     # which migrations are applied
 db/db.sh migrate   -h lightdesk.local -U postgres     # apply pending migrations later
+db/db.sh drop      -h lightdesk.local -U postgres     # delete the database and its role again
 ```
 
 - **`bootstrap`** needs a superuser. It creates the role `recordshelf` (login, with a generated password that is printed once at the end, or `RECORDSHELF_DB_PASSWORD` if you set it), the database `recordshelf` owned by it, and applies all migrations. Everything the migrations create belongs to the role. It only creates what is missing, so running it again is safe and never changes an existing role's password.
 - **`migrate`** applies pending migrations; it works with the superuser or with the `recordshelf` role itself.
 - **`status`** lists every migration as `applied` or `pending`.
+- **`drop`** needs a superuser too. It shows what will be deleted (size, number of tables), and you must type the database name to confirm; `--confirm NAME` does that without a prompt, for scripts. Connected sessions are disconnected, everything in the database is lost. The role is dropped as well, unless `--keep-role` is given or it owns other databases. The `postgres` and template databases are refused. A dump first: `pg_dump -h HOST -U postgres recordshelf > recordshelf.sql`.
 - `-d` and `-r` choose another database or role name (defaults `recordshelf`).
 
 Afterwards put the connection string that `bootstrap` printed into the settings file (it is not used by the app yet).
