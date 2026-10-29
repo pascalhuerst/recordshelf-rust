@@ -47,6 +47,10 @@ pub struct Args {
     #[arg(long)]
     pub username: Option<String>,
 
+    /// Start in a normal window instead of fullscreen (F11 toggles at runtime)
+    #[arg(long)]
+    pub windowed: bool,
+
     /// Enable the decks.de browser bridge (localhost server for the userscript)
     #[arg(long)]
     pub decks_bridge: bool,
@@ -86,7 +90,10 @@ fn main() -> Result<()> {
     args.apply_to(&mut settings);
 
     let decks_port = args.decks_bridge.then_some(args.decks_port);
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_fullscreen(!args.windowed),
+        ..Default::default()
+    };
     eframe::run_native(
         "RecordShelf",
         native_options,
@@ -150,5 +157,11 @@ mod tests {
         assert_eq!(settings.token, "abc");
         assert_eq!(settings.currency, "USD");
         assert_eq!(settings.user_agent, "UA");
+    }
+
+    #[test]
+    fn starts_fullscreen_unless_windowed_is_given() {
+        assert!(!parse(&[]).windowed);
+        assert!(parse(&["--windowed"]).windowed);
     }
 }

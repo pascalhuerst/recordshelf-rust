@@ -1071,6 +1071,10 @@ impl eframe::App for RecordShelfApp {
         self.drain_events();
         self.sync_selection(ctx);
         self.persist_zoom(ctx);
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        }
         if self.decks.is_some() {
             // Keeps the "browser connected" indicator fresh.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
