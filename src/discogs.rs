@@ -346,7 +346,7 @@ where
     })
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Release {
     pub id: Option<u32>,
     pub title: Option<String>,

@@ -26,6 +26,7 @@ Desktop GUI (egui/eframe 0.27) for cataloguing vinyl via the Discogs API. A USB 
 ## Conventions
 - All Discogs searches are restricted to `format=Vinyl` (only vinyl is of interest); this is applied in `SearchQuery::params`.
 - Errors: `anyhow` with `.context(...)`; worker turns them into `String`s for the UI; the UI shows them as a `Notice` in the status bar.
+- Browsing results shows details without Enter: the first `PREFETCH_LIMIT` (5) results are prefetched (release + collection status), later ones load when the selection rests for 250 ms. Releases are cached in `releases`/`requested`; Enter forces a reload. Keep this in mind for the 60 req/min Discogs limit.
 - Owned releases are flagged (ownership cache `HashMap<release_id, Vec<CollectionInstance>>`); adding a duplicate copy is always allowed.
 - Tests live in `#[cfg(test)]` modules next to the code; Discogs HTTP is tested against a local one-shot `TcpListener` server (`DiscogsClient.base` is overridable in-crate).
 - Keep clippy and fmt clean; commit only when asked.

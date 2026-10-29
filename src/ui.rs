@@ -1,11 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::Receiver,
     },
+    time::{Duration, Instant},
 };
 
 use crate::barcode_reader::{self, BarcodeReader, InputDevice, ScanEvent};
@@ -24,6 +25,12 @@ enum ImageState {
     Ready(Arc<[u8]>),
     Failed,
 }
+
+/// Results beyond this many are only fetched once selected.
+const PREFETCH_LIMIT: usize = 5;
+/// How long the selection must rest before an unfetched release is requested,
+/// so that holding an arrow key does not flood the API.
+const SELECTION_DEBOUNCE: Duration = Duration::from_millis(250);
 
 const THUMB_SIZE: f32 = 56.0;
 const COVER_SIZE: f32 = 220.0;
@@ -62,7 +69,12 @@ pub struct RecordShelfApp {
     search_barcode: String,
     search_results: Vec<SearchItem>,
     selected_result: Option<usize>,
-    selected_release: Option<Release>,
+    /// Full release data by id; filled by prefetching and by browsing the results.
+    releases: HashMap<u32, Release>,
+    /// Releases already requested (so each is fetched once per session).
+    requested: HashSet<u32>,
+    last_selected: Option<u32>,
+    selection_changed: Instant,
     settings_open: bool,
     images: HashMap<String, ImageState>,
     decks: Option<DecksState>,
@@ -101,7 +113,10 @@ impl RecordShelfApp {
             search_barcode: String::new(),
             search_results: Vec::new(),
             selected_result: None,
-            selected_release: None,
+            releases: HashMap::new(),
+            requested: HashSet::new(),
+            last_selected: None,
+            selection_changed: Instant::now(),
             settings_open: false,
             images: HashMap::new(),
             decks: None,
@@ -218,8 +233,52 @@ impl RecordShelfApp {
         self.folder_picker_open = false;
         self.search_results = items;
         self.selected_result = Some(0);
-        self.selected_release = None;
-        self.load_selected_release();
+        self.prefetch_results();
+    }
+
+    /// Fetches release data (and collection status) for the first few results
+    /// so that browsing them shows details immediately.
+    fn prefetch_results(&mut self) {
+        let ids: Vec<u32> = self
+            .search_results
+            .iter()
+            .take(PREFETCH_LIMIT)
+            .filter_map(|item| item.id)
+            .collect();
+        for id in ids {
+            self.request_release(id);
+        }
+    }
+
+    /// Requests a release and its collection status unless already done.
+    fn request_release(&mut self, id: u32) {
+        if self.requested.insert(id) {
+            self.worker.send(Request::LoadRelease(id));
+            if !self.ownership.contains_key(&id) {
+                self.worker.send(Request::CheckOwnership(id));
+            }
+        }
+    }
+
+    fn selected_release(&self) -> Option<&Release> {
+        self.releases.get(&self.selected_id()?)
+    }
+
+    /// Loads the selected release once the selection has settled.
+    fn sync_selection(&mut self, ctx: &egui::Context) {
+        let id = self.selected_id();
+        if id != self.last_selected {
+            self.last_selected = id;
+            self.selection_changed = Instant::now();
+        }
+        if let Some(id) = id.filter(|id| !self.requested.contains(id)) {
+            let waited = self.selection_changed.elapsed();
+            if waited >= SELECTION_DEBOUNCE {
+                self.request_release(id);
+            } else {
+                ctx.request_repaint_after(SELECTION_DEBOUNCE - waited);
+            }
+        }
     }
 
     /// Starts downloading a picture unless it is already loading or cached.
@@ -255,6 +314,8 @@ impl RecordShelfApp {
         self.folder_selected = None;
         self.ownership.clear();
         self.images.clear();
+        self.releases.clear();
+        self.requested.clear();
         self.notice = None;
         self.configure_worker();
         if self.config_path.is_none() {
@@ -399,17 +460,13 @@ impl RecordShelfApp {
                 self.selected_result = if items.is_empty() { None } else { Some(0) };
                 self.search_focus = items.is_empty();
                 self.search_results = items;
-                self.selected_release = None;
+                self.prefetch_results();
                 self.notice = None;
             }
             Response::Search(Err(err)) => self.set_error(err),
             Response::Release { id, result } => match result {
                 Ok(release) => {
-                    // Ignore answers for a result the user has already moved away from.
-                    if self.selected_id() == Some(id) {
-                        self.selected_release = Some(release);
-                        self.notice = None;
-                    }
+                    self.releases.insert(id, release);
                 }
                 Err(err) => self.set_error(err),
             },
@@ -579,8 +636,7 @@ impl RecordShelfApp {
         ui.separator();
 
         let cover = self
-            .selected_release
-            .as_ref()
+            .selected_release()
             .and_then(|r| r.cover_url())
             .map(str::to_string);
         if let Some(url) = &cover {
@@ -590,16 +646,24 @@ impl RecordShelfApp {
             .id_source("search-release")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if let Some(release) = &self.selected_release {
+                if let Some(release) = self.selected_release() {
                     let owned = release.id.and_then(|id| self.ownership.get(&id));
                     ui.horizontal_top(|ui| {
-                        if let Some(url) = &cover {
-                            draw_image(ui, &self.images, url, COVER_SIZE);
+                        match &cover {
+                            Some(url) => {
+                                draw_image(ui, &self.images, url, COVER_SIZE);
+                            }
+                            None => draw_placeholder(ui, COVER_SIZE),
                         }
                         ui.vertical(|ui| {
                             render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
                             render_release(ui, release);
                         });
+                    });
+                } else if self.selected_id().is_some() {
+                    ui.horizontal_top(|ui| {
+                        draw_placeholder(ui, COVER_SIZE);
+                        ui.label("Loading release...");
                     });
                 }
             });
@@ -635,11 +699,10 @@ impl RecordShelfApp {
                 down,
             );
             if enter {
-                self.load_selected_release();
+                self.reload_selected_release();
             }
             if esc {
                 self.selected_result = None;
-                self.selected_release = None;
                 self.search_focus = true;
             }
         }
@@ -699,11 +762,12 @@ impl RecordShelfApp {
         self.search_barcode.clear();
     }
 
-    fn load_selected_release(&mut self) {
+    /// Forces a fresh fetch of the selected release (also retries a failed one).
+    fn reload_selected_release(&mut self) {
         match self.selected_id() {
             Some(id) => {
-                self.worker.send(Request::LoadRelease(id));
-                self.worker.send(Request::CheckOwnership(id));
+                self.requested.remove(&id);
+                self.request_release(id);
             }
             None => self.set_error("Select a result first".to_string()),
         }
@@ -745,6 +809,7 @@ impl RecordShelfApp {
 impl eframe::App for RecordShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.sync_selection(ctx);
         if self.decks.is_some() {
             // Keeps the "browser connected" indicator fresh.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -1045,6 +1110,91 @@ fn render_release(ui: &mut egui::Ui, release: &Release) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_with_results(n: u32) -> RecordShelfApp {
+        let mut app =
+            RecordShelfApp::new(egui::Context::default(), Settings::default(), None, None);
+        app.search_results = (1..=n)
+            .map(|id| SearchItem {
+                id: Some(id),
+                ..Default::default()
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn prefetch_covers_only_the_first_results() {
+        let mut app = app_with_results(8);
+        app.prefetch_results();
+        assert_eq!(app.requested, (1..=PREFETCH_LIMIT as u32).collect());
+        // one release + one ownership request each
+        assert_eq!(app.worker.pending(), PREFETCH_LIMIT * 2);
+        app.prefetch_results();
+        assert_eq!(
+            app.worker.pending(),
+            PREFETCH_LIMIT * 2,
+            "nothing is fetched twice"
+        );
+    }
+
+    #[test]
+    fn known_ownership_is_not_requested_again() {
+        let mut app = app_with_results(1);
+        app.ownership.insert(1, Vec::new());
+        app.request_release(1);
+        assert_eq!(app.worker.pending(), 1);
+    }
+
+    #[test]
+    fn selecting_beyond_the_prefetched_results_waits_for_the_debounce() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_results(8);
+        app.prefetch_results();
+        app.selected_result = Some(6);
+        app.sync_selection(&ctx);
+        assert!(!app.requested.contains(&7), "still settling");
+        app.selection_changed = Instant::now() - SELECTION_DEBOUNCE * 2;
+        app.sync_selection(&ctx);
+        assert!(app.requested.contains(&7));
+    }
+
+    #[test]
+    fn prefetched_selection_needs_no_extra_request() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_results(3);
+        app.prefetch_results();
+        let before = app.worker.pending();
+        app.selected_result = Some(2);
+        app.selection_changed = Instant::now() - SELECTION_DEBOUNCE * 2;
+        app.sync_selection(&ctx);
+        assert_eq!(app.worker.pending(), before);
+    }
+
+    #[test]
+    fn reload_refetches_a_release() {
+        let mut app = app_with_results(2);
+        app.selected_result = Some(0);
+        app.prefetch_results();
+        app.ownership.insert(1, Vec::new());
+        let before = app.worker.pending();
+        app.reload_selected_release();
+        assert_eq!(
+            app.worker.pending(),
+            before + 1,
+            "only the release, ownership is known"
+        );
+    }
+
+    #[test]
+    fn selected_release_follows_the_selection() {
+        let mut app = app_with_results(2);
+        app.releases.insert(2, Release::default());
+        app.selected_result = Some(0);
+        assert!(app.selected_release().is_none());
+        app.selected_result = Some(1);
+        assert!(app.selected_release().is_some());
+    }
 
     #[test]
     fn step_moves_within_bounds() {
