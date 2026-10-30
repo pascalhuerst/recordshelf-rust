@@ -26,6 +26,7 @@ struct PanelKey {
     height_centi_mm: u32,
     qr: bool,
     tags: String,
+    hidden: Vec<String>,
 }
 
 /// What to draw: the picture, its size on the screen in points, and a caption.
@@ -39,6 +40,8 @@ pub(super) struct LabelView {
     pub code_choice: String,
     /// Whether the record has any styles to show as tags.
     pub has_tags: bool,
+    /// Names of the parts left out.
+    pub hidden: Vec<String>,
 }
 
 /// A change made with the toggles beside the picture.
@@ -46,6 +49,8 @@ pub(super) struct LabelView {
 pub(super) struct LabelAction {
     pub tags: Option<String>,
     pub code: Option<String>,
+    /// A part to switch on or off: (name, shown).
+    pub part: Option<(String, bool)>,
 }
 
 /// Space around the label panel, in points.
@@ -154,6 +159,7 @@ impl RecordShelfApp {
             CodeKind::Barcode
         });
         options.tag_style = tag_style;
+        options.parts = settings.label_parts();
         label::render_with(content, size, &options)
     }
 
@@ -167,6 +173,7 @@ impl RecordShelfApp {
             height_centi_mm: (s.label_height_mm * 100.0).round() as u32,
             qr: s.label_code == "qr",
             tags: s.label_tags.clone(),
+            hidden: s.label_hidden.clone(),
         }
     }
 
@@ -246,6 +253,7 @@ impl RecordShelfApp {
             tags_choice: self.settings.label_tags.clone(),
             code_choice: self.settings.label_code.clone(),
             has_tags: !p.content.tags.is_empty(),
+            hidden: self.settings.label_hidden.clone(),
         })
     }
 
@@ -317,6 +325,17 @@ pub(super) fn draw_label_panel(ui: &mut egui::Ui, view: &LabelView) -> LabelActi
                     if view.tags_choice != "off" && !view.has_tags {
                         ui.label(RichText::new("(this record has no styles)").small().weak());
                     }
+                    ui.add_space(4.0);
+                    ui.label("Show:");
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, title) in label::PARTS {
+                            let mut shown = !view.hidden.iter().any(|h| h == name);
+                            if ui.checkbox(&mut shown, title).changed() {
+                                action.part = Some((name.to_string(), shown));
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
                     action.code = choose(
                         ui,
                         "Code",
@@ -342,14 +361,22 @@ impl RecordShelfApp {
         if let Some(code) = &action.code {
             self.settings.label_code = code.clone();
         }
-        let (tags, code) = (
+        if let Some((name, shown)) = &action.part {
+            self.settings.label_hidden.retain(|h| h != name);
+            if !shown {
+                self.settings.label_hidden.push(name.clone());
+            }
+        }
+        let (tags, code, hidden) = (
             self.settings.label_tags.clone(),
             self.settings.label_code.clone(),
+            self.settings.label_hidden.clone(),
         );
         if let Some(path) = &self.config_path
             && let Err(err) = Settings::update_on_disk(path, |s| {
                 s.label_tags = tags;
                 s.label_code = code;
+                s.label_hidden = hidden;
             })
         {
             self.set_error(format!("{err:#}"));
@@ -881,15 +908,48 @@ mod tests {
         app.apply_label_action(LabelAction {
             tags: Some("filled".into()),
             code: Some("qr".into()),
+            part: Some(("tracks".into(), false)),
         });
+        assert_eq!(app.settings.label_hidden, ["tracks"]);
+        assert!(!app.settings.label_parts().tracks);
         assert_eq!(app.settings.label_tags, "filled");
         assert_eq!(app.settings.label_code, "qr");
         let saved = Settings::load(&path).unwrap();
         assert_eq!(saved.label_tags, "filled");
         assert_eq!(saved.label_code, "qr");
         assert_eq!(saved.token, "keep");
+        assert_eq!(saved.label_hidden, ["tracks"]);
+        app.apply_label_action(LabelAction {
+            part: Some(("tracks".into(), true)),
+            ..LabelAction::default()
+        });
+        assert!(app.settings.label_hidden.is_empty());
+        app.apply_label_action(LabelAction {
+            tags: Some("filled".into()),
+            ..LabelAction::default()
+        });
         app.apply_label_action(LabelAction::default());
         assert_eq!(app.settings.label_tags, "filled");
+    }
+
+    #[test]
+    fn leaving_a_part_out_redraws_the_picture() {
+        let mut app = collection_app();
+        app.collection.details = Some(long_record());
+        let bitmap = |app: &RecordShelfApp| {
+            app.render_label_bitmap(&crate::label::sample_content(), None)
+                .unwrap()
+        };
+        let full = bitmap(&app);
+        app.apply_label_action(LabelAction {
+            part: Some(("artist".into(), false)),
+            ..LabelAction::default()
+        });
+        assert_ne!(bitmap(&app).as_raw(), full.as_raw());
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        assert!(texts.iter().any(|(t, _)| t == "Artist"), "checkbox shown");
+        assert!(app.label_panel.as_ref().unwrap().key.hidden == ["artist"]);
     }
 
     #[test]

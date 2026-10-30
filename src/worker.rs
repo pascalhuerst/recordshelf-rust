@@ -281,6 +281,8 @@ pub struct PrintJob {
     pub code: CodeKind,
     /// Draw the styles as tags (`None`: no tags).
     pub tag_style: Option<crate::label::TagStyle>,
+    /// Which parts of the label are drawn.
+    pub parts: crate::label::LabelParts,
 }
 
 impl PrintJob {
@@ -289,6 +291,7 @@ impl PrintJob {
         let size = LabelSize::from_mm(self.width_mm, self.height_mm);
         let mut options = LabelOptions::new(self.code);
         options.tag_style = self.tag_style;
+        options.parts = self.parts;
         let img = label::render_with(&self.content, size, &options)?;
         let job = JobOptions {
             darkness: Some(self.darkness),
@@ -873,6 +876,7 @@ mod tests {
             speed_ips: 3,
             code: CodeKind::Barcode,
             tag_style: None,
+            parts: Default::default(),
         }
     }
 

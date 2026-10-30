@@ -434,6 +434,51 @@ fn barcode(id: u32, module: u32, height: u32) -> Result<CodeBitmap> {
     })
 }
 
+/// The parts of a label that can be left out: (name in the settings, name to show).
+pub const PARTS: [(&str, &str); 5] = [
+    ("header", "Size, label, cat. no."),
+    ("artist", "Artist"),
+    ("title", "Title"),
+    ("tracks", "Tracks"),
+    ("code", "Code"),
+];
+
+/// Which parts of a label are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelParts {
+    pub header: bool,
+    pub artist: bool,
+    pub title: bool,
+    pub tracks: bool,
+    pub code: bool,
+}
+
+impl Default for LabelParts {
+    fn default() -> Self {
+        Self {
+            header: true,
+            artist: true,
+            title: true,
+            tracks: true,
+            code: true,
+        }
+    }
+}
+
+impl LabelParts {
+    /// Everything except the parts named in `hidden` (unknown names are ignored).
+    pub fn without(hidden: &[String]) -> Self {
+        let shown = |name: &str| !hidden.iter().any(|h| h == name);
+        Self {
+            header: shown("header"),
+            artist: shown("artist"),
+            title: shown("title"),
+            tracks: shown("tracks"),
+            code: shown("code"),
+        }
+    }
+}
+
 /// How the code is drawn, besides its kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelOptions {
@@ -446,6 +491,8 @@ pub struct LabelOptions {
     pub caption: Option<String>,
     /// Draw genres and styles as tags in this style (`None`: no tags).
     pub tag_style: Option<TagStyle>,
+    /// Which parts are drawn.
+    pub parts: LabelParts,
 }
 
 impl LabelOptions {
@@ -456,6 +503,7 @@ impl LabelOptions {
             barcode_module: 2,
             caption: None,
             tag_style: None,
+            parts: LabelParts::default(),
         }
     }
 }
@@ -614,16 +662,17 @@ pub fn render_with(
     };
 
     // Header: size on the left, label / catalog number on the right.
+    let parts = options.parts;
     let header_px = 21.0;
     let size_text = content
         .size_inch
         .map(|s| format!("{s}\""))
         .unwrap_or_default();
     let size_width = text_width(&fonts.bold, header_px, &size_text);
-    if !size_text.is_empty() {
+    if parts.header && !size_text.is_empty() {
         draw_text(&mut img, &fonts.bold, header_px, left, y, &size_text);
     }
-    if !(content.label.is_empty() && content.catno.is_empty()) {
+    if parts.header && !(content.label.is_empty() && content.catno.is_empty()) {
         let room = inner_width - size_width - 12.0;
         let (px, line) = fit_label_line(
             &fonts.regular,
@@ -643,17 +692,19 @@ pub fn render_with(
             &line,
         );
     }
-    y += header_px * 1.25 + 4.0;
+    if parts.header {
+        y += header_px * 1.25 + 4.0;
+    }
 
     // Artist: as large as fits on one line.
-    if !content.artist.is_empty() {
+    if parts.artist && !content.artist.is_empty() {
         let (px, line) = fit_line(&fonts.bold, 32.0, 20.0, &content.artist, inner_width);
         draw_text(&mut img, &fonts.bold, px, left, y, &line);
         y += px * 1.2 + 2.0;
     }
 
     // Title: up to two lines.
-    if !content.title.is_empty() {
+    if parts.title && !content.title.is_empty() {
         let px = 22.0;
         for line in wrap(&fonts.regular, px, &content.title, inner_width, 2) {
             draw_text(&mut img, &fonts.regular, px, left, y, &line);
@@ -671,19 +722,21 @@ pub fn render_with(
     }
 
     // Tracks: as many as fit above (and beside) the code.
+    let tracks: &[LabelTrack] = if parts.tracks { &content.tracks } else { &[] };
     let track_px: f32 = 19.0;
     let line_height = (track_px * 1.25).round();
-    let position_width = content
-        .tracks
+    let position_width = tracks
         .iter()
         .map(|t| text_width(&fonts.bold, track_px, &t.position))
         .fold(0.0, f32::max);
     let bottom = (size.height - MARGIN) as f32;
+    // without the code the whole height is free
+    let code_top = if parts.code { code_top } else { size.height };
     let code_top_f = code_top as f32;
     // (top, right edge) of every track line that fits
     let mut rows: Vec<(f32, f32)> = Vec::new();
     let mut row_y = y;
-    for _ in &content.tracks {
+    for _ in tracks {
         if row_y + line_height > bottom + 2.0 {
             break;
         }
@@ -702,12 +755,12 @@ pub fn render_with(
         rows.push((row_y, right_edge));
         row_y += line_height;
     }
-    let hidden = content.tracks.len() - rows.len();
+    let hidden = tracks.len() - rows.len();
     let marker = format!("+{hidden}");
     let marker_width = text_width(&fonts.bold, track_px, &marker);
     let title_x = left + position_width + 6.0;
     let last = rows.len().saturating_sub(1);
-    for (i, ((top, right_edge), track)) in rows.iter().zip(&content.tracks).enumerate() {
+    for (i, ((top, right_edge), track)) in rows.iter().zip(tracks).enumerate() {
         // tracks that did not fit are counted on the last line, not silently dropped
         let marker_here = hidden > 0 && i == last;
         let mut room = right_edge - title_x;
@@ -729,7 +782,9 @@ pub fn render_with(
         }
     }
 
-    code.draw(&mut img, code_left, code_top);
+    if parts.code {
+        code.draw(&mut img, code_left, code_top);
+    }
     if let Some(caption) = &options.caption {
         let px = 15.0;
         let top = (size.height - MARGIN) as f32 - px;
@@ -823,6 +878,75 @@ pub fn write_previews(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ink_in(img: &GrayImage, y0: u32, y1: u32) -> usize {
+        (y0..y1.min(img.height()))
+            .flat_map(|y| (0..img.width()).map(move |x| (x, y)))
+            .filter(|&(x, y)| img.get_pixel(x, y).0[0] < 128)
+            .count()
+    }
+
+    fn render_without(part: &str, kind: CodeKind) -> GrayImage {
+        let mut options = LabelOptions::new(kind);
+        options.parts = LabelParts::without(&[part.to_string()]);
+        render_with(&sample_content(), SIZE_TEST, &options).unwrap()
+    }
+
+    #[test]
+    fn every_part_can_be_left_out() {
+        for kind in [CodeKind::Barcode, CodeKind::Qr] {
+            let full = render_with(&sample_content(), SIZE_TEST, &LabelOptions::new(kind)).unwrap();
+            for (name, _) in PARTS {
+                let img = render_without(name, kind);
+                assert!(
+                    ink_in(&img, 0, img.height()) < ink_in(&full, 0, full.height()),
+                    "{name} ({kind:?}) leaves something out"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaving_out_a_part_keeps_the_others() {
+        let no_code = render_without("code", CodeKind::Barcode);
+        assert_eq!(decode(&no_code), None, "no code to read");
+        let with_code = render_with(
+            &sample_content(),
+            SIZE_TEST,
+            &LabelOptions::new(CodeKind::Barcode),
+        )
+        .unwrap();
+        // the top of the label is the same: the header, artist and title stay
+        assert_eq!(ink_in(&no_code, 0, 120), ink_in(&with_code, 0, 120));
+        // without the header everything moves up, so the title is higher
+        let no_header = render_without("header", CodeKind::Barcode);
+        assert_ne!(ink_in(&no_header, 0, 40), ink_in(&with_code, 0, 40));
+    }
+
+    #[test]
+    fn without_the_code_the_tracks_may_use_the_room() {
+        let mut content = sample_content();
+        content.tracks = (1..=12)
+            .map(|i| LabelTrack {
+                position: format!("A{i}"),
+                title: format!("Track {i}"),
+            })
+            .collect();
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        let with = render_with(&content, SIZE_TEST, &options).unwrap();
+        options.parts.code = false;
+        let without = render_with(&content, SIZE_TEST, &options).unwrap();
+        // more track lines fit: the lowest left corner (beside the barcode) is
+        // empty with the code, and holds a track position without it
+        let corner = |img: &GrayImage| {
+            (270..296u32)
+                .flat_map(|y| (MARGIN..MARGIN + 30).map(move |x| (x, y)))
+                .filter(|&(x, y)| img.get_pixel(x, y).0[0] < 128)
+                .count()
+        };
+        assert_eq!(corner(&with), 0);
+        assert!(corner(&without) > 0);
+    }
 
     const SIZE_REAL: LabelSize = LabelSize {
         width: 416,

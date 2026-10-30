@@ -2082,6 +2082,7 @@ impl RecordShelfApp {
                 CodeKind::Barcode
             },
             tag_style: settings.tag_style(),
+            parts: settings.label_parts(),
         }
     }
 
@@ -4436,6 +4437,19 @@ mod tests {
     }
 
     // --- style tags on the label -----------------------------------------------------------
+
+    #[test]
+    fn the_hidden_label_parts_go_into_the_print_job() {
+        let mut app = app_with_results(0);
+        let content = crate::label::sample_content();
+        assert_eq!(
+            app.print_job(content.clone()).parts,
+            crate::label::LabelParts::default()
+        );
+        app.settings.label_hidden = vec!["tracks".into()];
+        let parts = app.print_job(content).parts;
+        assert!(!parts.tracks && parts.title);
+    }
 
     #[test]
     fn the_tag_style_of_the_settings_goes_into_the_print_job() {

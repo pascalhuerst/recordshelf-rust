@@ -42,6 +42,8 @@ pub struct Settings {
     pub label_code: String,
     /// Styles as tags on the label: "off", "outline" or "filled"
     pub label_tags: String,
+    /// Parts of the label that are left out: "header", "artist", "title", "tracks", "code"
+    pub label_hidden: Vec<String>,
     /// How many screen points make an inch, for the label preview at real size (96 is usual)
     pub preview_ppi: f32,
     /// PostgreSQL connection string of our own database (written by `db/db.sh bootstrap`)
@@ -78,6 +80,7 @@ impl Default for Settings {
             label_height_mm: 38.0,
             label_code: "barcode".to_string(),
             label_tags: "off".to_string(),
+            label_hidden: Vec::new(),
             preview_ppi: 96.0,
             database_url: String::new(),
             library_auto_sync: true,
@@ -191,7 +194,20 @@ impl Settings {
             "filled" => "filled".to_string(),
             _ => "off".to_string(),
         };
+        let mut hidden: Vec<String> = Vec::new();
+        for name in &self.label_hidden {
+            let name = name.trim().to_lowercase();
+            if crate::label::PARTS.iter().any(|(n, _)| *n == name) && !hidden.contains(&name) {
+                hidden.push(name);
+            }
+        }
+        self.label_hidden = hidden;
         self
+    }
+
+    /// Which parts of the label are drawn.
+    pub fn label_parts(&self) -> crate::label::LabelParts {
+        crate::label::LabelParts::without(&self.label_hidden)
     }
 
     /// How the styles are drawn on the label, if at all.
@@ -212,6 +228,27 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_label_parts_are_cleaned_up() {
+        let s = Settings {
+            label_hidden: vec![
+                " Tracks ".into(),
+                "bogus".into(),
+                "tracks".into(),
+                "code".into(),
+            ],
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(s.label_hidden, ["tracks", "code"]);
+        let parts = s.label_parts();
+        assert!(!parts.tracks && !parts.code && parts.header && parts.artist && parts.title);
+        assert_eq!(
+            Settings::default().label_parts(),
+            crate::label::LabelParts::default()
+        );
+    }
 
     #[test]
     fn missing_file_gives_defaults() {
