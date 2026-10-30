@@ -608,11 +608,20 @@ impl RecordShelfApp {
         let mut action = None;
         let (mut edit, mut delete) = (false, false);
         ui.horizontal(|ui| {
-            if ui.button("Print label  [P]").clicked() {
-                action = Some(Command::Print);
-            }
-            if ui.button("Label preview  [Shift+P]").clicked() {
-                action = Some(Command::Preview);
+            // while Shift is held, the button shows (and does) its shifted function
+            let shift = ui.input(|i| i.modifiers.shift);
+            let print = if shift {
+                Command::Preview
+            } else {
+                Command::Print
+            };
+            let text = if shift {
+                "Label preview  [Shift+P]"
+            } else {
+                "Print label  [P]"
+            };
+            if ui.button(text).clicked() {
+                action = Some(print);
             }
             if ui.button("Open in browser  [O]").clicked() {
                 action = Some(Command::Open);

@@ -59,6 +59,15 @@ impl Command {
         )
     }
 
+    /// What the button of this command does while Shift is held (and so what it
+    /// shows then). The shifted command has no button of its own.
+    pub fn shifted(self) -> Option<Command> {
+        match self {
+            Command::Print => Some(Command::Preview),
+            _ => None,
+        }
+    }
+
     /// Whether the key has to be pressed together with Shift.
     pub fn needs_shift(self) -> bool {
         matches!(self, Command::Preview)
@@ -357,5 +366,26 @@ mod tests {
         );
         // absurd counts do not overflow
         assert_eq!(decide_sync(100_000, 0, false), Save(u16::MAX));
+    }
+
+    #[test]
+    fn every_shift_command_belongs_to_a_plain_one() {
+        for cmd in Command::ALL {
+            if cmd.needs_shift() {
+                let owners: Vec<_> = Command::ALL
+                    .iter()
+                    .filter(|c| c.shifted() == Some(cmd))
+                    .collect();
+                assert_eq!(
+                    owners.len(),
+                    1,
+                    "{cmd:?} is the shifted form of exactly one button"
+                );
+                assert_eq!(owners[0].key(), cmd.key(), "on the same key");
+            }
+        }
+        assert_eq!(Command::Print.shifted(), Some(Command::Preview));
+        assert_eq!(Command::Add.shifted(), None);
+        assert_eq!(Command::Preview.shifted(), None);
     }
 }

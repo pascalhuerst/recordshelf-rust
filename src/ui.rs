@@ -2165,9 +2165,20 @@ impl RecordShelfApp {
             .is_some_and(|copies| !copies.is_empty());
         let library_off = self.library_link == LibraryLink::Off;
         let auto_sync = self.settings.library_auto_sync;
+        // while Shift is held, a button shows (and does) its shifted function
+        let shift = ui.input(|i| i.modifiers.shift);
         let mut clicked = None;
         ui.horizontal(|ui| {
-            for cmd in Command::ALL {
+            for base in Command::ALL {
+                // shifted commands have no button of their own
+                if base.needs_shift() {
+                    continue;
+                }
+                let cmd = if shift {
+                    base.shifted().unwrap_or(base)
+                } else {
+                    base
+                };
                 // the label button only appears for records we own
                 if cmd.needs_ownership() && !owned {
                     continue;

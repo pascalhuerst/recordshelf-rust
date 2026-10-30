@@ -748,4 +748,202 @@ mod tests {
             "the texture was made again"
         );
     }
+
+    // --- the button shows its shifted function while Shift is held ------------------------------
+
+    fn collect_texts(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                let center = text.pos + text.galley.rect.center().to_vec2();
+                out.push((text.galley.text().to_string(), center));
+            }
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_texts(s, out)),
+            _ => {}
+        }
+    }
+
+    /// One frame with the given events; returns what was drawn (text and its
+    /// centre) and the command the Add tab's button bar reported as clicked.
+    fn bar_frame(
+        app: &mut RecordShelfApp,
+        shift: bool,
+        events: Vec<egui::Event>,
+        bar: bool,
+    ) -> (Vec<(String, egui::Pos2)>, Option<Command>) {
+        let modifiers = if shift {
+            egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::NONE
+        };
+        let raw = egui::RawInput {
+            modifiers,
+            events,
+            ..Default::default()
+        };
+        let ctx = app.repaint.clone();
+        let mut clicked = None;
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if bar {
+                    clicked = app.command_bar(ui);
+                } else {
+                    app.ui_collection(ui);
+                }
+            });
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        (texts, clicked)
+    }
+
+    fn click_events(pos: egui::Pos2, shift: bool) -> Vec<egui::Event> {
+        let modifiers = if shift {
+            egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::NONE
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+    }
+
+    fn position_of(texts: &[(String, egui::Pos2)], needle: &str) -> egui::Pos2 {
+        texts
+            .iter()
+            .find(|(t, _)| t.contains(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{needle:?} is not drawn: {:?}",
+                    texts.iter().map(|t| &t.0).collect::<Vec<_>>()
+                )
+            })
+            .1
+    }
+
+    fn has(texts: &[(String, egui::Pos2)], needle: &str) -> bool {
+        texts.iter().any(|(t, _)| t.contains(needle))
+    }
+
+    fn owned_app() -> RecordShelfApp {
+        let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1)]);
+        app.releases.insert(1, crate::discogs::Release::default());
+        app
+    }
+
+    #[test]
+    fn without_shift_the_button_prints_and_there_is_no_preview_button() {
+        let mut app = owned_app();
+        let (texts, _) = bar_frame(&mut app, false, vec![], true);
+        assert!(has(&texts, "Print label  [P]"));
+        assert!(
+            !has(&texts, "Label preview"),
+            "no button of its own for the preview"
+        );
+        assert!(!has(&texts, "Shift+P"));
+        assert!(has(&texts, "Remove  [R]") && has(&texts, "Move  [M]") && has(&texts, "Quit  [Q]"));
+    }
+
+    #[test]
+    fn with_shift_only_that_button_changes_its_text() {
+        let mut app = owned_app();
+        let (plain, _) = bar_frame(&mut app, false, vec![], true);
+        let (shifted, _) = bar_frame(&mut app, true, vec![], true);
+        assert!(has(&shifted, "Label preview  [Shift+P]"));
+        assert!(!has(&shifted, "Print label"));
+        let names = |texts: &[(String, egui::Pos2)]| -> Vec<String> {
+            texts
+                .iter()
+                .map(|(t, _)| t.clone())
+                .filter(|t| t.contains('['))
+                .collect()
+        };
+        let (a, b) = (names(&plain), names(&shifted));
+        assert_eq!(a.len(), b.len(), "the same buttons: {a:?} / {b:?}");
+        let differing: Vec<_> = a.iter().zip(&b).filter(|(x, y)| x != y).collect();
+        assert_eq!(differing.len(), 1, "only one button differs: {differing:?}");
+    }
+
+    #[test]
+    fn the_preview_is_offered_with_shift_even_when_the_release_is_not_owned() {
+        let mut app = owned_app();
+        app.ownership.insert(1, Vec::new());
+        let (plain, _) = bar_frame(&mut app, false, vec![], true);
+        assert!(
+            !has(&plain, "Print label") && !has(&plain, "Label preview"),
+            "nothing to print for a release we do not own"
+        );
+        let (shifted, _) = bar_frame(&mut app, true, vec![], true);
+        assert!(has(&shifted, "Label preview  [Shift+P]"));
+    }
+
+    #[test]
+    fn clicking_the_button_does_what_it_shows() {
+        let mut app = owned_app();
+        let (texts, _) = bar_frame(&mut app, false, vec![], true);
+        let (_, clicked) = bar_frame(
+            &mut app,
+            false,
+            click_events(position_of(&texts, "Print label"), false),
+            true,
+        );
+        assert_eq!(clicked, Some(Command::Print));
+
+        let (texts, _) = bar_frame(&mut app, true, vec![], true);
+        let (_, clicked) = bar_frame(
+            &mut app,
+            true,
+            click_events(position_of(&texts, "Label preview"), true),
+            true,
+        );
+        assert_eq!(clicked, Some(Command::Preview));
+    }
+
+    #[test]
+    fn the_collection_tab_button_changes_with_shift_too() {
+        let mut app = collection_app();
+        let (plain, _) = bar_frame(&mut app, false, vec![], false);
+        assert!(
+            has(&plain, "Print label  [P]") && !has(&plain, "Label preview"),
+            "{:?}",
+            plain.iter().map(|t| &t.0).collect::<Vec<_>>()
+        );
+        assert!(
+            has(&plain, "Open in browser  [O]")
+                && has(&plain, "Edit notes  [E]")
+                && has(&plain, "Delete  [D]")
+        );
+        let (shifted, _) = bar_frame(&mut app, true, vec![], false);
+        assert!(has(&shifted, "Label preview  [Shift+P]") && !has(&shifted, "Print label"));
+        assert!(
+            has(&shifted, "Open in browser  [O]"),
+            "the other buttons stay"
+        );
+        // a click with Shift held opens the preview, without Shift it prints
+        let before = app.worker.pending();
+        let (_, _) = bar_frame(
+            &mut app,
+            true,
+            click_events(position_of(&shifted, "Label preview"), true),
+            false,
+        );
+        assert!(app.label_preview.is_some());
+        assert_eq!(app.worker.pending(), before, "nothing was printed");
+        app.label_preview = None;
+        let (texts, _) = bar_frame(&mut app, false, vec![], false);
+        let (_, _) = bar_frame(
+            &mut app,
+            false,
+            click_events(position_of(&texts, "Print label"), false),
+            false,
+        );
+        assert!(app.label_preview.is_none());
+        assert_eq!(app.worker.pending(), before + 1, "the click printed");
+    }
 }
