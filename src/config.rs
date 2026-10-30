@@ -44,6 +44,10 @@ pub struct Settings {
     pub database_url: String,
     /// Keep our database in line with the Discogs collection automatically (key U switches)
     pub library_auto_sync: bool,
+    /// With --shop-bridge: open the shop pages (decks.de, hhv.de) in the browser at the start
+    pub shop_open_tabs: bool,
+    /// Browser command for those pages (empty: the system's default browser)
+    pub shop_browser: String,
     /// Settings this version does not know (hand written, or from a newer
     /// version) are kept when saving instead of being dropped.
     #[serde(flatten)]
@@ -71,6 +75,8 @@ impl Default for Settings {
             label_code: "barcode".to_string(),
             database_url: String::new(),
             library_auto_sync: true,
+            shop_open_tabs: true,
+            shop_browser: String::new(),
             extra: std::collections::BTreeMap::new(),
         }
     }
@@ -155,6 +161,7 @@ impl Settings {
             &mut self.device_path,
             &mut self.printer_host,
             &mut self.database_url,
+            &mut self.shop_browser,
         ] {
             *text = text.trim().to_string();
         }

@@ -39,6 +39,21 @@ enum Tab {
     Collection,
 }
 
+/// Opens a web page in the browser: the URL and, optionally, the browser command.
+type UrlOpener = Box<dyn FnMut(&str, Option<&str>) -> std::io::Result<()>>;
+
+/// The system's default browser, or the given command.
+fn system_opener(url: &str, browser: Option<&str>) -> std::io::Result<()> {
+    match browser {
+        Some(browser) => open::with_detached(url, browser),
+        None => open::that_detached(url),
+    }
+}
+
+/// How long the app waits for already open shop tabs to report in before it
+/// opens the missing ones.
+const SHOP_TABS_DELAY: Duration = Duration::from_secs(3);
+
 /// How far the connection to our own database is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LibraryLink {
@@ -121,6 +136,10 @@ pub struct RecordShelfApp {
     scanner_stop: Arc<AtomicBool>,
     scanner_rx: Receiver<ScanEvent>,
     scanner_status: String,
+    /// Opens the shop pages (replaced in tests).
+    url_opener: UrlOpener,
+    /// When the shop pages are to be opened, if still to be done.
+    shop_tabs_due: Option<Instant>,
     /// A scanner thread is listening to a device.
     scanner_running: bool,
     scanner_next_try: Instant,
@@ -192,6 +211,8 @@ impl RecordShelfApp {
             scanner_stop,
             scanner_rx,
             scanner_status,
+            url_opener: Box::new(system_opener),
+            shop_tabs_due: None,
             scanner_running,
             scanner_next_try: Instant::now() + SCANNER_RETRY,
             notice: None,
@@ -615,8 +636,52 @@ impl RecordShelfApp {
                     "shop bridge on 127.0.0.1:{port}; install userscript {}",
                     script_path.display()
                 ));
+                if self.settings.shop_open_tabs {
+                    // tabs that are open already report in within a second: give them time
+                    self.shop_tabs_due = Some(Instant::now() + SHOP_TABS_DELAY);
+                }
             }
             Err(err) => self.set_error(format!("shop bridge: {err:#}")),
+        }
+    }
+
+    /// Opens the shop pages that have no connected tab yet in the browser, so the
+    /// userscript can run there. Pages that are open already are left alone.
+    fn open_shop_tabs(&mut self) {
+        let Some(state) = &self.bridge else {
+            return;
+        };
+        let missing: Vec<Shop> = Shop::BROWSER
+            .into_iter()
+            .filter(|shop| !state.bridge.connected(*shop))
+            .collect();
+        if missing.is_empty() {
+            self.set_info("The shop tabs are already connected".to_string());
+            return;
+        }
+        let browser = Some(self.settings.shop_browser.trim())
+            .filter(|b| !b.is_empty())
+            .map(str::to_string);
+        let (mut opened, mut failed) = (Vec::new(), Vec::new());
+        for shop in missing {
+            let Some(url) = shop.tab_url() else {
+                continue;
+            };
+            match (self.url_opener)(url, browser.as_deref()) {
+                Ok(()) => opened.push(shop.name()),
+                Err(err) => failed.push(format!("{url}: {err}")),
+            }
+        }
+        if !failed.is_empty() {
+            self.set_error(format!(
+                "Could not open in the browser: {}",
+                failed.join("; ")
+            ));
+        } else {
+            self.set_info(format!(
+                "Opened {} in the browser; pass the site's check there, the userscript does the rest",
+                opened.join(" and ")
+            ));
         }
     }
 
@@ -1075,6 +1140,27 @@ impl RecordShelfApp {
                             });
                         ui.label(
                             RichText::new("Printing is switched off while the host is empty.").small(),
+                        );
+
+                        ui.add_space(8.0);
+                        ui.heading("Shop bridge");
+                        ui.checkbox(
+                            &mut draft.shop_open_tabs,
+                            "Open the decks.de and hhv.de pages in the browser when started with --shop-bridge",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Browser:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.shop_browser)
+                                    .hint_text("empty: the default browser, or e.g. chromium")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Use the browser that has the userscript manager. deejay.de needs no tab.",
+                            )
+                            .small(),
                         );
 
                         ui.add_space(8.0);
@@ -2088,6 +2174,15 @@ impl eframe::App for RecordShelfApp {
         self.drain_events();
         self.sync_selection(ctx);
         self.retry_scanner(ctx);
+        if let Some(due) = self.shop_tabs_due {
+            let now = Instant::now();
+            if now >= due {
+                self.shop_tabs_due = None;
+                self.open_shop_tabs();
+            } else {
+                ctx.request_repaint_after(due - now);
+            }
+        }
         self.persist_zoom(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -4084,5 +4179,165 @@ mod tests {
             app.scanner_status
         );
         assert!(!app.scanner_running);
+    }
+
+    // --- opening the shop pages ---------------------------------------------------------
+
+    type OpenLog = std::rc::Rc<std::cell::RefCell<Vec<(String, Option<String>)>>>;
+
+    fn app_with_recording_browser() -> (RecordShelfApp, OpenLog) {
+        let mut app = app_with_results(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bridge = Bridge::spawn(0, "t".into(), tx, egui::Context::default()).unwrap();
+        app.bridge = Some(BridgeState { bridge, rx });
+        let log: OpenLog = Default::default();
+        let sink = log.clone();
+        app.url_opener = Box::new(move |url, browser| {
+            sink.borrow_mut()
+                .push((url.to_string(), browser.map(str::to_string)));
+            Ok(())
+        });
+        (app, log)
+    }
+
+    #[test]
+    fn both_browser_shop_pages_are_opened_when_nothing_is_connected() {
+        let (mut app, log) = app_with_recording_browser();
+        app.open_shop_tabs();
+        let urls: Vec<String> = log.borrow().iter().map(|(u, _)| u.clone()).collect();
+        assert_eq!(urls, ["https://www.decks.de/decks/", "https://www.hhv.de/"]);
+        assert!(
+            log.borrow().iter().all(|(_, b)| b.is_none()),
+            "the default browser"
+        );
+        let notice = app.notice.as_ref().unwrap();
+        assert!(
+            !notice.is_error && notice.text.contains("decks.de and hhv.de"),
+            "{}",
+            notice.text
+        );
+    }
+
+    #[test]
+    fn deejay_needs_no_page() {
+        let (mut app, log) = app_with_recording_browser();
+        app.open_shop_tabs();
+        assert!(!log.borrow().iter().any(|(u, _)| u.contains("deejay")));
+    }
+
+    #[test]
+    fn a_tab_that_is_already_connected_is_not_opened_again() {
+        let (mut app, log) = app_with_recording_browser();
+        // the hhv.de tab polls the bridge
+        app.bridge
+            .as_ref()
+            .unwrap()
+            .bridge
+            .handle("GET", "/pending?token=t&shop=hhv", "");
+        app.open_shop_tabs();
+        let urls: Vec<String> = log.borrow().iter().map(|(u, _)| u.clone()).collect();
+        assert_eq!(urls, ["https://www.decks.de/decks/"]);
+        // all connected: nothing at all
+        log.borrow_mut().clear();
+        app.bridge
+            .as_ref()
+            .unwrap()
+            .bridge
+            .handle("GET", "/pending?token=t&shop=decks", "");
+        app.open_shop_tabs();
+        assert!(log.borrow().is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("already connected"))
+        );
+    }
+
+    #[test]
+    fn the_configured_browser_is_used() {
+        let (mut app, log) = app_with_recording_browser();
+        app.settings.shop_browser = "  chromium ".into();
+        app.open_shop_tabs();
+        assert!(
+            log.borrow()
+                .iter()
+                .all(|(_, b)| b.as_deref() == Some("chromium")),
+            "{:?}",
+            log.borrow()
+        );
+    }
+
+    #[test]
+    fn a_browser_that_cannot_be_started_is_reported() {
+        let (mut app, _log) = app_with_recording_browser();
+        app.url_opener = Box::new(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such browser",
+            ))
+        });
+        app.open_shop_tabs();
+        let notice = app.notice.as_ref().unwrap();
+        assert!(
+            notice.is_error
+                && notice.text.contains("no such browser")
+                && notice.text.contains("decks.de"),
+            "{}",
+            notice.text
+        );
+    }
+
+    #[test]
+    fn nothing_is_opened_without_the_bridge() {
+        let mut app = app_with_results(0);
+        let log: OpenLog = Default::default();
+        let sink = log.clone();
+        app.url_opener = Box::new(move |u, b| {
+            sink.borrow_mut()
+                .push((u.to_string(), b.map(str::to_string)));
+            Ok(())
+        });
+        app.open_shop_tabs();
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn starting_the_bridge_schedules_the_pages_unless_switched_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut app = app_with_results(0);
+        app.config_path = Some(dir.path().join("config.toml"));
+        app.settings.shop_open_tabs = true;
+        app.start_bridge(port);
+        let due = app.shop_tabs_due.expect("scheduled");
+        assert!(
+            due > Instant::now(),
+            "a moment is left for open tabs to report in"
+        );
+
+        let port2 = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut app = app_with_results(0);
+        app.config_path = Some(dir.path().join("config.toml"));
+        app.settings.shop_open_tabs = false;
+        app.start_bridge(port2);
+        assert!(app.shop_tabs_due.is_none());
+    }
+
+    #[test]
+    fn the_shop_browser_is_saved_from_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings_draft.shop_browser = "  firefox ".into();
+        app.settings_draft.shop_open_tabs = false;
+        app.save_settings();
+        let saved = Settings::load(&dir.path().join("config.toml")).unwrap();
+        assert_eq!(saved.shop_browser, "firefox");
+        assert!(!saved.shop_open_tabs);
     }
 }

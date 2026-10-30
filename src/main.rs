@@ -100,6 +100,10 @@ pub struct Args {
     #[arg(long, visible_alias = "decks-bridge")]
     pub shop_bridge: bool,
 
+    /// Do not open the shop pages in the browser at the start (for this run)
+    #[arg(long)]
+    pub no_shop_tabs: bool,
+
     /// Port of the shop bridge
     #[arg(long, visible_alias = "decks-port", default_value_t = shop_bridge::DEFAULT_PORT)]
     pub shop_port: u16,
@@ -108,6 +112,9 @@ pub struct Args {
 impl Args {
     /// Applies command line overrides on top of loaded settings.
     pub fn apply_to(&self, settings: &mut Settings) {
+        if self.no_shop_tabs {
+            settings.shop_open_tabs = false;
+        }
         let overrides = [
             (&self.device, &mut settings.device_path),
             (&self.device_name, &mut settings.device_name),
@@ -339,5 +346,16 @@ mod tests {
     fn starts_fullscreen_unless_windowed_is_given() {
         assert!(!parse(&[]).windowed);
         assert!(parse(&["--windowed"]).windowed);
+    }
+
+    #[test]
+    fn the_command_line_can_switch_the_shop_pages_off_for_one_run() {
+        let mut settings = Settings::default();
+        assert!(settings.shop_open_tabs);
+        parse(&["--shop-bridge", "--no-shop-tabs"]).apply_to(&mut settings);
+        assert!(!settings.shop_open_tabs);
+        let mut settings = Settings::default();
+        parse(&["--shop-bridge"]).apply_to(&mut settings);
+        assert!(settings.shop_open_tabs);
     }
 }

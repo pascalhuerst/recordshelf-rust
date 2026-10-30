@@ -26,6 +26,16 @@ impl Shop {
     /// The shops that need a browser tab (and the userscript).
     pub const BROWSER: [Shop; 2] = [Shop::Decks, Shop::Hhv];
 
+    /// The page to keep open in the browser for the userscript (it runs on pages
+    /// of the shop). `None` for shops that need no tab.
+    pub fn tab_url(self) -> Option<&'static str> {
+        match self {
+            Shop::Decks => Some("https://www.decks.de/decks/"),
+            Shop::Hhv => Some("https://www.hhv.de/"),
+            Shop::Deejay => None,
+        }
+    }
+
     /// Whether the page has to be fetched by a browser tab. Otherwise the app
     /// asks the shop itself.
     pub fn uses_browser(self) -> bool {
@@ -461,5 +471,25 @@ mod tests {
             "without an artist there is nothing to compare"
         );
         assert!(prefer_artist(Vec::new(), &e).is_empty());
+    }
+
+    #[test]
+    fn exactly_the_browser_shops_have_a_tab_to_open() {
+        for shop in Shop::ALL {
+            assert_eq!(shop.tab_url().is_some(), shop.uses_browser(), "{shop:?}");
+        }
+        // the userscript matches these pages
+        let script = crate::shop_bridge::userscript(1, "t");
+        for shop in Shop::BROWSER {
+            let url = shop.tab_url().unwrap();
+            let origin = &url[..url
+                .find('/')
+                .map(|_| url.match_indices('/').nth(2).unwrap().0)
+                .unwrap()];
+            assert!(
+                script.contains(&format!("// @match        {origin}/*")),
+                "{url} is not matched by the userscript"
+            );
+        }
     }
 }

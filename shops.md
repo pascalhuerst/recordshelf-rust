@@ -70,7 +70,7 @@ The QR reader types the URL like a keyboard, with Shift for `:` and `_` (US layo
 ## Setup
 1. `cargo run -- --shop-bridge` (port via `--shop-port`, default 47321; the old names `--decks-bridge`/`--decks-port` still work). The first run creates `~/.config/recordshelf/decks-token` (mode 0600; the name is historical, it is the bridge token for both shops) and writes `~/.config/recordshelf/recordshelf.user.js`.
 2. Install `recordshelf.user.js` in Tampermonkey (new script, paste contents). Replace an older "RecordShelf decks.de bridge" script: the new one serves both shops. Reinstall whenever the token or port changes or `USERSCRIPT_VERSION` is bumped.
-3. Open `https://www.decks.de/decks/` and/or `https://www.hhv.de/` in a tab, pass the bot check (accept cookies, browse a page) and keep the tab open.
+3. The app opens `https://www.decks.de/decks/` and `https://www.hhv.de/` in your browser about 3 seconds after it started (the default browser, or the command in the `shop_browser` setting; `--no-shop-tabs` or `shop_open_tabs = false` switches that off). Tabs that are open already and connected are not opened again. Pass the sites' checks there (accept cookies, browse a page) and keep the tabs open. deejay.de needs no tab. Use the browser that has the userscript manager: set `shop_browser` (e.g. `chromium`) if that is not your default.
 4. The status bar shows "decks.de: connected" / "hhv.de: connected" while a tab polls.
 
 ## Bridge API (127.0.0.1 only, every request needs `?token=`)
