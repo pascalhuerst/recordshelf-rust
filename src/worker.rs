@@ -13,7 +13,7 @@ use crate::discogs::{
     CollectionFolder, CollectionInstance, DiscogsClient, Release, SearchItem, SearchQuery,
 };
 use crate::label::{self, CodeKind, LabelContent, LabelOptions, LabelSize};
-use crate::library::{Entry, Library, RecordRow, StoredRelease};
+use crate::library::{AddOutcome, Entry, Library, RecordRow, StackEntry, StackInfo, StoredRelease};
 use crate::printer::{self, JobOptions, Printer};
 use crate::shop_bridge::ShopPage;
 use crate::shops::{Shop, ShopEntry, prefer_artist, search_plan};
@@ -52,6 +52,54 @@ pub enum LibraryRequest {
         image: Vec<u8>,
         source_url: String,
     },
+    /// Do something with the stacks; the answer lists them all again, and the
+    /// records of the stack `show` (or of the first one, if there is no such stack).
+    Stacks {
+        op: StackOp,
+        show: Option<i32>,
+    },
+}
+
+/// A change of the stacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StackOp {
+    /// Only look.
+    Load,
+    /// Start a new stack; it becomes the active one and is shown.
+    Create {
+        name: String,
+    },
+    /// Make a stack the active one, or none.
+    Activate(Option<i32>),
+    Rename {
+        id: i32,
+        name: String,
+    },
+    Delete(i32),
+    /// Put a record at the end of a stack.
+    Add {
+        stack: i32,
+        release: u32,
+    },
+    Remove {
+        stack: i32,
+        release: u32,
+    },
+    MoveTo {
+        stack: i32,
+        release: u32,
+        position: u32,
+    },
+}
+
+/// All stacks and the records of one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StackState {
+    pub stacks: Vec<StackInfo>,
+    /// The stack whose records are listed: (id, records in order).
+    pub shown: Option<(i32, Vec<StackEntry>)>,
+    /// What happened, in words.
+    pub note: Option<String>,
 }
 
 /// Bring one release in line with the Discogs collection.
@@ -111,6 +159,7 @@ pub enum LibraryResponse {
         ids: Vec<u32>,
         result: Result<Vec<(u32, Vec<u8>)>, String>,
     },
+    Stacks(Result<Box<StackState>, String>),
 }
 
 impl LibraryRequest {
@@ -261,8 +310,93 @@ impl LibraryState {
                 });
                 LibraryResponse::Cover { release_id, result }
             }
+            LibraryRequest::Stacks { op, show } => {
+                LibraryResponse::Stacks(self.connection().and_then(|l| {
+                    stack_op(l, op, show)
+                        .map(Box::new)
+                        .map_err(|e| format!("{e:#}"))
+                }))
+            }
         }
     }
+}
+
+/// Does one change of the stacks and reads the stacks again.
+fn stack_op(library: &mut Library, op: StackOp, show: Option<i32>) -> anyhow::Result<StackState> {
+    let mut show = show;
+    let name_of = |library: &mut Library, id: i32| -> String {
+        library
+            .list_stacks()
+            .ok()
+            .and_then(|all| all.into_iter().find(|s| s.id == id))
+            .map_or_else(|| "the stack".to_string(), |s| s.name)
+    };
+    let note = match op {
+        StackOp::Load => None,
+        StackOp::Create { name } => {
+            let id = library.create_stack(&name)?;
+            show = Some(id);
+            Some(format!("Started stack {}", name.trim()))
+        }
+        StackOp::Activate(id) => {
+            library.set_active_stack(id)?;
+            match id {
+                Some(id) => Some(format!(
+                    "Labelled records now go on stack {}",
+                    name_of(library, id)
+                )),
+                None => Some("Not stacking any more".to_string()),
+            }
+        }
+        StackOp::Rename { id, name } => {
+            library.rename_stack(id, &name)?;
+            None
+        }
+        StackOp::Delete(id) => {
+            let name = name_of(library, id);
+            library.delete_stack(id)?;
+            Some(format!("Deleted stack {name}"))
+        }
+        StackOp::Add { stack, release } => {
+            let name = name_of(library, stack);
+            Some(match library.add_to_stack(stack, release)? {
+                AddOutcome::Added { position } => {
+                    format!("Release {release} is number {position} on stack {name}")
+                }
+                AddOutcome::Already { position } => {
+                    format!("Release {release} is on stack {name} already (number {position})")
+                }
+                AddOutcome::NotInLibrary => {
+                    format!("Release {release} is not in the library, so it is not on stack {name}")
+                }
+            })
+        }
+        StackOp::Remove { stack, release } => {
+            library.remove_from_stack(stack, release)?;
+            None
+        }
+        StackOp::MoveTo {
+            stack,
+            release,
+            position,
+        } => {
+            library.move_in_stack(stack, release, position)?;
+            None
+        }
+    };
+    let stacks = library.list_stacks()?;
+    let id = show
+        .filter(|id| stacks.iter().any(|s| s.id == *id))
+        .or_else(|| stacks.first().map(|s| s.id));
+    let shown = match id {
+        Some(id) => Some((id, library.stack_entries(id)?)),
+        None => None,
+    };
+    Ok(StackState {
+        stacks,
+        shown,
+        note,
+    })
 }
 
 /// Everything needed to print one label (taken from the settings when the
@@ -969,7 +1103,7 @@ mod tests {
         let url = server.new_database("w_life");
         assert!(matches!(
             state.handle(LibraryRequest::Configure { url }),
-            LibraryResponse::Ready { migrated: 2 }
+            LibraryResponse::Ready { migrated: 3 }
         ));
 
         // not there yet
@@ -1060,6 +1194,116 @@ mod tests {
         }) {
             LibraryResponse::Cover { result, .. } => assert!(!result.unwrap()),
             _ => panic!(),
+        }
+    }
+
+    fn stacks(state: &mut LibraryState, op: StackOp, show: Option<i32>) -> StackState {
+        match state.handle(LibraryRequest::Stacks { op, show }) {
+            LibraryResponse::Stacks(result) => *result.unwrap(),
+            _ => panic!("expected the stacks"),
+        }
+    }
+
+    #[test]
+    fn the_library_thread_keeps_stacks() {
+        let Some(server) = crate::library::testing::server() else {
+            return;
+        };
+        let mut state = LibraryState::default();
+        state.handle(LibraryRequest::Configure {
+            url: server.new_database("w_stacks"),
+        });
+        assert!(stacks(&mut state, StackOp::Load, None).shown.is_none());
+        for id in [7, 8] {
+            state.handle(save_job(id, 1));
+        }
+        let made = stacks(&mut state, StackOp::Create { name: "ABC".into() }, None);
+        assert_eq!(made.note.as_deref(), Some("Started stack ABC"));
+        let (id, _) = made.shown.clone().unwrap();
+        assert!(made.stacks[0].active);
+
+        let added = stacks(
+            &mut state,
+            StackOp::Add {
+                stack: id,
+                release: 8,
+            },
+            Some(id),
+        );
+        assert_eq!(
+            added.note.as_deref(),
+            Some("Release 8 is number 1 on stack ABC")
+        );
+        let added = stacks(
+            &mut state,
+            StackOp::Add {
+                stack: id,
+                release: 7,
+            },
+            Some(id),
+        );
+        assert_eq!(added.shown.as_ref().unwrap().1.len(), 2);
+        let again = stacks(
+            &mut state,
+            StackOp::Add {
+                stack: id,
+                release: 7,
+            },
+            Some(id),
+        );
+        assert!(again.note.unwrap().contains("already (number 2)"));
+        let unknown = stacks(
+            &mut state,
+            StackOp::Add {
+                stack: id,
+                release: 99,
+            },
+            Some(id),
+        );
+        assert!(unknown.note.unwrap().contains("not in the library"));
+
+        let moved = stacks(
+            &mut state,
+            StackOp::MoveTo {
+                stack: id,
+                release: 7,
+                position: 1,
+            },
+            Some(id),
+        );
+        let order: Vec<u32> = moved
+            .shown
+            .unwrap()
+            .1
+            .iter()
+            .map(|e| e.release_id)
+            .collect();
+        assert_eq!(order, [7, 8]);
+        let removed = stacks(
+            &mut state,
+            StackOp::Remove {
+                stack: id,
+                release: 7,
+            },
+            Some(id),
+        );
+        assert_eq!(removed.shown.unwrap().1.len(), 1);
+
+        // another stack to look at; a vanished one falls back to the first
+        let other = stacks(&mut state, StackOp::Create { name: "XYZ".into() }, Some(id));
+        let (other_id, _) = other.shown.unwrap();
+        assert_ne!(other_id, id);
+        let gone = stacks(&mut state, StackOp::Delete(other_id), Some(other_id));
+        assert_eq!(gone.shown.unwrap().0, id);
+        let none = stacks(&mut state, StackOp::Activate(None), Some(id));
+        assert!(none.stacks.iter().all(|s| !s.active));
+        // a clear message for a name used twice
+        match state.handle(LibraryRequest::Stacks {
+            op: StackOp::Create { name: "abc".into() },
+            show: None,
+        }) {
+            LibraryResponse::Stacks(Err(err)) => assert!(err.contains("already"), "{err}"),
+            _ => panic!("expected an error"),
         }
     }
 

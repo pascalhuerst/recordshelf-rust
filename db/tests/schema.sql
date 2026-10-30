@@ -59,6 +59,72 @@ END
 $$;
 DELETE FROM releases WHERE id = 11;
 
+-- stacks: ordered, a record once per stack, one active stack, cascades
+INSERT INTO releases (id, title) VALUES (12, 'Stack test');
+INSERT INTO stacks (name, active) VALUES ('Box A', true);
+INSERT INTO stacks (name) VALUES ('Box B');
+INSERT INTO stack_records (stack_id, position, release_id)
+    SELECT id, 1, 12 FROM stacks WHERE name = 'Box A';
+INSERT INTO stack_records (stack_id, position, release_id)
+    SELECT id, 1, 12 FROM stacks WHERE name = 'Box B';
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO stacks (name) VALUES ('box a');
+        RAISE EXCEPTION 'stack names must be unique, ignoring case';
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END;
+    BEGIN
+        UPDATE stacks SET active = true WHERE name = 'Box B';
+        RAISE EXCEPTION 'only one stack may be active';
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END;
+    BEGIN
+        INSERT INTO stacks (name) VALUES ('  ');
+        RAISE EXCEPTION 'blank stack names must be refused';
+    EXCEPTION WHEN check_violation THEN NULL;
+    END;
+    BEGIN
+        INSERT INTO stack_records (stack_id, position, release_id)
+            SELECT id, 2, 12 FROM stacks WHERE name = 'Box A';
+        RAISE EXCEPTION 'a record may be on a stack only once';
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END;
+END
+$$;
+-- positions can be swapped inside a transaction (the key is checked at the end)
+INSERT INTO releases (id, title) VALUES (13, 'Stack test 2');
+INSERT INTO stack_records (stack_id, position, release_id)
+    SELECT id, 2, 13 FROM stacks WHERE name = 'Box A';
+UPDATE stack_records SET position = 3 - position
+    WHERE stack_id = (SELECT id FROM stacks WHERE name = 'Box A');
+DO $$
+BEGIN
+    IF (SELECT release_id FROM stack_records WHERE position = 1
+          AND stack_id = (SELECT id FROM stacks WHERE name = 'Box A')) <> 13 THEN
+        RAISE EXCEPTION 'swapping positions failed';
+    END IF;
+END
+$$;
+DELETE FROM releases WHERE id = 13;
+DELETE FROM stacks WHERE name = 'Box B';
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM stack_records) <> 1 THEN
+        RAISE EXCEPTION 'deleting a release or stack must remove its stack rows';
+    END IF;
+END
+$$;
+DELETE FROM releases WHERE id = 12;
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM stack_records) <> 0 OR (SELECT count(*) FROM stacks) <> 1 THEN
+        RAISE EXCEPTION 'a deleted release leaves its stack, the stack stays';
+    END IF;
+END
+$$;
+DELETE FROM stacks;
+
 -- updated_at moves on update, created_at does not
 UPDATE releases SET created_at = now() - interval '1 day', updated_at = now() - interval '1 day' WHERE id = 10;
 UPDATE releases SET title = 'Speicher 95 Tribute EP (renamed)' WHERE id = 10;

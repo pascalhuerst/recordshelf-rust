@@ -448,6 +448,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| match app.tab {
                 Tab::Add => app.ui_main(ui),
                 Tab::Collection => app.ui_collection(ui),
+                Tab::Stacks => app.ui_stacks(ui),
             });
         });
     }
@@ -710,6 +711,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| match app.tab {
                 Tab::Add => app.ui_main(ui),
                 Tab::Collection => app.ui_collection(ui),
+                Tab::Stacks => app.ui_stacks(ui),
             });
         });
         let panel_texture = app.label_panel.as_ref().map(|p| p.texture.id());

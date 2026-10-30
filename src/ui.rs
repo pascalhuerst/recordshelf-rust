@@ -30,6 +30,7 @@ use eframe::egui::{self, Color32, RichText};
 
 mod collection_tab;
 mod label_preview;
+mod stacks_tab;
 
 /// The two tabs of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,8 @@ enum Tab {
     Add,
     /// Browse and search the records in our own database.
     Collection,
+    /// The stacks of labelled records, and their order.
+    Stacks,
 }
 
 /// Opens a web page in the browser: the URL and, optionally, the browser command.
@@ -178,6 +181,7 @@ pub struct RecordShelfApp {
     images: HashMap<String, ImageState>,
     tab: Tab,
     collection: Collection,
+    stacks: stacks_tab::StacksState,
     library_link: LibraryLink,
     /// What our database has, per release (copies 0 = not in it).
     library: HashMap<u32, LibraryEntry>,
@@ -245,6 +249,7 @@ impl RecordShelfApp {
             images: HashMap::new(),
             tab: Tab::Add,
             collection: Collection::default(),
+            stacks: stacks_tab::StacksState::default(),
             library_link: LibraryLink::Off,
             library: HashMap::new(),
             library_status_requested: HashSet::new(),
@@ -512,6 +517,7 @@ impl RecordShelfApp {
                         "Database brought up to date ({migrated} migration(s))"
                     ));
                 }
+                self.load_stacks();
                 // what we already know about: look it up in the database
                 let ids: Vec<u32> = self.ownership.keys().copied().collect();
                 for id in ids {
@@ -586,6 +592,7 @@ impl RecordShelfApp {
                 // the collection may have changed while this was running
                 self.after_data(release_id);
             }
+            LibraryResponse::Stacks(result) => self.handle_stacks_response(result),
             response @ (LibraryResponse::List(_)
             | LibraryResponse::Details { .. }
             | LibraryResponse::Image { .. }
@@ -1313,6 +1320,7 @@ impl RecordShelfApp {
                     match self.tab {
                         Tab::Add => self.route_scan(code),
                         Tab::Collection => self.scan_in_collection(code),
+                        Tab::Stacks => self.scan_in_stacks(code),
                     }
                 }
             }
@@ -1464,9 +1472,12 @@ impl RecordShelfApp {
                 self.resync_collection(release_id);
             }
             Response::Printed { release_id, result } => match result {
-                Ok(()) => self.set_info(format!(
-                    "Label for release {release_id} sent to the printer"
-                )),
+                Ok(()) => {
+                    self.set_info(format!(
+                        "Label for release {release_id} sent to the printer"
+                    ));
+                    self.stack_after_print(release_id);
+                }
                 Err(err) => self.set_error(format!("Printing failed: {err}")),
             },
             Response::Removed { release_id, result } => {
@@ -1967,6 +1978,10 @@ impl RecordShelfApp {
                 self.sync_selected();
                 return;
             }
+            Command::AutoStack => {
+                self.toggle_auto_stack();
+                return;
+            }
             _ => {}
         }
         let Some(id) = self.selected_id() else {
@@ -1979,7 +1994,12 @@ impl RecordShelfApp {
             Command::Move => self.move_release(id),
             Command::Open => self.open_release(id),
             Command::Print => self.print_label(id),
-            Command::ChooseFolder | Command::Quit | Command::Sync | Command::AutoSync => {}
+            Command::Stack => self.put_on_stack(id),
+            Command::ChooseFolder
+            | Command::Quit
+            | Command::Sync
+            | Command::AutoSync
+            | Command::AutoStack => {}
         }
     }
 
@@ -2195,6 +2215,7 @@ impl RecordShelfApp {
             .is_some_and(|copies| !copies.is_empty());
         let library_off = self.library_link == LibraryLink::Off;
         let auto_sync = self.settings.library_auto_sync;
+        let auto_stack = self.settings.stack_auto_add;
         let mut clicked = None;
         ui.horizontal(|ui| {
             for cmd in Command::ALL {
@@ -2203,7 +2224,11 @@ impl RecordShelfApp {
                     continue;
                 }
                 // the library buttons only appear when a database is configured
-                if matches!(cmd, Command::Sync | Command::AutoSync) && library_off {
+                if matches!(
+                    cmd,
+                    Command::Sync | Command::AutoSync | Command::Stack | Command::AutoStack
+                ) && library_off
+                {
                     continue;
                 }
                 let label = match cmd {
@@ -2215,6 +2240,10 @@ impl RecordShelfApp {
                     Command::Sync => "Sync to library".to_string(),
                     Command::AutoSync => {
                         format!("Auto sync: {}", if auto_sync { "on" } else { "off" })
+                    }
+                    Command::Stack => "Put on stack".to_string(),
+                    Command::AutoStack => {
+                        format!("Auto stack: {}", if auto_stack { "on" } else { "off" })
                     }
                     Command::ChooseFolder => "Change folder".to_string(),
                     Command::Quit => "Quit".to_string(),
@@ -2284,12 +2313,19 @@ impl eframe::App for RecordShelfApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
         if !self.settings_open {
-            let (f1, f2) =
-                ctx.input(|i| (i.key_pressed(egui::Key::F1), i.key_pressed(egui::Key::F2)));
+            let (f1, f2, f3) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::F1),
+                    i.key_pressed(egui::Key::F2),
+                    i.key_pressed(egui::Key::F3),
+                )
+            });
             let wanted = if f1 {
                 Some(Tab::Add)
             } else if f2 {
                 Some(Tab::Collection)
+            } else if f3 {
+                Some(Tab::Stacks)
             } else {
                 None
             };
@@ -2310,6 +2346,7 @@ impl eframe::App for RecordShelfApp {
                 let before = self.tab;
                 ui.selectable_value(&mut self.tab, Tab::Add, "Add records  [F1]");
                 ui.selectable_value(&mut self.tab, Tab::Collection, "Search Collection  [F2]");
+                ui.selectable_value(&mut self.tab, Tab::Stacks, "Stacks  [F3]");
                 if self.tab != before {
                     self.on_tab_changed();
                 }
@@ -2347,6 +2384,10 @@ impl eframe::App for RecordShelfApp {
                     ui.separator();
                     ui.colored_label(color, text);
                 }
+                if let Some((text, color)) = self.stack_indicator() {
+                    ui.separator();
+                    ui.colored_label(color, text);
+                }
                 if let Some(notice) = &self.notice {
                     ui.separator();
                     let color = if notice.is_error {
@@ -2368,6 +2409,7 @@ impl eframe::App for RecordShelfApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Add => self.ui_main(ui),
             Tab::Collection => self.ui_collection(ui),
+            Tab::Stacks => self.ui_stacks(ui),
         });
 
         if self.settings_open {

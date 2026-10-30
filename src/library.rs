@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::catalogue::{CatalogueRelease, fold, join_artists};
 
+mod stacks;
+pub use stacks::{AddOutcome, StackEntry, StackInfo};
+
 /// Longest side of the stored thumbnail in pixels.
 pub const THUMB_SIZE: u32 = 150;
 
@@ -25,6 +28,11 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         2,
         "0002_add_my_notes.sql",
         include_str!("../db/migrations/0002_add_my_notes.sql"),
+    ),
+    (
+        3,
+        "0003_stacks.sql",
+        include_str!("../db/migrations/0003_stacks.sql"),
     ),
 ];
 

@@ -17,12 +17,16 @@ pub enum Command {
     Sync,
     /// Switch between syncing by hand (S) and syncing automatically.
     AutoSync,
+    /// Put the record on the active stack.
+    Stack,
+    /// Switch between stacking by hand (K) and stacking every printed label.
+    AutoStack,
     ChooseFolder,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 9] = [
+    pub const ALL: [Command; 11] = [
         Command::Add,
         Command::Remove,
         Command::Move,
@@ -30,6 +34,8 @@ impl Command {
         Command::Print,
         Command::Sync,
         Command::AutoSync,
+        Command::Stack,
+        Command::AutoStack,
         Command::ChooseFolder,
         Command::Quit,
     ];
@@ -43,6 +49,8 @@ impl Command {
             Command::Print => Key::P,
             Command::Sync => Key::S,
             Command::AutoSync => Key::U,
+            Command::Stack => Key::K,
+            Command::AutoStack => Key::J,
             Command::ChooseFolder => Key::F,
             Command::Quit => Key::Q,
         }
@@ -52,7 +60,7 @@ impl Command {
     pub fn needs_selection(self) -> bool {
         !matches!(
             self,
-            Command::ChooseFolder | Command::Quit | Command::AutoSync
+            Command::ChooseFolder | Command::Quit | Command::AutoSync | Command::AutoStack
         )
     }
 
@@ -72,6 +80,8 @@ impl Command {
             Command::Print => "P",
             Command::Sync => "S",
             Command::AutoSync => "U",
+            Command::Stack => "K",
+            Command::AutoStack => "J",
             Command::ChooseFolder => "F",
             Command::Quit => "Q",
         }
@@ -229,6 +239,9 @@ mod tests {
         assert_eq!(Command::Sync.key(), Key::S);
         assert_eq!(Command::AutoSync.key(), Key::U);
         assert!(Command::Sync.needs_selection() && !Command::AutoSync.needs_selection());
+        assert_eq!(Command::Stack.key(), Key::K);
+        assert_eq!(Command::AutoStack.key_label(), "J");
+        assert!(Command::Stack.needs_selection() && !Command::AutoStack.needs_selection());
         assert_eq!(Command::Quit.key(), Key::Q);
         assert_eq!(Command::Quit.key_label(), "Q");
         assert!(Command::Remove.needs_selection());

@@ -50,6 +50,8 @@ pub struct Settings {
     pub database_url: String,
     /// Keep our database in line with the Discogs collection automatically (key U switches)
     pub library_auto_sync: bool,
+    /// Put every label that was printed on the active stack (key J switches)
+    pub stack_auto_add: bool,
     /// With --shop-bridge: open the shop pages (decks.de, hhv.de) in the browser at the start
     pub shop_open_tabs: bool,
     /// Browser command for those pages (empty: the system's default browser)
@@ -84,6 +86,7 @@ impl Default for Settings {
             preview_ppi: 96.0,
             database_url: String::new(),
             library_auto_sync: true,
+            stack_auto_add: true,
             shop_open_tabs: true,
             shop_browser: String::new(),
             extra: std::collections::BTreeMap::new(),

@@ -62,6 +62,9 @@ impl RecordShelfApp {
             self.collection.focus_search = true;
             self.load_collection_if_needed();
         }
+        if self.tab == Tab::Stacks {
+            self.load_stacks();
+        }
     }
 
     /// Loads the list the first time, and again after the database changed.
@@ -412,6 +415,15 @@ impl RecordShelfApp {
         }
         if pressed(egui::Key::E) {
             self.start_edit();
+        }
+        if pressed(Command::Stack.key()) {
+            match self.collection.selected_id {
+                Some(id) => self.put_on_stack(id),
+                None => self.set_error("Select a record first".to_string()),
+            }
+        }
+        if pressed(Command::AutoStack.key()) {
+            self.toggle_auto_stack();
         }
         if pressed(Command::Quit.key()) {
             self.run_command(Command::Quit);

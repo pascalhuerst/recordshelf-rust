@@ -35,6 +35,7 @@ With `database_url` set, the app connects at startup, brings the schema up to da
 ## Schema
 | Table | Purpose |
 |---|---|
+| `stacks`, `stack_records` | named, ordered lists of records in the order they were labelled (migration 0003): `stacks.active` marks the one new labels go on (at most one), `stack_records(stack_id, position, release_id)` with the position unique per stack (the key is deferred, so positions can be swapped in a transaction) and a record only once per stack but possibly on several stacks; both cascade (deleting a release takes it off its stacks) |
 | `releases` | one row per release we own: Discogs `id`, `master_id`, title, `released_on` + `released_precision`, generated `year`, country, genres, styles, `notes` (Discogs pressing notes, refreshed by sync), `my_notes` (our own, never touched by sync), `copies`, timestamps |
 | `release_covers` | our own copy of the cover (`image`) and a thumbnail (`thumb`) |
 | `artists`, `release_artists` | artists in sleeve order; `join_text` is what the sleeve puts after the name ("&", ",", "feat.") |
