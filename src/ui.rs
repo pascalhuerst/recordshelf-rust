@@ -148,6 +148,8 @@ pub struct RecordShelfApp {
     url_opener: UrlOpener,
     /// When the shop pages are to be opened, if still to be done.
     shop_tabs_due: Option<Instant>,
+    /// What the sticker said for the article number looked up last: (number, scanned text).
+    last_shop_scan: Option<(String, String)>,
     /// The devices a scanner thread is listening to (several receivers can work at once).
     scanner_active: HashSet<PathBuf>,
     scanner_next_try: Instant,
@@ -224,6 +226,7 @@ impl RecordShelfApp {
             label_panel: None,
             url_opener: Box::new(system_opener),
             shop_tabs_due: None,
+            last_shop_scan: None,
             scanner_active,
             scanner_next_try: Instant::now() + SCANNER_RETRY,
             notice: None,
@@ -753,8 +756,14 @@ impl RecordShelfApp {
                 } else {
                     String::new()
                 };
+                let sticker = self
+                    .last_shop_scan
+                    .as_ref()
+                    .filter(|(number, _)| *number == code)
+                    .map(|(_, raw)| format!(" (the sticker said {raw})"))
+                    .unwrap_or_default();
                 self.set_error(format!(
-                    "{name} has no exact match for {code} ({} results){hint}",
+                    "{name} has no exact match for {code}{sticker} ({} results){hint}",
                     entries.len()
                 ));
             }
@@ -1306,7 +1315,13 @@ impl RecordShelfApp {
 
     /// Sends a scanned code to the shop browser tab or to Discogs.
     fn route_scan(&mut self, code: String) {
-        let code = shops::normalize_scan(&code, self.bridge.is_some());
+        let raw = code;
+        let code = shops::normalize_scan(&raw, self.bridge.is_some());
+        self.last_shop_scan = (code != raw).then(|| (code.clone(), raw.clone()));
+        if code != raw {
+            // say which number is looked up: the sticker says more than the article number
+            self.set_info(format!("Scanned {raw}: article number {code}"));
+        }
         let route = shops::route_scan(&code, self.bridge.is_some(), |shop| {
             self.bridge
                 .as_ref()
@@ -3337,6 +3352,39 @@ mod tests {
                 .as_ref()
                 .is_some_and(|n| n.is_error && n.text.contains("--shop-bridge"))
         );
+    }
+
+    #[test]
+    fn a_sticker_with_a_variant_looks_up_the_article_and_names_both_in_an_error() {
+        let mut app = app_with_bridge();
+        connect(&app, Shop::Hhv);
+        app.route_scan("525768V1".into());
+        assert!(
+            app.shop_info
+                .as_deref()
+                .is_some_and(|i| i.contains("525768") && i.contains("waiting")),
+            "asked the shop for the article number"
+        );
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Hhv,
+            code: "525768".into(),
+            status: Some(200),
+            entries: vec![],
+        });
+        let text = &app.notice.as_ref().unwrap().text;
+        assert!(
+            text.contains("no exact match for 525768 (the sticker said 525768V1)"),
+            "{text}"
+        );
+        // a plain number says nothing extra
+        app.route_scan("525768".into());
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Hhv,
+            code: "525768".into(),
+            status: Some(200),
+            entries: vec![],
+        });
+        assert!(!app.notice.as_ref().unwrap().text.contains("sticker said"));
     }
 
     #[test]
