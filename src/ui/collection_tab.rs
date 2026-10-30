@@ -231,14 +231,27 @@ impl RecordShelfApp {
             self.set_info("The record is still loading; press P again".to_string());
             return;
         };
-        if self.settings.printer_host.trim().is_empty() {
-            self.set_error("No printer configured (printer_host in the settings file)".to_string());
-            return;
-        }
         let content = LabelContent::from_stored(record);
-        let job = self.print_job(content);
-        self.worker.send(Request::PrintLabel(Box::new(job)));
-        self.set_info("Printing label...".to_string());
+        self.print_content(content, self.settings.tag_style());
+    }
+
+    /// Shift+P: show the label of the selected record.
+    fn preview_stored(&mut self) {
+        let Some(record) = self
+            .collection
+            .details
+            .as_ref()
+            .filter(|d| Some(d.id) == self.collection.selected_id)
+        else {
+            self.set_info("The record is still loading; press Shift+P again".to_string());
+            return;
+        };
+        let title = match record.artist_display().as_str() {
+            "" => record.title.clone(),
+            artists => format!("{artists} - {}", record.title),
+        };
+        let content = LabelContent::from_stored(record);
+        self.open_label_preview(content, title);
     }
 
     /// D: ask before deleting the selected record from the library.
@@ -404,7 +417,18 @@ impl RecordShelfApp {
         if pressed(egui::Key::Slash) {
             self.collection.focus_search = true;
         }
-        if pressed(Command::Print.key()) {
+        let (shift, no_shift) = (
+            ctx.input(|i| {
+                i.key_pressed(Command::Preview.key()) && i.modifiers.shift && !i.modifiers.command
+            }),
+            ctx.input(|i| {
+                i.key_pressed(Command::Print.key()) && !i.modifiers.shift && !i.modifiers.command
+            }),
+        );
+        if shift {
+            self.preview_stored();
+        }
+        if no_shift {
             self.print_stored();
         }
         if pressed(Command::Open.key()) {
@@ -471,7 +495,7 @@ impl RecordShelfApp {
             }
         });
 
-        if !self.collection.dialog_open() {
+        if !self.collection.dialog_open() && self.label_preview.is_none() {
             self.handle_collection_navigation(ui.ctx());
             if !search_active {
                 self.handle_collection_commands(ui.ctx());
@@ -587,6 +611,9 @@ impl RecordShelfApp {
             if ui.button("Print label  [P]").clicked() {
                 action = Some(Command::Print);
             }
+            if ui.button("Label preview  [Shift+P]").clicked() {
+                action = Some(Command::Preview);
+            }
             if ui.button("Open in browser  [O]").clicked() {
                 action = Some(Command::Open);
             }
@@ -603,6 +630,7 @@ impl RecordShelfApp {
         });
         match action {
             Some(Command::Print) => self.print_stored(),
+            Some(Command::Preview) => self.preview_stored(),
             Some(Command::Open) => self.open_stored(),
             Some(Command::Quit) => self.run_command(Command::Quit),
             _ => {}

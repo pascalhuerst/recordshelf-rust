@@ -29,6 +29,7 @@ use crate::worker::{
 use eframe::egui::{self, Color32, RichText};
 
 mod collection_tab;
+mod label_preview;
 
 /// The two tabs of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +137,8 @@ pub struct RecordShelfApp {
     scanner_stop: Arc<AtomicBool>,
     scanner_rx: Receiver<ScanEvent>,
     scanner_status: String,
+    /// The open label preview window, if any.
+    label_preview: Option<label_preview::LabelPreview>,
     /// Opens the shop pages (replaced in tests).
     url_opener: UrlOpener,
     /// When the shop pages are to be opened, if still to be done.
@@ -211,6 +214,7 @@ impl RecordShelfApp {
             scanner_stop,
             scanner_rx,
             scanner_status,
+            label_preview: None,
             url_opener: Box::new(system_opener),
             shop_tabs_due: None,
             scanner_running,
@@ -1572,7 +1576,11 @@ impl RecordShelfApp {
 
         // Keyboard handling. Skipped while typing, and on the frame a search was
         // triggered by Enter so that the same keypress does not also pick a result.
-        if !search_fields_active && !trigger_search && !self.settings_open {
+        if !search_fields_active
+            && !trigger_search
+            && !self.settings_open
+            && self.label_preview.is_none()
+        {
             self.handle_search_keys(ui.ctx());
         }
         if self.folder_picker_open {
@@ -1668,7 +1676,14 @@ impl RecordShelfApp {
             return;
         }
 
-        if let Some(cmd) = Command::ALL.into_iter().find(|c| pressed(c.key())) {
+        let command_pressed = |c: &Command| {
+            ctx.input(|i| {
+                i.key_pressed(c.key())
+                    && i.modifiers.shift == c.needs_shift()
+                    && !i.modifiers.command
+            })
+        };
+        if let Some(cmd) = Command::ALL.into_iter().find(command_pressed) {
             self.run_command(cmd);
             return;
         }
@@ -1925,6 +1940,7 @@ impl RecordShelfApp {
             Command::Move => self.move_release(id),
             Command::Open => self.open_release(id),
             Command::Print => self.print_label(id),
+            Command::Preview => self.preview_selected_label(id),
             Command::ChooseFolder | Command::Quit | Command::Sync | Command::AutoSync => {}
         }
     }
@@ -2057,7 +2073,17 @@ impl RecordShelfApp {
             return;
         };
         let content = LabelContent::from_release(id, release);
-        let job = self.print_job(content);
+        self.print_content(content, self.settings.tag_style());
+    }
+
+    /// Sends a label to the printer (with the given tag style).
+    fn print_content(&mut self, content: LabelContent, tag_style: Option<crate::label::TagStyle>) {
+        if self.settings.printer_host.trim().is_empty() {
+            self.set_error("No printer configured (printer_host in the settings file)".to_string());
+            return;
+        }
+        let mut job = self.print_job(content);
+        job.tag_style = tag_style;
         self.worker.send(Request::PrintLabel(Box::new(job)));
         self.set_info("Printing label...".to_string());
     }
@@ -2139,6 +2165,7 @@ impl RecordShelfApp {
                     Command::Move => "Move".to_string(),
                     Command::Open => "Open in browser".to_string(),
                     Command::Print => "Print label".to_string(),
+                    Command::Preview => "Label preview".to_string(),
                     Command::Sync => "Sync to library".to_string(),
                     Command::AutoSync => {
                         format!("Auto sync: {}", if auto_sync { "on" } else { "off" })
@@ -2296,6 +2323,8 @@ impl eframe::App for RecordShelfApp {
             Tab::Add => self.ui_main(ui),
             Tab::Collection => self.ui_collection(ui),
         });
+
+        self.show_label_preview(ctx);
 
         if self.settings_open {
             self.show_settings(ctx);
@@ -2778,7 +2807,7 @@ mod tests {
         }
     }
 
-    fn app_ready_to_add() -> RecordShelfApp {
+    pub(super) fn app_ready_to_add() -> RecordShelfApp {
         let mut app = app_with_results(2);
         app.folders = vec![folder(1, "Uncategorized"), folder(5, "Techno")];
         app.folder_selected = Some(1);
@@ -2786,7 +2815,7 @@ mod tests {
         app
     }
 
-    fn copy(instance_id: u32, folder_id: u32) -> CollectionInstance {
+    pub(super) fn copy(instance_id: u32, folder_id: u32) -> CollectionInstance {
         CollectionInstance {
             instance_id,
             folder_id,
