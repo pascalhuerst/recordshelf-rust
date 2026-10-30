@@ -47,6 +47,15 @@ impl LabelSize {
     }
 }
 
+/// How genres and styles are drawn as tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagStyle {
+    /// A rounded frame with black text.
+    Outline,
+    /// A black rounded area with white text.
+    Filled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeKind {
     Qr,
@@ -69,6 +78,8 @@ pub struct LabelContent {
     pub catno: String,
     pub artist: String,
     pub title: String,
+    /// Genres and styles, drawn as tags when the options ask for them.
+    pub tags: Vec<String>,
     pub tracks: Vec<LabelTrack>,
 }
 
@@ -104,6 +115,10 @@ impl LabelContent {
                     .filter_map(|a| Some((a.name.as_deref()?, a.join.as_deref()))),
             ),
             title: release.title.clone().unwrap_or_default(),
+            tags: tags_of(
+                release.genres.iter().flatten(),
+                release.styles.iter().flatten(),
+            ),
             tracks: release
                 .tracklist
                 .iter()
@@ -132,6 +147,7 @@ impl LabelContent {
             catno,
             artist: record.artist_display(),
             title: record.title.clone(),
+            tags: tags_of(record.genres.iter(), record.styles.iter()),
             tracks: record
                 .tracks
                 .iter()
@@ -142,6 +158,21 @@ impl LabelContent {
                 .collect(),
         }
     }
+}
+
+/// Genres and then styles, without empty entries and repeats.
+fn tags_of<'a>(
+    genres: impl Iterator<Item = &'a String>,
+    styles: impl Iterator<Item = &'a String>,
+) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for tag in genres.chain(styles) {
+        let tag = tag.trim();
+        if !tag.is_empty() && !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+            tags.push(tag.to_string());
+        }
+    }
+    tags
 }
 
 struct Fonts {
@@ -173,8 +204,21 @@ fn text_width(font: &FontRef, px: f32, text: &str) -> f32 {
     width
 }
 
-/// Draws `text` with its top at `top`; returns the line height used.
+/// Draws `text` in black with its top at `top`.
 fn draw_text(img: &mut GrayImage, font: &FontRef, px: f32, x: f32, top: f32, text: &str) {
+    draw_text_in(img, font, px, x, top, text, BLACK);
+}
+
+/// Draws `text` in `color` (white for text on a black area).
+fn draw_text_in(
+    img: &mut GrayImage,
+    font: &FontRef,
+    px: f32,
+    x: f32,
+    top: f32,
+    text: &str,
+    color: Luma<u8>,
+) {
     let scale = PxScale::from(px);
     let scaled = font.as_scaled(scale);
     let baseline = top + scaled.ascent();
@@ -195,7 +239,7 @@ fn draw_text(img: &mut GrayImage, font: &FontRef, px: f32, x: f32, top: f32, tex
                         bounds.min.y as i32 + gy as i32,
                     );
                     if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
-                        img.put_pixel(x as u32, y as u32, BLACK);
+                        img.put_pixel(x as u32, y as u32, color);
                     }
                 }
             });
@@ -405,6 +449,8 @@ pub struct LabelOptions {
     pub barcode_module: u32,
     /// Small text in the bottom left corner (used by test labels).
     pub caption: Option<String>,
+    /// Draw genres and styles as tags in this style (`None`: no tags).
+    pub tag_style: Option<TagStyle>,
 }
 
 impl LabelOptions {
@@ -414,8 +460,123 @@ impl LabelOptions {
             barcode_height: 24, // 3 mm; the printed tests read fine down to 2 mm
             barcode_module: 2,
             caption: None,
+            tag_style: None,
         }
     }
+}
+
+/// Whether the point (pixel centre) lies inside a rounded rectangle of size w x h.
+fn in_rounded_rect(px: f32, py: f32, w: f32, h: f32, r: f32) -> bool {
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let (cx, cy) = (px.clamp(r, w - r), py.clamp(r, h - r));
+    let (dx, dy) = (px - cx, py - cy);
+    px >= 0.0 && py >= 0.0 && px <= w && py <= h && dx * dx + dy * dy <= r * r
+}
+
+/// A rounded rectangle, as an area or as a frame `thickness` dots wide.
+fn draw_pill(img: &mut GrayImage, x: u32, y: u32, w: u32, h: u32, filled: bool, thickness: f32) {
+    let (wf, hf) = (w as f32, h as f32);
+    let radius = (hf / 2.0).min(7.0);
+    for yy in 0..h {
+        for xx in 0..w {
+            let (px, py) = (xx as f32 + 0.5, yy as f32 + 0.5);
+            if !in_rounded_rect(px, py, wf, hf, radius) {
+                continue;
+            }
+            let inside_frame = !filled
+                && in_rounded_rect(
+                    px - thickness,
+                    py - thickness,
+                    wf - 2.0 * thickness,
+                    hf - 2.0 * thickness,
+                    radius - thickness,
+                );
+            if !inside_frame && x + xx < img.width() && y + yy < img.height() {
+                img.put_pixel(x + xx, y + yy, BLACK);
+            }
+        }
+    }
+}
+
+const TAG_PX: f32 = 15.0;
+const TAG_HEIGHT: f32 = 22.0;
+const TAG_PADDING: f32 = 8.0;
+const TAG_GAP: f32 = 5.0;
+
+/// One row of tags starting at `y`: as many as fit `max_width`; the rest is
+/// counted ("+2"). Returns the height used (0 without tags).
+fn draw_tags(
+    img: &mut GrayImage,
+    fonts: &Fonts,
+    left: f32,
+    y: f32,
+    max_width: f32,
+    tags: &[String],
+    style: TagStyle,
+) -> f32 {
+    if tags.is_empty() {
+        return 0.0;
+    }
+    let filled = style == TagStyle::Filled;
+    let widths: Vec<f32> = tags
+        .iter()
+        .map(|t| text_width(&fonts.regular, TAG_PX, t) + 2.0 * TAG_PADDING)
+        .collect();
+    // how many fit, leaving room for a "+N" if some do not
+    let marker_width = |hidden: usize| text_width(&fonts.bold, TAG_PX, &format!("+{hidden}")) + 4.0;
+    let mut shown = 0;
+    let mut used = 0.0;
+    for (i, w) in widths.iter().enumerate() {
+        let needed = used + w + if i == 0 { 0.0 } else { TAG_GAP };
+        let hidden_after = tags.len() - i - 1;
+        let reserve = if hidden_after > 0 {
+            TAG_GAP + marker_width(hidden_after)
+        } else {
+            0.0
+        };
+        if needed + reserve > max_width && i > 0 {
+            break;
+        }
+        used = needed;
+        shown = i + 1;
+    }
+    // a single tag wider than the row is shortened
+    let mut x = left;
+    for (i, tag) in tags.iter().take(shown).enumerate() {
+        let mut label = tag.clone();
+        let mut width = widths[i];
+        if width > max_width {
+            label = ellipsize(&fonts.regular, TAG_PX, tag, max_width - 2.0 * TAG_PADDING);
+            width = text_width(&fonts.regular, TAG_PX, &label) + 2.0 * TAG_PADDING;
+        }
+        draw_pill(
+            img,
+            x as u32,
+            y as u32,
+            width.ceil() as u32,
+            TAG_HEIGHT as u32,
+            filled,
+            2.0,
+        );
+        let text_top = y + (TAG_HEIGHT - TAG_PX * 1.2) / 2.0 - 0.5;
+        let color = if filled { WHITE } else { BLACK };
+        draw_text_in(
+            img,
+            &fonts.regular,
+            TAG_PX,
+            x + TAG_PADDING,
+            text_top,
+            &label,
+            color,
+        );
+        x += width + TAG_GAP;
+    }
+    if shown < tags.len() {
+        let marker = format!("+{}", tags.len() - shown);
+        let text_top = y + (TAG_HEIGHT - TAG_PX * 1.2) / 2.0 - 0.5;
+        draw_text(img, &fonts.bold, TAG_PX, x, text_top, &marker);
+    }
+    TAG_HEIGHT
 }
 
 /// Draws the label. Black pixels are 0, the rest 255.
@@ -506,6 +667,14 @@ pub fn render_with(
         y += 4.0;
     }
 
+    // Genres and styles as tags.
+    if let Some(style) = options.tag_style {
+        let used = draw_tags(&mut img, &fonts, left, y, inner_width, &content.tags, style);
+        if used > 0.0 {
+            y += used + 5.0;
+        }
+    }
+
     // Tracks: as many as fit above (and beside) the code.
     let track_px: f32 = 19.0;
     let line_height = (track_px * 1.25).round();
@@ -574,6 +743,16 @@ pub fn render_with(
     Ok(img)
 }
 
+/// The sample with genres and styles.
+pub fn sample_content_with_tags() -> LabelContent {
+    LabelContent {
+        tags: ["Electronic", "House", "Disco", "Edits"]
+            .map(String::from)
+            .to_vec(),
+        ..sample_content()
+    }
+}
+
 /// A sample (from a real sleeve) for trying out layouts without Discogs.
 pub fn sample_content() -> LabelContent {
     let track = |p: &str, t: &str| LabelTrack {
@@ -587,6 +766,7 @@ pub fn sample_content() -> LabelContent {
         catno: "MOC040".to_string(),
         artist: "Alexander Kowalski & Rebar".to_string(),
         title: "When Darkness Surrenders To The Light".to_string(),
+        tags: Vec::new(),
         tracks: vec![
             track("A1", "Dawns Embrace"),
             track("A2", "Radiant Resurgence"),
@@ -617,6 +797,26 @@ pub fn write_previews(
                 image::imageops::FilterType::Nearest,
             );
             let path = dir.join(format!("label-{w}x{h}-{name}.png"));
+            big.save(&path)
+                .with_context(|| format!("write {}", path.display()))?;
+            files.push(path);
+        }
+        // the same label with genres and styles as tags
+        for (style, name) in [(TagStyle::Outline, "outline"), (TagStyle::Filled, "filled")] {
+            let mut options = LabelOptions::new(CodeKind::Barcode);
+            options.tag_style = Some(style);
+            let img = render_with(
+                &sample_content_with_tags(),
+                LabelSize::from_mm(w, h),
+                &options,
+            )?;
+            let big = image::imageops::resize(
+                &img,
+                img.width() * 3,
+                img.height() * 3,
+                image::imageops::FilterType::Nearest,
+            );
+            let path = dir.join(format!("label-{w}x{h}-barcode-tags-{name}.png"));
             big.save(&path)
                 .with_context(|| format!("write {}", path.display()))?;
             files.push(path);
@@ -740,6 +940,7 @@ mod tests {
             catno: "ABCDEFGH-0042".to_string(),
             artist: "An Extremely Long Artist Name Featuring Several Other Very Long Artist Names".to_string(),
             title: "An Equally Long Release Title That Needs More Than Two Lines To Be Shown In Full Here".to_string(),
+            tags: Vec::new(),
             tracks: (1..=20)
                 .map(|i| LabelTrack {
                     position: format!("{}{}", if i <= 10 { "A" } else { "B" }, i),
@@ -769,6 +970,7 @@ mod tests {
             catno: String::new(),
             artist: String::new(),
             title: String::new(),
+            tags: Vec::new(),
             tracks: Vec::new(),
         };
         for kind in [CodeKind::Qr, CodeKind::Barcode] {
@@ -952,7 +1154,11 @@ mod tests {
     fn previews_are_written_for_every_size_and_kind() {
         let dir = tempfile::tempdir().unwrap();
         let files = write_previews(dir.path(), &sample_content()).unwrap();
-        assert_eq!(files.len(), 4);
+        assert_eq!(
+            files.len(),
+            8,
+            "two sizes: qr, barcode, and the barcode with tags in two styles"
+        );
         for f in files {
             assert!(f.exists(), "{}", f.display());
         }
@@ -1028,5 +1234,185 @@ mod tests {
             &crate::catalogue::CatalogueRelease::from_release(9, &release, 1).unwrap(),
         );
         assert_eq!(LabelContent::from_stored(&stored), from_discogs);
+    }
+
+    // --- tags ------------------------------------------------------------------------------
+
+    fn with_tags(tags: &[&str]) -> LabelContent {
+        LabelContent {
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..sample_content()
+        }
+    }
+
+    fn tagged(style: TagStyle) -> LabelOptions {
+        let mut o = LabelOptions::new(CodeKind::Barcode);
+        o.tag_style = Some(style);
+        o
+    }
+
+    #[test]
+    fn genres_and_styles_become_tags_without_repeats() {
+        let release: Release = serde_json::from_str(
+            r#"{"title": "T", "genres": ["Electronic", "", " Jazz "], "styles": ["House", "electronic", "Disco"]}"#,
+        )
+        .unwrap();
+        let content = LabelContent::from_release(1, &release);
+        assert_eq!(
+            content.tags,
+            ["Electronic", "Jazz", "House", "Disco"],
+            "genres first, no empty ones, no repeats"
+        );
+        let stored = crate::library::StoredRelease::from_catalogue(
+            &crate::catalogue::CatalogueRelease::from_release(1, &release, 1).unwrap(),
+        );
+        assert_eq!(LabelContent::from_stored(&stored).tags, content.tags);
+        assert!(
+            LabelContent::from_release(1, &Release::default())
+                .tags
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tags_are_only_drawn_when_asked_for() {
+        let content = with_tags(&["House", "Disco"]);
+        let off = render_with(&content, SIZE_TEST, &LabelOptions::new(CodeKind::Barcode)).unwrap();
+        let plain = render(&sample_content(), SIZE_TEST, CodeKind::Barcode).unwrap();
+        assert_eq!(
+            off.as_raw(),
+            plain.as_raw(),
+            "without a tag style the label is as before"
+        );
+        let on = render_with(&content, SIZE_TEST, &tagged(TagStyle::Outline)).unwrap();
+        assert_ne!(on.as_raw(), plain.as_raw());
+        // no tags, no change either
+        let none = render_with(&sample_content(), SIZE_TEST, &tagged(TagStyle::Outline)).unwrap();
+        assert_eq!(none.as_raw(), plain.as_raw());
+    }
+
+    #[test]
+    fn both_styles_keep_the_code_readable_and_inside_the_margins() {
+        for style in [TagStyle::Outline, TagStyle::Filled] {
+            for size in [SIZE_REAL, SIZE_TEST] {
+                for kind in [CodeKind::Barcode, CodeKind::Qr] {
+                    let mut o = tagged(style);
+                    o.kind = kind;
+                    let img = render_with(&sample_content_with_tags(), size, &o).unwrap();
+                    assert_eq!(
+                        decode(&img).as_deref(),
+                        Some("32474433"),
+                        "{style:?} {kind:?}"
+                    );
+                    assert_inside_safe_area(&img, &format!("{style:?} {kind:?}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filled_tags_are_black_areas_and_outlined_ones_are_frames() {
+        let content = with_tags(&["House"]);
+        let black = |style| {
+            let img = render_with(&content, SIZE_TEST, &tagged(style)).unwrap();
+            img.pixels().filter(|p| p.0[0] < 128).count()
+        };
+        let base = render(&sample_content(), SIZE_TEST, CodeKind::Barcode)
+            .unwrap()
+            .pixels()
+            .filter(|p| p.0[0] < 128)
+            .count();
+        let (outline, filled) = (black(TagStyle::Outline), black(TagStyle::Filled));
+        assert!(
+            outline > base && filled > outline,
+            "{base} < {outline} < {filled}"
+        );
+    }
+
+    #[test]
+    fn white_text_shows_up_inside_a_filled_tag() {
+        let img = render_with(
+            &with_tags(&["Electronic"]),
+            SIZE_TEST,
+            &tagged(TagStyle::Filled),
+        )
+        .unwrap();
+        // the tag row: find the black area and count white pixels inside it
+        let row = (100..200)
+            .find(|y| (16..60).all(|x| img.get_pixel(x, *y).0[0] < 128))
+            .expect("a filled tag row");
+        let white_inside = (16..90)
+            .filter(|x| img.get_pixel(*x, row + 4).0[0] > 128)
+            .count()
+            + (16..90)
+                .filter(|x| img.get_pixel(*x, row + 8).0[0] > 128)
+                .count();
+        assert!(white_inside > 0, "the lettering is white on the black tag");
+    }
+
+    #[test]
+    fn too_many_tags_are_counted_not_cut_off() {
+        let many = [
+            "Electronic",
+            "Jazz",
+            "Funk / Soul",
+            "Experimental",
+            "Ambient",
+            "Drum n Bass",
+            "Reggae",
+            "Rock",
+        ];
+        let o = tagged(TagStyle::Outline);
+        let img = render_with(&with_tags(&many), SIZE_TEST, &o).unwrap();
+        assert_inside_safe_area(&img, "many tags");
+        assert_eq!(decode(&img).as_deref(), Some("32474433"));
+        // at least the first tag fits, and the row never grows beyond one line
+        let few = render_with(&with_tags(&many[..2]), SIZE_TEST, &o).unwrap();
+        let rows_with_ink = |img: &GrayImage| {
+            (112..150)
+                .filter(|y| (16..392).any(|x| img.get_pixel(x, *y).0[0] < 128))
+                .count()
+        };
+        assert_eq!(rows_with_ink(&img), rows_with_ink(&few), "one row of tags");
+    }
+
+    #[test]
+    fn a_very_long_tag_is_shortened_to_fit() {
+        let long = "An Extremely Long Style Name That Is Far Wider Than The Whole Label Itself";
+        let img = render_with(&with_tags(&[long]), SIZE_TEST, &tagged(TagStyle::Outline)).unwrap();
+        assert_inside_safe_area(&img, "long tag");
+        assert_eq!(decode(&img).as_deref(), Some("32474433"));
+    }
+
+    #[test]
+    fn tags_leave_the_track_list_intact() {
+        // the sample's four tracks still fit with a row of tags
+        let o = tagged(TagStyle::Outline);
+        let with = render_with(&sample_content_with_tags(), SIZE_TEST, &o).unwrap();
+        let without = render(&sample_content(), SIZE_TEST, CodeKind::Barcode).unwrap();
+        let ink = |img: &GrayImage, y0: u32, y1: u32| {
+            (y0..y1)
+                .flat_map(|y| (16..392).map(move |x| (x, y)))
+                .filter(|(x, y)| img.get_pixel(*x, *y).0[0] < 128)
+                .count()
+        };
+        // below the title there is more ink with tags (the tags), and the last track line is still drawn
+        assert!(ink(&with, 120, 260) > ink(&without, 120, 260));
+        assert!(ink(&with, 205, 235) > 100, "the last track is still there");
+    }
+
+    #[test]
+    fn the_rounded_rectangle_has_round_corners() {
+        assert!(in_rounded_rect(10.0, 10.0, 20.0, 20.0, 5.0));
+        assert!(
+            !in_rounded_rect(0.2, 0.2, 20.0, 20.0, 5.0),
+            "the corner is cut"
+        );
+        assert!(
+            in_rounded_rect(5.0, 0.5, 20.0, 20.0, 5.0),
+            "the straight edge is not"
+        );
+        assert!(!in_rounded_rect(-1.0, 5.0, 20.0, 20.0, 5.0));
+        assert!(!in_rounded_rect(21.0, 5.0, 20.0, 20.0, 5.0));
     }
 }
