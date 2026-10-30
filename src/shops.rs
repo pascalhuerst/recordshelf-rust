@@ -209,6 +209,16 @@ pub enum Route {
 /// 6-7 digit numbers, which look like Discogs release ids, so they are only
 /// taken for hhv when the bridge is running (`bridge_on`); then a number of
 /// that length is never looked up as a Discogs id.
+/// The code as it is looked up: the article number of an hhv sticker with
+/// padding or a variant suffix (`525768V1`) is reduced to the number while the
+/// bridge runs; every other code stays as it is.
+pub fn normalize_scan(code: &str, bridge_on: bool) -> String {
+    if bridge_on && let Some(number) = hhv::article_number(code) {
+        return number;
+    }
+    code.to_string()
+}
+
 pub fn route_scan(code: &str, bridge_on: bool, connected: impl Fn(Shop) -> bool) -> Route {
     // the QR code of deejay.de holds the article URL: unmistakable, and no browser needed
     if deejay::article_id(code).is_some() {
@@ -491,5 +501,20 @@ mod tests {
                 "{url} is not matched by the userscript"
             );
         }
+    }
+
+    #[test]
+    fn hhv_stickers_with_padding_or_variant_find_the_article() {
+        assert_eq!(normalize_scan("525768V1", true), "525768");
+        assert_eq!(normalize_scan("0000525768", true), "525768");
+        assert_eq!(
+            route_scan(&normalize_scan("525768V1", true), true, |s| s == Shop::Hhv),
+            Route::Shop(Shop::Hhv)
+        );
+        // without the bridge, and for everything else, the code stays as it is
+        assert_eq!(normalize_scan("525768V1", false), "525768V1");
+        assert_eq!(normalize_scan("5012345678900", true), "5012345678900");
+        assert_eq!(normalize_scan("CNF/O1", true), "CNF/O1");
+        assert_eq!(normalize_scan("24950", true), "24950");
     }
 }

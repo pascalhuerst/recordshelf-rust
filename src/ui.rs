@@ -1306,6 +1306,7 @@ impl RecordShelfApp {
 
     /// Sends a scanned code to the shop browser tab or to Discogs.
     fn route_scan(&mut self, code: String) {
+        let code = shops::normalize_scan(&code, self.bridge.is_some());
         let route = shops::route_scan(&code, self.bridge.is_some(), |shop| {
             self.bridge
                 .as_ref()

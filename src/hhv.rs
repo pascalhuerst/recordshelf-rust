@@ -14,6 +14,29 @@ pub fn is_hhv_code(code: &str) -> bool {
     (6..=7).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The article number in what a sticker's barcode says: the number may be
+/// padded with leading zeros (`0000525768`) and followed by a variant suffix
+/// (`525768V1`). `None` if it is not one.
+pub fn article_number(code: &str) -> Option<String> {
+    let code = code.trim().to_ascii_lowercase();
+    // a variant suffix: `v` and digits at the end
+    let core = match code.rfind('v') {
+        Some(at)
+            if at > 0
+                && code[at + 1..].bytes().all(|b| b.is_ascii_digit())
+                && at + 1 < code.len() =>
+        {
+            &code[..at]
+        }
+        _ => code.as_str(),
+    };
+    if core.is_empty() || !core.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number = core.trim_start_matches('0');
+    is_hhv_code(number).then(|| number.to_string())
+}
+
 /// The article page must be the one we asked for.
 pub fn find_entry<'a>(code: &str, entries: &'a [ShopEntry]) -> Option<&'a ShopEntry> {
     entries.iter().find(|e| e.code == code.trim())
@@ -127,6 +150,42 @@ mod tests {
         for code in ["525768", " 525768\n", "1234567"] {
             assert!(is_hhv_code(code), "{code}");
         }
+    }
+
+    #[test]
+    fn reads_the_article_number_from_padded_and_variant_codes() {
+        for (code, number) in [
+            ("525768", "525768"),
+            ("0000525768", "525768"),
+            ("00000000525768", "525768"),
+            ("525768V1", "525768"),
+            ("525768v12", "525768"),
+            (" 0525768V1\n", "525768"),
+            ("000525768v1", "525768"),
+        ] {
+            assert_eq!(article_number(code).as_deref(), Some(number), "{code}");
+        }
+        for code in [
+            "",
+            "v1",
+            "000000v1",
+            "000000",
+            "12345",
+            "12345678",
+            "525768v",
+            "525768x1",
+            "52576a",
+            "5012345678900",
+            "00880319822216",
+            "CNF/O1",
+            "525768v1v1",
+        ] {
+            assert_eq!(article_number(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn recognises_article_numbers_2() {
         for code in [
             "",
             "12345",
