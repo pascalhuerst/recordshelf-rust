@@ -1627,7 +1627,12 @@ impl RecordShelfApp {
                 if let Some(release) = self.selected_release() {
                     let owned = release.id.and_then(|id| self.ownership.get(&id));
                     let split = label_view.as_ref().and_then(|v| {
-                        label_preview::split_widths(ui.available_width(), COVER_SIZE, v.size.x)
+                        label_preview::split_widths(
+                            ui.available_width(),
+                            COVER_SIZE,
+                            v.size.x,
+                            ui.ctx().screen_rect().center().x - ui.max_rect().left(),
+                        )
                     });
                     // cover and info; `width` is what the info may use
                     let draw_info = |ui: &mut egui::Ui, width: f32| {

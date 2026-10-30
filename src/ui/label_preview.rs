@@ -54,16 +54,21 @@ const PANEL_PADDING: f32 = 16.0;
 const SPLIT_MARGIN: f32 = 14.0;
 /// The record info needs at least this much width.
 const MIN_INFO_WIDTH: f32 = 260.0;
+/// The panel is at least this wide, for the toggles.
+const PANEL_MIN_WIDTH: f32 = 230.0;
 
 /// How a details area of `available` width is split: the left part (cover and
-/// info, half of the width but not less than they need) and the right part with
-/// the label panel. `None` if the right part would be too small for the picture.
+/// info) and the right part with the label panel. The line goes through the
+/// middle of the window, `middle` points from the left edge of the area, but
+/// the left part gets at least what the cover and info need. `None` if the
+/// right part would be too small for the picture.
 pub(super) fn split_widths(
     available: f32,
     cover_width: f32,
     picture_width: f32,
+    middle: f32,
 ) -> Option<(f32, f32)> {
-    let left = (available * 0.5).max(cover_width + 12.0 + MIN_INFO_WIDTH);
+    let left = (middle - SPLIT_MARGIN).max(cover_width + 12.0 + MIN_INFO_WIDTH);
     let right = available - left;
     let needed = picture_width + 2.0 * PANEL_PADDING + 2.0 * SPLIT_MARGIN;
     (right >= needed).then_some((left, right))
@@ -90,12 +95,14 @@ pub(super) fn split_pane<R>(
             |ui| {
                 ui.spacing_mut().item_spacing = spacing;
                 ui.set_max_width(left_width);
+                // the part takes its whole width, whatever the content needs
+                ui.set_min_width(left_width);
                 left(ui);
             },
         );
         let line_x = left_x + left_width + SPLIT_MARGIN;
         ui.add_space(2.0 * SPLIT_MARGIN);
-        let pane_width = (right_width - 2.0 * SPLIT_MARGIN).max(1.0);
+        let pane_width = (right_width - 3.0 * SPLIT_MARGIN).max(1.0);
         let inner = ui.allocate_ui_with_layout(
             egui::vec2(pane_width, 1.0),
             egui::Layout::top_down(egui::Align::Min),
@@ -259,54 +266,66 @@ impl RecordShelfApp {
 /// tags and the code, with space around it. Returns what was changed.
 pub(super) fn draw_label_panel(ui: &mut egui::Ui, view: &LabelView) -> LabelAction {
     let mut action = LabelAction::default();
-    egui::Frame::none()
-        .inner_margin(egui::Margin::same(PANEL_PADDING))
-        .show(ui, |ui| {
-            ui.label(RichText::new("Label").strong());
-            ui.add_space(4.0);
-            egui::Frame::none()
-                .stroke(egui::Stroke::new(1.0_f32, Color32::GRAY))
-                .show(ui, |ui| {
-                    ui.add(egui::Image::new((view.texture, view.size)));
-                });
-            ui.label(RichText::new(&view.caption).small());
-            ui.add_space(8.0);
+    let content_width = view.size.x.max(PANEL_MIN_WIDTH);
+    // the panel sits in the middle of the space it is given
+    let indent = ((ui.available_width() - content_width - 2.0 * PANEL_PADDING) / 2.0).max(0.0);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(indent);
+        egui::Frame::none()
+            .inner_margin(egui::Margin::same(PANEL_PADDING))
+            .show(ui, |ui| {
+                ui.set_width(content_width);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.label(RichText::new("Label").strong());
+                    ui.add_space(4.0);
+                    egui::Frame::none()
+                        .stroke(egui::Stroke::new(1.0_f32, Color32::GRAY))
+                        .show(ui, |ui| {
+                            ui.add(egui::Image::new((view.texture, view.size)));
+                        });
+                    ui.label(RichText::new(&view.caption).small());
+                    ui.add_space(8.0);
 
-            let choose =
-                |ui: &mut egui::Ui, caption: &str, current: &str, options: &[(&str, &str)]| {
-                    let mut picked = None;
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{caption}:"));
-                        for (value, name) in options {
-                            if ui.selectable_label(current == *value, *name).clicked()
-                                && current != *value
-                            {
-                                picked = Some(value.to_string());
+                    let choose = |ui: &mut egui::Ui,
+                                  caption: &str,
+                                  current: &str,
+                                  options: &[(&str, &str)]| {
+                        let mut picked = None;
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{caption}:"));
+                            for (value, name) in options {
+                                if ui.selectable_label(current == *value, *name).clicked()
+                                    && current != *value
+                                {
+                                    picked = Some(value.to_string());
+                                }
                             }
-                        }
-                    });
-                    picked
-                };
-            action.tags = choose(
-                ui,
-                "Style tags",
-                &view.tags_choice,
-                &[
-                    ("off", "Off"),
-                    ("outline", "Outlined"),
-                    ("filled", "Filled"),
-                ],
-            );
-            if view.tags_choice != "off" && !view.has_tags {
-                ui.label(RichText::new("(this record has no styles)").small().weak());
-            }
-            action.code = choose(
-                ui,
-                "Code",
-                &view.code_choice,
-                &[("barcode", "Barcode"), ("qr", "QR code")],
-            );
-        });
+                        });
+                        picked
+                    };
+                    action.tags = choose(
+                        ui,
+                        "Style tags",
+                        &view.tags_choice,
+                        &[
+                            ("off", "Off"),
+                            ("outline", "Outlined"),
+                            ("filled", "Filled"),
+                        ],
+                    );
+                    if view.tags_choice != "off" && !view.has_tags {
+                        ui.label(RichText::new("(this record has no styles)").small().weak());
+                    }
+                    action.code = choose(
+                        ui,
+                        "Code",
+                        &view.code_choice,
+                        &[("barcode", "Barcode"), ("qr", "QR code")],
+                    );
+                });
+            });
+    });
     action
 }
 
@@ -804,6 +823,36 @@ mod tests {
     }
 
     #[test]
+    fn the_picture_is_in_the_middle_of_the_right_half_of_the_window() {
+        for app in [
+            {
+                let mut a = collection_app();
+                a.collection.details = Some(long_record());
+                a
+            },
+            {
+                let mut a = app_ready_to_add();
+                a.releases.insert(
+                    1,
+                    serde_json::from_str(r#"{"id": 1, "title": "W", "artists": []}"#).unwrap(),
+                );
+                a.ownership.insert(1, vec![copy(10, 1)]);
+                a
+            },
+        ] {
+            let mut app = app;
+            layout_frame(&mut app, 1400.0, 900.0);
+            let (picture, _) = layout_frame(&mut app, 1400.0, 900.0);
+            let picture = picture.expect("drawn");
+            let centre = picture.center().x;
+            assert!(
+                (centre - 1050.0).abs() < 30.0,
+                "centre {centre} should be near 1050, the middle of the right half: {picture:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_toggles_are_beside_the_picture() {
         let mut app = collection_app();
         app.collection.details = Some(long_record());
@@ -845,9 +894,9 @@ mod tests {
 
     #[test]
     fn the_split_needs_room() {
-        assert!(split_widths(1300.0, 220.0, 193.0).is_some());
-        assert!(split_widths(700.0, 220.0, 193.0).is_none());
-        let (left, right) = split_widths(1300.0, 220.0, 193.0).unwrap();
+        assert!(split_widths(1300.0, 220.0, 193.0, 650.0).is_some());
+        assert!(split_widths(700.0, 220.0, 193.0, 350.0).is_none());
+        let (left, right) = split_widths(1300.0, 220.0, 193.0, 650.0).unwrap();
         assert!((left + right - 1300.0).abs() < 0.01);
     }
 }
