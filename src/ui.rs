@@ -1114,6 +1114,23 @@ impl RecordShelfApp {
                                         );
                                     });
                                 ui.end_row();
+                                ui.label("Preview scale:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.preview_ppi)
+                                            .clamp_range(40.0..=400.0)
+                                            .speed(0.5)
+                                            .fixed_decimals(0)
+                                            .suffix(" points/inch"),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "(96 is usual; change it until the preview is as big as a real label)",
+                                        )
+                                        .small(),
+                                    );
+                                });
+                                ui.end_row();
                                 ui.label("Style tags:");
                                 egui::ComboBox::from_id_source("label-tags")
                                     .selected_text(match draft.label_tags.as_str() {

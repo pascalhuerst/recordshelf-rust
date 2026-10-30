@@ -42,6 +42,8 @@ pub struct Settings {
     pub label_code: String,
     /// Styles as tags on the label: "off", "outline" or "filled"
     pub label_tags: String,
+    /// How many screen points make an inch, for the label preview at real size (96 is usual)
+    pub preview_ppi: f32,
     /// PostgreSQL connection string of our own database (written by `db/db.sh bootstrap`)
     pub database_url: String,
     /// Keep our database in line with the Discogs collection automatically (key U switches)
@@ -76,6 +78,7 @@ impl Default for Settings {
             label_height_mm: 38.0,
             label_code: "barcode".to_string(),
             label_tags: "off".to_string(),
+            preview_ppi: 96.0,
             database_url: String::new(),
             library_auto_sync: true,
             shop_open_tabs: true,
@@ -182,6 +185,7 @@ impl Settings {
             "qr" => "qr".to_string(),
             _ => "barcode".to_string(),
         };
+        self.preview_ppi = clamp_mm(self.preview_ppi, 40.0, 400.0, 96.0);
         self.label_tags = match self.label_tags.trim().to_lowercase().as_str() {
             "outline" => "outline".to_string(),
             "filled" => "filled".to_string(),
@@ -487,5 +491,23 @@ mod printer_tests {
             Settings::load(&path).unwrap().tag_style(),
             Some(TagStyle::Filled)
         );
+    }
+
+    #[test]
+    fn the_preview_scale_is_96_by_default_and_kept_sane() {
+        assert_eq!(Settings::default().preview_ppi, 96.0);
+        for (value, expected) in [
+            (120.0, 120.0),
+            (1.0, 40.0),
+            (5000.0, 400.0),
+            (f32::NAN, 96.0),
+        ] {
+            let s = Settings {
+                preview_ppi: value,
+                ..Settings::default()
+            }
+            .normalized();
+            assert_eq!(s.preview_ppi, expected, "{value}");
+        }
     }
 }
