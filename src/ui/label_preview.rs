@@ -33,6 +33,87 @@ pub(super) struct LabelView {
     pub texture: egui::TextureId,
     pub size: egui::Vec2,
     pub caption: String,
+    /// The current settings, for the toggles: "off", "outline" or "filled" ...
+    pub tags_choice: String,
+    /// ... and "barcode" or "qr".
+    pub code_choice: String,
+    /// Whether the record has any styles to show as tags.
+    pub has_tags: bool,
+}
+
+/// A change made with the toggles beside the picture.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct LabelAction {
+    pub tags: Option<String>,
+    pub code: Option<String>,
+}
+
+/// Space around the label panel, in points.
+const PANEL_PADDING: f32 = 16.0;
+/// Space on each side of the line that splits the details.
+const SPLIT_MARGIN: f32 = 14.0;
+/// The record info needs at least this much width.
+const MIN_INFO_WIDTH: f32 = 260.0;
+
+/// How a details area of `available` width is split: the left part (cover and
+/// info, half of the width but not less than they need) and the right part with
+/// the label panel. `None` if the right part would be too small for the picture.
+pub(super) fn split_widths(
+    available: f32,
+    cover_width: f32,
+    picture_width: f32,
+) -> Option<(f32, f32)> {
+    let left = (available * 0.5).max(cover_width + 12.0 + MIN_INFO_WIDTH);
+    let right = available - left;
+    let needed = picture_width + 2.0 * PANEL_PADDING + 2.0 * SPLIT_MARGIN;
+    (right >= needed).then_some((left, right))
+}
+
+/// Draws the details in two parts with a line between them: `left` (cover and
+/// info) and `right` (the label panel). Returns what `right` returns.
+pub(super) fn split_pane<R>(
+    ui: &mut egui::Ui,
+    left_width: f32,
+    right_width: f32,
+    left: impl FnOnce(&mut egui::Ui),
+    right: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let mut result = None;
+    let spacing = ui.spacing().item_spacing;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let top = ui.cursor().top();
+        let left_x = ui.cursor().left();
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_width, 1.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing = spacing;
+                ui.set_max_width(left_width);
+                left(ui);
+            },
+        );
+        let line_x = left_x + left_width + SPLIT_MARGIN;
+        ui.add_space(2.0 * SPLIT_MARGIN);
+        let pane_width = (right_width - 2.0 * SPLIT_MARGIN).max(1.0);
+        let inner = ui.allocate_ui_with_layout(
+            egui::vec2(pane_width, 1.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing = spacing;
+                ui.set_max_width(pane_width);
+                right(ui)
+            },
+        );
+        result = Some(inner.inner);
+        let bottom = ui.min_rect().bottom();
+        ui.painter().vline(
+            line_x,
+            top..=bottom,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    });
+    result.expect("the right part is always drawn")
 }
 
 /// The size in points of a label of `width_mm` x `height_mm` that looks as big
@@ -155,6 +236,9 @@ impl RecordShelfApp {
             texture: p.texture.id(),
             size: p.display,
             caption: p.caption.clone(),
+            tags_choice: self.settings.label_tags.clone(),
+            code_choice: self.settings.label_code.clone(),
+            has_tags: !p.content.tags.is_empty(),
         })
     }
 
@@ -171,18 +255,87 @@ impl RecordShelfApp {
     }
 }
 
-/// The picture, framed, with its caption underneath, flush with the right edge
-/// of the space that is left in `ui`.
-pub(super) fn draw_label_view(ui: &mut egui::Ui, view: &LabelView) {
-    let space = egui::vec2(ui.available_width(), view.size.y + 40.0);
-    ui.allocate_ui_with_layout(space, egui::Layout::top_down(egui::Align::Max), |ui| {
-        egui::Frame::none()
-            .stroke(egui::Stroke::new(1.0_f32, Color32::GRAY))
-            .show(ui, |ui| {
-                ui.add(egui::Image::new((view.texture, view.size)));
-            });
-        ui.label(RichText::new(&view.caption).small());
-    });
+/// The label panel: the picture with its caption and the toggles for the style
+/// tags and the code, with space around it. Returns what was changed.
+pub(super) fn draw_label_panel(ui: &mut egui::Ui, view: &LabelView) -> LabelAction {
+    let mut action = LabelAction::default();
+    egui::Frame::none()
+        .inner_margin(egui::Margin::same(PANEL_PADDING))
+        .show(ui, |ui| {
+            ui.label(RichText::new("Label").strong());
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .stroke(egui::Stroke::new(1.0_f32, Color32::GRAY))
+                .show(ui, |ui| {
+                    ui.add(egui::Image::new((view.texture, view.size)));
+                });
+            ui.label(RichText::new(&view.caption).small());
+            ui.add_space(8.0);
+
+            let choose =
+                |ui: &mut egui::Ui, caption: &str, current: &str, options: &[(&str, &str)]| {
+                    let mut picked = None;
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{caption}:"));
+                        for (value, name) in options {
+                            if ui.selectable_label(current == *value, *name).clicked()
+                                && current != *value
+                            {
+                                picked = Some(value.to_string());
+                            }
+                        }
+                    });
+                    picked
+                };
+            action.tags = choose(
+                ui,
+                "Style tags",
+                &view.tags_choice,
+                &[
+                    ("off", "Off"),
+                    ("outline", "Outlined"),
+                    ("filled", "Filled"),
+                ],
+            );
+            if view.tags_choice != "off" && !view.has_tags {
+                ui.label(RichText::new("(this record has no styles)").small().weak());
+            }
+            action.code = choose(
+                ui,
+                "Code",
+                &view.code_choice,
+                &[("barcode", "Barcode"), ("qr", "QR code")],
+            );
+        });
+    action
+}
+
+impl RecordShelfApp {
+    /// Applies a choice made with the toggles: the label settings change (they
+    /// are what the next print uses) and are remembered in the settings file.
+    pub(super) fn apply_label_action(&mut self, action: LabelAction) {
+        if action == LabelAction::default() {
+            return;
+        }
+        if let Some(tags) = &action.tags {
+            self.settings.label_tags = tags.clone();
+        }
+        if let Some(code) = &action.code {
+            self.settings.label_code = code.clone();
+        }
+        let (tags, code) = (
+            self.settings.label_tags.clone(),
+            self.settings.label_code.clone(),
+        );
+        if let Some(path) = &self.config_path
+            && let Err(err) = Settings::update_on_disk(path, |s| {
+                s.label_tags = tags;
+                s.label_code = code;
+            })
+        {
+            self.set_error(format!("{err:#}"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -567,8 +720,12 @@ mod tests {
             "inside the window: {picture:?}"
         );
         assert!(
-            picture.max.x > 1300.0 - 60.0,
-            "at the right edge: {picture:?}"
+            picture.min.x > 400.0,
+            "beyond the info (the list is at the left): {picture:?}"
+        );
+        assert!(
+            picture.max.x < 1300.0 - 8.0 && picture.min.y > 8.0,
+            "out of the corner: {picture:?}"
         );
         let info: Vec<_> = texts
             .iter()
@@ -641,8 +798,56 @@ mod tests {
         let (picture, _) = layout_frame(&mut app, 1300.0, 900.0);
         let picture = picture.expect("drawn on the Add records tab");
         assert!(
-            picture.max.x > 1300.0 - 60.0 && picture.max.x <= 1300.5,
+            picture.min.x > 400.0 && picture.max.x < 1300.0 - 8.0,
             "{picture:?}"
         );
+    }
+
+    #[test]
+    fn the_toggles_are_beside_the_picture() {
+        let mut app = collection_app();
+        app.collection.details = Some(long_record());
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (picture, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        let picture = picture.unwrap();
+        for name in ["Outlined", "Filled", "Barcode", "QR code"] {
+            let (_, rect) = texts
+                .iter()
+                .find(|(t, _)| t == name)
+                .unwrap_or_else(|| panic!("{name} toggle"));
+            assert!(
+                rect.min.x >= picture.min.x - 0.5,
+                "{name} aligned with the picture"
+            );
+        }
+    }
+
+    #[test]
+    fn toggles_change_and_remember_the_label_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "token = \"keep\"\n").unwrap();
+        let mut app = collection_app();
+        app.config_path = Some(path.clone());
+        app.apply_label_action(LabelAction {
+            tags: Some("filled".into()),
+            code: Some("qr".into()),
+        });
+        assert_eq!(app.settings.label_tags, "filled");
+        assert_eq!(app.settings.label_code, "qr");
+        let saved = Settings::load(&path).unwrap();
+        assert_eq!(saved.label_tags, "filled");
+        assert_eq!(saved.label_code, "qr");
+        assert_eq!(saved.token, "keep");
+        app.apply_label_action(LabelAction::default());
+        assert_eq!(app.settings.label_tags, "filled");
+    }
+
+    #[test]
+    fn the_split_needs_room() {
+        assert!(split_widths(1300.0, 220.0, 193.0).is_some());
+        assert!(split_widths(700.0, 220.0, 193.0).is_none());
+        let (left, right) = split_widths(1300.0, 220.0, 193.0).unwrap();
+        assert!((left + right - 1300.0).abs() < 0.01);
     }
 }

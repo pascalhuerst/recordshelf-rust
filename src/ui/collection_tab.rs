@@ -1,6 +1,7 @@
 //! The "Search Collection" tab: browse and search the records in our own
 //! database, and look up a scanned sticker there (never on Discogs).
 
+use super::label_preview;
 use super::*;
 use crate::catalogue::join_separator;
 use crate::collection::{ListState, NotesEditor};
@@ -621,6 +622,7 @@ impl RecordShelfApp {
                 .map(|d| LabelContent::from_stored(d));
             self.label_view(ui.ctx(), content)
         };
+        let mut label_action = label_preview::LabelAction::default();
         egui::ScrollArea::vertical()
             .id_source("collection-details")
             .auto_shrink([false, false])
@@ -639,34 +641,42 @@ impl RecordShelfApp {
                     }
                     return;
                 };
-                // the label picture needs room beside the info; without it, it is left out
-                let view = label_view.as_ref().filter(|v| {
-                    ui.available_width() - COVER_SIZE - v.size.x - 24.0 >= MIN_INFO_WIDTH
+                let split = label_view.as_ref().and_then(|v| {
+                    label_preview::split_widths(ui.available_width(), COVER_SIZE, v.size.x)
                 });
-                let info_width = ui.available_width()
-                    - COVER_SIZE
-                    - view.map_or(0.0, |v| v.size.x + 24.0)
-                    - 12.0;
-                ui.horizontal_top(|ui| {
-                    if self.collection.selected_row().is_some_and(|r| r.has_cover) {
-                        draw_image(ui, &self.images, &cover_key(record.id), COVER_SIZE);
-                    } else {
-                        draw_placeholder(ui, COVER_SIZE);
-                    }
-                    ui.vertical(|ui| {
-                        ui.set_max_width(info_width.max(MIN_INFO_WIDTH));
-                        render_stored(ui, record, &mut sink);
+                let has_cover = self.collection.selected_row().is_some_and(|r| r.has_cover);
+                // cover and info; `width` is what the info may use
+                let mut draw_info = |ui: &mut egui::Ui, width: f32| {
+                    ui.horizontal_top(|ui| {
+                        if has_cover {
+                            draw_image(ui, &self.images, &cover_key(record.id), COVER_SIZE);
+                        } else {
+                            draw_placeholder(ui, COVER_SIZE);
+                        }
+                        ui.vertical(|ui| {
+                            ui.set_max_width((width - COVER_SIZE - 12.0).max(120.0));
+                            render_stored(ui, record, &mut sink);
+                        });
                     });
-                    if let Some(view) = view {
-                        // at the right edge, beside the record info
-                        super::label_preview::draw_label_view(ui, view);
+                };
+                match (split, &label_view) {
+                    (Some((left, right)), Some(view)) => {
+                        label_action = label_preview::split_pane(
+                            ui,
+                            left,
+                            right,
+                            |ui| draw_info(ui, left),
+                            |ui| label_preview::draw_label_panel(ui, view),
+                        );
                     }
-                });
+                    _ => draw_info(ui, ui.available_width()),
+                }
             });
         #[cfg(test)]
         {
             self.collection.test_links = std::mem::take(&mut sink.seen);
         }
+        self.apply_label_action(label_action);
         if let Some(value) = sink.clicked {
             self.collection.search_for(&value);
             self.collection.focus_search = false;

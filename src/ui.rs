@@ -78,9 +78,6 @@ const PREFETCH_LIMIT: usize = 5;
 /// so that holding an arrow key does not flood the API.
 const SELECTION_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// The record info needs at least this much width before the label picture is shown beside it.
-const MIN_INFO_WIDTH: f32 = 260.0;
-
 const THUMB_SIZE: f32 = 56.0;
 const COVER_SIZE: f32 = 220.0;
 
@@ -1622,47 +1619,54 @@ impl RecordShelfApp {
             let content = self.shown_release_label();
             self.label_view(ui.ctx(), content)
         };
+        let mut label_action = label_preview::LabelAction::default();
         egui::ScrollArea::vertical()
             .id_source("search-release")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(release) = self.selected_release() {
                     let owned = release.id.and_then(|id| self.ownership.get(&id));
-                    // the label picture needs room beside the info; without it, it is left out
-                    let view = label_view.as_ref().filter(|v| {
-                        ui.available_width() - COVER_SIZE - v.size.x - 24.0 >= MIN_INFO_WIDTH
+                    let split = label_view.as_ref().and_then(|v| {
+                        label_preview::split_widths(ui.available_width(), COVER_SIZE, v.size.x)
                     });
-                    let info_width = ui.available_width()
-                        - COVER_SIZE
-                        - view.map_or(0.0, |v| v.size.x + 24.0)
-                        - 12.0;
-                    ui.horizontal_top(|ui| {
-                        match &cover {
-                            Some(url) => {
-                                draw_image(ui, &self.images, url, COVER_SIZE);
+                    // cover and info; `width` is what the info may use
+                    let draw_info = |ui: &mut egui::Ui, width: f32| {
+                        ui.horizontal_top(|ui| {
+                            match &cover {
+                                Some(url) => {
+                                    draw_image(ui, &self.images, url, COVER_SIZE);
+                                }
+                                None => draw_placeholder(ui, COVER_SIZE),
                             }
-                            None => draw_placeholder(ui, COVER_SIZE),
-                        }
-                        ui.vertical(|ui| {
-                            ui.set_max_width(info_width.max(MIN_INFO_WIDTH));
-                            render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
-                            if self.library_ready()
-                                && let Some(id) = release.id
-                                && let Some((text, color)) = library_line(
-                                    owned.map(Vec::len),
-                                    self.library.get(&id).copied(),
-                                )
-                            {
-                                ui.colored_label(color, text);
-                                ui.add_space(4.0);
-                            }
-                            render_release(ui, release);
+                            ui.vertical(|ui| {
+                                ui.set_max_width((width - COVER_SIZE - 12.0).max(120.0));
+                                render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
+                                if self.library_ready()
+                                    && let Some(id) = release.id
+                                    && let Some((text, color)) = library_line(
+                                        owned.map(Vec::len),
+                                        self.library.get(&id).copied(),
+                                    )
+                                {
+                                    ui.colored_label(color, text);
+                                    ui.add_space(4.0);
+                                }
+                                render_release(ui, release);
+                            });
                         });
-                        if let Some(view) = view {
-                            // at the right edge, beside the record info
-                            label_preview::draw_label_view(ui, view);
+                    };
+                    match (split, &label_view) {
+                        (Some((left, right)), Some(view)) => {
+                            label_action = label_preview::split_pane(
+                                ui,
+                                left,
+                                right,
+                                |ui| draw_info(ui, left),
+                                |ui| label_preview::draw_label_panel(ui, view),
+                            );
                         }
-                    });
+                        _ => draw_info(ui, ui.available_width()),
+                    }
                 } else if self.selected_id().is_some() {
                     ui.horizontal_top(|ui| {
                         draw_placeholder(ui, COVER_SIZE);
@@ -1670,6 +1674,7 @@ impl RecordShelfApp {
                     });
                 }
             });
+        self.apply_label_action(label_action);
     }
 
     fn handle_search_keys(&mut self, ctx: &egui::Context) {
