@@ -121,6 +121,9 @@ pub struct RecordShelfApp {
     scanner_stop: Arc<AtomicBool>,
     scanner_rx: Receiver<ScanEvent>,
     scanner_status: String,
+    /// A scanner thread is listening to a device.
+    scanner_running: bool,
+    scanner_next_try: Instant,
     notice: Option<Notice>,
     folders: Vec<CollectionFolder>,
     folder_picker_open: bool,
@@ -179,7 +182,8 @@ impl RecordShelfApp {
     ) -> Self {
         egui_extras::install_image_loaders(&repaint);
         repaint.set_zoom_factor(settings.zoom());
-        let (scanner_stop, scanner_rx, scanner_status) = start_scanner(&settings, &repaint);
+        let (scanner_stop, scanner_rx, scanner_status, scanner_running) =
+            start_scanner(&settings, &repaint);
         let mut app = Self {
             worker: Worker::spawn(repaint.clone()),
             settings,
@@ -188,6 +192,8 @@ impl RecordShelfApp {
             scanner_stop,
             scanner_rx,
             scanner_status,
+            scanner_running,
+            scanner_next_try: Instant::now() + SCANNER_RETRY,
             notice: None,
             folders: Vec::new(),
             folder_picker_open: false,
@@ -719,6 +725,33 @@ impl RecordShelfApp {
         self.releases.get(&self.selected_id()?)
     }
 
+    /// Looks for a scanner that was not there at the start or that was unplugged.
+    fn retry_scanner(&mut self, ctx: &egui::Context) {
+        let configured = !self.settings.device_name.trim().is_empty()
+            || !self.settings.device_path.trim().is_empty();
+        if self.scanner_running || !configured {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.scanner_next_try {
+            ctx.request_repaint_after(self.scanner_next_try - now);
+            return;
+        }
+        self.scanner_stop.store(true, Ordering::SeqCst);
+        let (stop, rx, status, running) = start_scanner(&self.settings, &self.repaint);
+        self.scanner_stop = stop;
+        self.scanner_rx = rx;
+        self.scanner_running = running;
+        self.scanner_next_try = now + SCANNER_RETRY;
+        if running {
+            self.scanner_status = status;
+        } else {
+            // keep the explanation of what is missing, unchanged between tries
+            self.scanner_status = status;
+            ctx.request_repaint_after(SCANNER_RETRY);
+        }
+    }
+
     /// Remembers zoom changes (Ctrl +/-) in the settings file.
     fn persist_zoom(&mut self, ctx: &egui::Context) {
         let zoom = ctx.zoom_factor();
@@ -789,10 +822,12 @@ impl RecordShelfApp {
 
         if scanner_changed {
             self.scanner_stop.store(true, Ordering::SeqCst);
-            let (stop, rx, status) = start_scanner(&self.settings, &self.repaint);
+            let (stop, rx, status, running) = start_scanner(&self.settings, &self.repaint);
             self.scanner_stop = stop;
             self.scanner_rx = rx;
             self.scanner_status = status;
+            self.scanner_running = running;
+            self.scanner_next_try = Instant::now() + SCANNER_RETRY;
         }
         if discogs_changed {
             // other credentials may mean another account: forget what we fetched
@@ -1141,6 +1176,10 @@ impl RecordShelfApp {
         while let Ok(ev) = self.scanner_rx.try_recv() {
             match ev {
                 ScanEvent::Info(msg) => self.scanner_status = msg,
+                ScanEvent::Stopped => {
+                    self.scanner_running = false;
+                    self.scanner_next_try = Instant::now() + SCANNER_RETRY;
+                }
                 ScanEvent::Code(code) => {
                     self.scanner_status = format!("Scanned {code}");
                     match self.tab {
@@ -2048,6 +2087,7 @@ impl eframe::App for RecordShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.sync_selection(ctx);
+        self.retry_scanner(ctx);
         self.persist_zoom(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -2170,22 +2210,33 @@ fn step(selected: &mut Option<usize>, len: usize, up: bool, down: bool) {
 fn start_scanner(
     settings: &Settings,
     repaint: &egui::Context,
-) -> (Arc<AtomicBool>, Receiver<ScanEvent>, String) {
+) -> (Arc<AtomicBool>, Receiver<ScanEvent>, String, bool) {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel();
     let devices = barcode_reader::list_devices();
-    let status =
+    let (status, running) =
         match barcode_reader::pick_device(&devices, &settings.device_name, &settings.device_path) {
             Some(path) => {
                 match BarcodeReader::spawn(path, stop.clone(), tx, Some(repaint.clone())) {
-                    Ok(()) => "Waiting for scans...".to_string(),
-                    Err(err) => format!("Scanner not started: {err}"),
+                    Ok(()) => ("Waiting for scans...".to_string(), true),
+                    Err(err) => (format!("Scanner not started: {err}"), false),
                 }
             }
-            None => "No scanner configured (set device_name in the settings file)".to_string(),
+            None => (
+                barcode_reader::explain_missing(
+                    &devices,
+                    &settings.device_name,
+                    &settings.device_path,
+                ),
+                false,
+            ),
         };
-    (stop, rx, status)
+    (stop, rx, status, running)
 }
+
+/// How often a scanner that is not there is looked for again (plugging it in
+/// is enough, no restart needed).
+const SCANNER_RETRY: Duration = Duration::from_secs(3);
 
 /// Draws a downloaded picture, or a placeholder box, always occupying exactly
 /// `size` x `size` so that rows and layouts do not shift.
@@ -3962,5 +4013,76 @@ mod tests {
     fn the_status_bar_lists_only_the_browser_shops() {
         // deejay.de needs no tab, so it has no connection indicator
         assert!(!Shop::BROWSER.contains(&Shop::Deejay));
+    }
+
+    // --- scanner ------------------------------------------------------------------------
+
+    #[test]
+    fn a_scanner_that_is_not_plugged_in_is_explained_and_looked_for_again() {
+        let mut app = app_with_results(0);
+        app.settings.device_name = "No Such Scanner 12345".into();
+        app.settings.device_path = String::new();
+        app.scanner_running = false;
+        app.scanner_next_try = Instant::now() - Duration::from_secs(1);
+        let ctx = app.repaint.clone();
+        app.retry_scanner(&ctx);
+        assert!(!app.scanner_running);
+        assert!(
+            app.scanner_status
+                .contains("\"No Such Scanner 12345\" not found"),
+            "{}",
+            app.scanner_status
+        );
+        assert!(
+            app.scanner_next_try > Instant::now(),
+            "the next try is later"
+        );
+        // not again before the time is up
+        app.scanner_status = "marker".into();
+        app.retry_scanner(&ctx);
+        assert_eq!(app.scanner_status, "marker");
+    }
+
+    #[test]
+    fn nothing_is_retried_without_a_configured_scanner() {
+        let mut app = app_with_results(0);
+        app.settings.device_name = String::new();
+        app.settings.device_path = String::new();
+        app.scanner_running = false;
+        app.scanner_next_try = Instant::now() - Duration::from_secs(1);
+        app.scanner_status = "marker".into();
+        let ctx = app.repaint.clone();
+        app.retry_scanner(&ctx);
+        assert_eq!(app.scanner_status, "marker");
+    }
+
+    #[test]
+    fn a_stopped_scanner_thread_makes_the_app_look_again() {
+        let mut app = app_with_results(0);
+        app.scanner_running = true;
+        // a second channel stands in for the scanner thread
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.scanner_rx = rx;
+        tx.send(ScanEvent::Info("Scanner lost".into())).unwrap();
+        tx.send(ScanEvent::Stopped).unwrap();
+        app.drain_events();
+        assert!(!app.scanner_running);
+        assert_eq!(app.scanner_status, "Scanner lost");
+        assert!(app.scanner_next_try > Instant::now());
+    }
+
+    #[test]
+    fn saving_the_scanner_settings_starts_the_search_for_the_new_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings_draft.device_name = "Another Missing Scanner".into();
+        app.save_settings();
+        assert!(
+            app.scanner_status
+                .contains("\"Another Missing Scanner\" not found"),
+            "{}",
+            app.scanner_status
+        );
+        assert!(!app.scanner_running);
     }
 }

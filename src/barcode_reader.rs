@@ -27,6 +27,8 @@ fn emit(tx: &Sender<ScanEvent>, repaint: &Option<EguiContext>, event: ScanEvent)
 pub enum ScanEvent {
     Info(String),
     Code(String),
+    /// The scanner thread ended (device missing or unplugged); the app may try again later.
+    Stopped,
 }
 
 /// An input device that could be a barcode scanner (it reports digit keys and Enter).
@@ -68,6 +70,25 @@ pub fn pick_device(devices: &[InputDevice], name: &str, fallback_path: &str) -> 
     (!fallback.is_empty()).then(|| PathBuf::from(fallback))
 }
 
+/// Why no device was picked: what to tell the user.
+pub fn explain_missing(devices: &[InputDevice], name: &str, fallback_path: &str) -> String {
+    let (name, path) = (name.trim(), fallback_path.trim());
+    if name.is_empty() && path.is_empty() {
+        return "No scanner configured (pick one in Settings)".to_string();
+    }
+    let wanted = if name.is_empty() { path } else { name };
+    let connected = if devices.is_empty() {
+        "none".to_string()
+    } else {
+        devices
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("Scanner \"{wanted}\" not found. Connected input devices: {connected}")
+}
+
 pub struct BarcodeReader;
 
 impl BarcodeReader {
@@ -102,6 +123,7 @@ fn scanner_loop(
                     device_path.display()
                 )),
             );
+            emit(&tx, &repaint, ScanEvent::Stopped);
             return;
         }
     };
@@ -112,6 +134,7 @@ fn scanner_loop(
             &repaint,
             ScanEvent::Info(format!("Failed to set device non-blocking: {err}")),
         );
+        emit(&tx, &repaint, ScanEvent::Stopped);
         return;
     }
 
@@ -142,9 +165,11 @@ fn scanner_loop(
                 emit(
                     &tx,
                     &repaint,
-                    ScanEvent::Info(format!("Read error on {}: {err}", device_path.display())),
+                    ScanEvent::Info(format!("Scanner {} lost: {err}", device_path.display())),
                 );
-                thread::sleep(Duration::from_millis(25));
+                // unplugged or otherwise gone: end the thread, the app looks for it again
+                emit(&tx, &repaint, ScanEvent::Stopped);
+                return;
             }
         }
     }
@@ -485,5 +510,34 @@ mod tests {
             }
         }
         assert_eq!(codes, ["CNF/O1", "525768"]);
+    }
+
+    #[test]
+    fn a_missing_scanner_is_explained_with_what_is_connected() {
+        let devices = vec![
+            InputDevice {
+                path: PathBuf::from("/dev/input/event2"),
+                name: "AT Translated Set 2 keyboard".into(),
+            },
+            InputDevice {
+                path: PathBuf::from("/dev/input/event16"),
+                name: "HID 0581:011a".into(),
+            },
+        ];
+        let text = explain_missing(&devices, "Belon.cn 2.4G Wireless Device", "");
+        assert!(
+            text.contains("\"Belon.cn 2.4G Wireless Device\" not found"),
+            "{text}"
+        );
+        assert!(
+            text.contains("HID 0581:011a") && text.contains("AT Translated Set 2 keyboard"),
+            "{text}"
+        );
+        assert!(explain_missing(&[], "X", "").contains("Connected input devices: none"));
+        assert!(explain_missing(&devices, "", "/dev/input/event99").contains("/dev/input/event99"));
+        assert_eq!(
+            explain_missing(&devices, "  ", " "),
+            "No scanner configured (pick one in Settings)"
+        );
     }
 }
