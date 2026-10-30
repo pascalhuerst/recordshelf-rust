@@ -27,47 +27,88 @@ fn emit(tx: &Sender<ScanEvent>, repaint: &Option<EguiContext>, event: ScanEvent)
 pub enum ScanEvent {
     Info(String),
     Code(String),
-    /// The scanner thread ended (device missing or unplugged); the app may try again later.
-    Stopped,
+    /// The reader thread of this device ended (missing or unplugged); the app may try again later.
+    Stopped(PathBuf),
 }
 
-/// An input device that could be a barcode scanner (it reports digit keys and Enter).
+/// An input device that could be a barcode scanner (it reports keys).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputDevice {
     pub path: PathBuf,
     pub name: String,
+    /// It has Enter and digit keys (also as keypad keys), as a scanner has.
+    /// Other devices that report keys are listed too, for scanners that
+    /// present themselves differently.
+    pub keyboard_like: bool,
 }
 
 /// Lists keyboard-like input devices. Event node numbers change between
 /// boots and USB ports, so devices are identified by name instead.
 pub fn list_devices() -> Vec<InputDevice> {
     let mut out: Vec<InputDevice> = evdev::enumerate()
-        .filter(|(_, dev)| {
-            dev.supported_keys()
-                .is_some_and(|k| k.contains(KeyCode::KEY_ENTER) && k.contains(KeyCode::KEY_1))
-        })
-        .map(|(path, dev)| InputDevice {
-            path,
-            name: dev.name().unwrap_or_default().to_string(),
+        .filter_map(|(path, dev)| {
+            let keys = dev.supported_keys()?;
+            let any = |codes: &[KeyCode]| codes.iter().any(|c| keys.contains(*c));
+            let enter = any(&[KeyCode::KEY_ENTER, KeyCode::KEY_KPENTER]);
+            let digit = any(&[KeyCode::KEY_1, KeyCode::KEY_KP1]);
+            // devices without any of these (mice, buttons) are of no use
+            (enter || digit || any(&[KeyCode::KEY_A])).then(|| InputDevice {
+                path,
+                name: dev.name().unwrap_or_default().to_string(),
+                keyboard_like: enter && digit,
+            })
         })
         .collect();
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-/// Chooses the device to open: the first whose name contains `name`
-/// (case-insensitive), otherwise `fallback_path` if set.
-pub fn pick_device(devices: &[InputDevice], name: &str, fallback_path: &str) -> Option<PathBuf> {
-    let name = name.trim().to_lowercase();
-    if !name.is_empty()
-        && let Some(dev) = devices
-            .iter()
-            .find(|d| d.name.to_lowercase().contains(&name))
-    {
-        return Some(dev.path.clone());
+/// The scanner names of the settings: several can be given, separated by `;`.
+pub fn split_names(names: &str) -> Vec<String> {
+    names
+        .split(';')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// `names` with `name` added, or removed when it is in there already
+/// (comparing without case); the settings text for the next choice.
+pub fn toggle_name(names: &str, name: &str) -> String {
+    let mut list = split_names(names);
+    let before = list.len();
+    list.retain(|n| !n.eq_ignore_ascii_case(name.trim()));
+    if list.len() == before && !name.trim().is_empty() {
+        list.push(name.trim().to_string());
     }
-    let fallback = fallback_path.trim();
-    (!fallback.is_empty()).then(|| PathBuf::from(fallback))
+    list.join("; ")
+}
+
+/// Chooses the devices to open: every one whose name contains one of the
+/// `names` (case-insensitive; several receivers of one model all count),
+/// otherwise `fallback_path` if set.
+pub fn pick_devices(devices: &[InputDevice], names: &str, fallback_path: &str) -> Vec<PathBuf> {
+    let names: Vec<String> = split_names(names)
+        .iter()
+        .map(|n| n.to_lowercase())
+        .collect();
+    let mut found: Vec<PathBuf> = devices
+        .iter()
+        .filter(|d| {
+            let name = d.name.to_lowercase();
+            names.iter().any(|n| name.contains(n))
+        })
+        .map(|d| d.path.clone())
+        .collect();
+    found.dedup();
+    if found.is_empty() {
+        let fallback = fallback_path.trim();
+        if !fallback.is_empty() {
+            found.push(PathBuf::from(fallback));
+        }
+    }
+    found
 }
 
 /// Why no device was picked: what to tell the user.
@@ -76,7 +117,15 @@ pub fn explain_missing(devices: &[InputDevice], name: &str, fallback_path: &str)
     if name.is_empty() && path.is_empty() {
         return "No scanner configured (pick one in Settings)".to_string();
     }
-    let wanted = if name.is_empty() { path } else { name };
+    let wanted = if name.is_empty() {
+        path.to_string()
+    } else {
+        split_names(name)
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let connected = if devices.is_empty() {
         "none".to_string()
     } else {
@@ -86,7 +135,7 @@ pub fn explain_missing(devices: &[InputDevice], name: &str, fallback_path: &str)
             .collect::<Vec<_>>()
             .join(", ")
     };
-    format!("Scanner \"{wanted}\" not found. Connected input devices: {connected}")
+    format!("Scanner {wanted} not found. Connected input devices: {connected}")
 }
 
 pub struct BarcodeReader;
@@ -123,7 +172,7 @@ fn scanner_loop(
                     device_path.display()
                 )),
             );
-            emit(&tx, &repaint, ScanEvent::Stopped);
+            emit(&tx, &repaint, ScanEvent::Stopped(device_path.clone()));
             return;
         }
     };
@@ -134,7 +183,7 @@ fn scanner_loop(
             &repaint,
             ScanEvent::Info(format!("Failed to set device non-blocking: {err}")),
         );
-        emit(&tx, &repaint, ScanEvent::Stopped);
+        emit(&tx, &repaint, ScanEvent::Stopped(device_path.clone()));
         return;
     }
 
@@ -168,7 +217,7 @@ fn scanner_loop(
                     ScanEvent::Info(format!("Scanner {} lost: {err}", device_path.display())),
                 );
                 // unplugged or otherwise gone: end the thread, the app looks for it again
-                emit(&tx, &repaint, ScanEvent::Stopped);
+                emit(&tx, &repaint, ScanEvent::Stopped(device_path.clone()));
                 return;
             }
         }
@@ -284,6 +333,7 @@ mod tests {
         InputDevice {
             path: PathBuf::from(path),
             name: name.to_string(),
+            keyboard_like: true,
         }
     }
 
@@ -294,45 +344,92 @@ mod tests {
         ]
     }
 
+    fn paths(list: Vec<PathBuf>) -> Vec<String> {
+        list.iter().map(|p| p.display().to_string()).collect()
+    }
+
     #[test]
     fn picks_device_by_name_even_if_renumbered() {
         let mut devs = devices();
         assert_eq!(
-            pick_device(&devs, "barcode scanner", ""),
-            Some(PathBuf::from("/dev/input/event17"))
+            paths(pick_devices(&devs, "barcode scanner", "")),
+            ["/dev/input/event17"]
         );
         devs[1].path = PathBuf::from("/dev/input/event5");
         assert_eq!(
-            pick_device(&devs, "Barcode Scanner", ""),
-            Some(PathBuf::from("/dev/input/event5"))
+            paths(pick_devices(&devs, "Barcode Scanner", "")),
+            ["/dev/input/event5"]
         );
     }
 
     #[test]
     fn name_takes_precedence_over_fallback_path() {
         assert_eq!(
-            pick_device(&devices(), "NT-1228", "/dev/input/event99"),
-            Some(PathBuf::from("/dev/input/event17"))
+            paths(pick_devices(&devices(), "NT-1228", "/dev/input/event99")),
+            ["/dev/input/event17"]
         );
     }
 
     #[test]
     fn falls_back_to_path_when_name_does_not_match() {
         assert_eq!(
-            pick_device(&devices(), "unplugged", "/dev/input/event9"),
-            Some(PathBuf::from("/dev/input/event9"))
+            paths(pick_devices(&devices(), "unplugged", "/dev/input/event9")),
+            ["/dev/input/event9"]
         );
         assert_eq!(
-            pick_device(&[], "", "/dev/input/event9"),
-            Some(PathBuf::from("/dev/input/event9"))
+            paths(pick_devices(&[], "", "/dev/input/event9")),
+            ["/dev/input/event9"]
         );
     }
 
     #[test]
     fn nothing_configured_picks_nothing() {
-        assert_eq!(pick_device(&devices(), "", ""), None);
-        assert_eq!(pick_device(&devices(), "  ", "  "), None);
-        assert_eq!(pick_device(&devices(), "unplugged", ""), None);
+        assert!(pick_devices(&devices(), "", "").is_empty());
+        assert!(pick_devices(&devices(), "  ;; ", "  ").is_empty());
+        assert!(pick_devices(&devices(), "unplugged", "").is_empty());
+    }
+
+    #[test]
+    fn several_names_and_several_devices_of_one_name_are_all_used() {
+        let mut devs = devices();
+        devs.push(dev("/dev/input/event16", "HID 0581:011a"));
+        devs.push(dev("/dev/input/event20", "HID 0581:011a"));
+        assert_eq!(
+            paths(pick_devices(&devs, "Barcode Scanner; hid 0581:011a", "")),
+            [
+                "/dev/input/event17",
+                "/dev/input/event16",
+                "/dev/input/event20"
+            ],
+            "every device of every name"
+        );
+        assert_eq!(
+            paths(pick_devices(&devs, "HID 0581:011a", "/dev/input/event99")),
+            ["/dev/input/event16", "/dev/input/event20"],
+            "the fallback only counts when nothing matches"
+        );
+    }
+
+    #[test]
+    fn names_are_split_and_toggled() {
+        assert_eq!(split_names(" A ;B;; C "), ["A", "B", "C"]);
+        assert!(split_names("").is_empty());
+        assert_eq!(toggle_name("", "HID 0581:011a"), "HID 0581:011a");
+        assert_eq!(toggle_name("A", "B"), "A; B");
+        assert_eq!(
+            toggle_name("A; B", "a"),
+            "B",
+            "picking it again takes it out"
+        );
+        assert_eq!(toggle_name("A", " "), "A");
+    }
+
+    #[test]
+    fn the_explanation_names_every_wanted_scanner() {
+        let text = explain_missing(&devices(), "One; Two", "");
+        assert!(text.contains("\"One\", \"Two\" not found"), "{text}");
+        assert!(text.contains("Barcode Scanner"), "{text}");
+        assert!(explain_missing(&[], " ", " ").contains("No scanner configured"));
     }
 
     #[test]
@@ -518,10 +615,12 @@ mod tests {
             InputDevice {
                 path: PathBuf::from("/dev/input/event2"),
                 name: "AT Translated Set 2 keyboard".into(),
+                keyboard_like: true,
             },
             InputDevice {
                 path: PathBuf::from("/dev/input/event16"),
                 name: "HID 0581:011a".into(),
+                keyboard_like: true,
             },
         ];
         let text = explain_missing(&devices, "Belon.cn 2.4G Wireless Device", "");

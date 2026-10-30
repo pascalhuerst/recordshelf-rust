@@ -139,6 +139,8 @@ pub struct RecordShelfApp {
     worker: Worker,
     scanner_stop: Arc<AtomicBool>,
     scanner_rx: Receiver<ScanEvent>,
+    /// The reader threads send their scans through this.
+    scanner_tx: std::sync::mpsc::Sender<ScanEvent>,
     scanner_status: String,
     /// The label picture beside the record info.
     label_panel: Option<label_preview::LabelPanel>,
@@ -146,8 +148,8 @@ pub struct RecordShelfApp {
     url_opener: UrlOpener,
     /// When the shop pages are to be opened, if still to be done.
     shop_tabs_due: Option<Instant>,
-    /// A scanner thread is listening to a device.
-    scanner_running: bool,
+    /// The devices a scanner thread is listening to (several receivers can work at once).
+    scanner_active: HashSet<PathBuf>,
     scanner_next_try: Instant,
     notice: Option<Notice>,
     folders: Vec<CollectionFolder>,
@@ -208,7 +210,7 @@ impl RecordShelfApp {
     ) -> Self {
         egui_extras::install_image_loaders(&repaint);
         repaint.set_zoom_factor(settings.zoom());
-        let (scanner_stop, scanner_rx, scanner_status, scanner_running) =
+        let (scanner_stop, scanner_rx, scanner_tx, scanner_status, scanner_active) =
             start_scanner(&settings, &repaint);
         let mut app = Self {
             worker: Worker::spawn(repaint.clone()),
@@ -217,11 +219,12 @@ impl RecordShelfApp {
             repaint,
             scanner_stop,
             scanner_rx,
+            scanner_tx,
             scanner_status,
             label_panel: None,
             url_opener: Box::new(system_opener),
             shop_tabs_due: None,
-            scanner_running,
+            scanner_active,
             scanner_next_try: Instant::now() + SCANNER_RETRY,
             notice: None,
             folders: Vec::new(),
@@ -805,7 +808,7 @@ impl RecordShelfApp {
     fn retry_scanner(&mut self, ctx: &egui::Context) {
         let configured = !self.settings.device_name.trim().is_empty()
             || !self.settings.device_path.trim().is_empty();
-        if self.scanner_running || !configured {
+        if !configured {
             return;
         }
         let now = Instant::now();
@@ -813,19 +816,28 @@ impl RecordShelfApp {
             ctx.request_repaint_after(self.scanner_next_try - now);
             return;
         }
-        self.scanner_stop.store(true, Ordering::SeqCst);
-        let (stop, rx, status, running) = start_scanner(&self.settings, &self.repaint);
-        self.scanner_stop = stop;
-        self.scanner_rx = rx;
-        self.scanner_running = running;
         self.scanner_next_try = now + SCANNER_RETRY;
-        if running {
-            self.scanner_status = status;
-        } else {
+        // receivers that were plugged in meanwhile start; the ones working go on
+        let devices = barcode_reader::list_devices();
+        let started = spawn_readers(
+            &self.settings,
+            &devices,
+            &self.repaint,
+            &self.scanner_stop,
+            &self.scanner_tx,
+            &mut self.scanner_active,
+        );
+        if started > 0 {
+            self.scanner_status = "Waiting for scans...".to_string();
+        } else if self.scanner_active.is_empty() {
             // keep the explanation of what is missing, unchanged between tries
-            self.scanner_status = status;
-            ctx.request_repaint_after(SCANNER_RETRY);
+            self.scanner_status = barcode_reader::explain_missing(
+                &devices,
+                &self.settings.device_name,
+                &self.settings.device_path,
+            );
         }
+        ctx.request_repaint_after(SCANNER_RETRY);
     }
 
     /// Remembers zoom changes (Ctrl +/-) in the settings file.
@@ -898,11 +910,12 @@ impl RecordShelfApp {
 
         if scanner_changed {
             self.scanner_stop.store(true, Ordering::SeqCst);
-            let (stop, rx, status, running) = start_scanner(&self.settings, &self.repaint);
+            let (stop, rx, tx, status, active) = start_scanner(&self.settings, &self.repaint);
             self.scanner_stop = stop;
             self.scanner_rx = rx;
+            self.scanner_tx = tx;
             self.scanner_status = status;
-            self.scanner_running = running;
+            self.scanner_active = active;
             self.scanner_next_try = Instant::now() + SCANNER_RETRY;
         }
         if discogs_changed {
@@ -1001,11 +1014,22 @@ impl RecordShelfApp {
                                     egui::ComboBox::from_id_source("scanner-device")
                                         .selected_text("Pick...")
                                         .show_ui(ui, |ui| {
-                                            for dev in &devices {
-                                                let label = format!("{} ({})", dev.name, dev.path.display());
-                                                if ui.selectable_label(false, label).clicked() {
-                                                    draft.device_name = dev.name.clone();
+                                            // a device that is picked is added to the names;
+                                            // picking it again takes it out
+                                            let mut other = false;
+                                            for dev in devices.iter().filter(|d| d.keyboard_like) {
+                                                device_choice(ui, draft, dev);
+                                            }
+                                            for dev in devices.iter().filter(|d| !d.keyboard_like) {
+                                                if !other {
+                                                    other = true;
+                                                    ui.separator();
+                                                    ui.label(RichText::new("Other input devices").small());
                                                 }
+                                                device_choice(ui, draft, dev);
+                                            }
+                                            if devices.is_empty() {
+                                                ui.label("No input devices found (permissions? the input group)");
                                             }
                                         });
                                     if ui.button("Refresh").clicked() {
@@ -1022,8 +1046,10 @@ impl RecordShelfApp {
                             });
                         ui.label(
                             RichText::new(
-                                "The scanner is found by name (substring match), so it keeps working \
-                                 when /dev/input numbering changes. The path is only a fallback.",
+                                "Scanners are found by name (substring match), so they keep working \
+                                 when /dev/input numbering changes. Several names, separated by ;, \
+                                 can be used at the same time, and all devices of a name are used. \
+                                 The path is only a fallback.",
                             )
                             .small(),
                         );
@@ -1311,8 +1337,8 @@ impl RecordShelfApp {
         while let Ok(ev) = self.scanner_rx.try_recv() {
             match ev {
                 ScanEvent::Info(msg) => self.scanner_status = msg,
-                ScanEvent::Stopped => {
-                    self.scanner_running = false;
+                ScanEvent::Stopped(path) => {
+                    self.scanner_active.remove(&path);
                     self.scanner_next_try = Instant::now() + SCANNER_RETRY;
                 }
                 ScanEvent::Code(code) => {
@@ -2437,33 +2463,80 @@ fn step(selected: &mut Option<usize>, len: usize, up: bool, down: bool) {
     }
 }
 
+/// One entry of the scanner list in the settings: a check mark when the name is used.
+fn device_choice(ui: &mut egui::Ui, draft: &mut Settings, dev: &barcode_reader::InputDevice) {
+    let used = barcode_reader::split_names(&draft.device_name)
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(&dev.name));
+    let label = format!(
+        "{}{} ({})",
+        if used { "✔ " } else { "" },
+        dev.name,
+        dev.path.display()
+    );
+    if ui.selectable_label(used, label).clicked() {
+        draft.device_name = barcode_reader::toggle_name(&draft.device_name, &dev.name);
+    }
+}
+
 /// Starts the scanner thread for the configured device. Returns its stop flag,
 /// the event receiver and an initial status line.
+#[allow(clippy::type_complexity)]
 fn start_scanner(
     settings: &Settings,
     repaint: &egui::Context,
-) -> (Arc<AtomicBool>, Receiver<ScanEvent>, String, bool) {
+) -> (
+    Arc<AtomicBool>,
+    Receiver<ScanEvent>,
+    std::sync::mpsc::Sender<ScanEvent>,
+    String,
+    HashSet<PathBuf>,
+) {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel();
     let devices = barcode_reader::list_devices();
-    let (status, running) =
-        match barcode_reader::pick_device(&devices, &settings.device_name, &settings.device_path) {
-            Some(path) => {
-                match BarcodeReader::spawn(path, stop.clone(), tx, Some(repaint.clone())) {
-                    Ok(()) => ("Waiting for scans...".to_string(), true),
-                    Err(err) => (format!("Scanner not started: {err}"), false),
-                }
+    let mut active = HashSet::new();
+    let started = spawn_readers(settings, &devices, repaint, &stop, &tx, &mut active);
+    let status = if started > 0 {
+        "Waiting for scans...".to_string()
+    } else {
+        barcode_reader::explain_missing(&devices, &settings.device_name, &settings.device_path)
+    };
+    (stop, rx, tx, status, active)
+}
+
+/// Starts a reader thread for every configured device that has none yet (any
+/// number of receivers can be used at once). Returns how many were started.
+fn spawn_readers(
+    settings: &Settings,
+    devices: &[barcode_reader::InputDevice],
+    repaint: &egui::Context,
+    stop: &Arc<AtomicBool>,
+    tx: &std::sync::mpsc::Sender<ScanEvent>,
+    active: &mut HashSet<PathBuf>,
+) -> usize {
+    let mut started = 0;
+    for path in barcode_reader::pick_devices(devices, &settings.device_name, &settings.device_path)
+    {
+        if active.contains(&path) {
+            continue;
+        }
+        match BarcodeReader::spawn(
+            path.clone(),
+            stop.clone(),
+            tx.clone(),
+            Some(repaint.clone()),
+        ) {
+            Ok(()) => {
+                active.insert(path);
+                started += 1;
             }
-            None => (
-                barcode_reader::explain_missing(
-                    &devices,
-                    &settings.device_name,
-                    &settings.device_path,
-                ),
-                false,
-            ),
-        };
-    (stop, rx, status, running)
+            Err(err) => {
+                let _ = tx.send(ScanEvent::Info(format!("Scanner not started: {err}")));
+            }
+        }
+    }
+    started
 }
 
 /// How often a scanner that is not there is looked for again (plugging it in
@@ -4254,11 +4327,10 @@ mod tests {
         let mut app = app_with_results(0);
         app.settings.device_name = "No Such Scanner 12345".into();
         app.settings.device_path = String::new();
-        app.scanner_running = false;
         app.scanner_next_try = Instant::now() - Duration::from_secs(1);
         let ctx = app.repaint.clone();
         app.retry_scanner(&ctx);
-        assert!(!app.scanner_running);
+        assert!(app.scanner_active.is_empty());
         assert!(
             app.scanner_status
                 .contains("\"No Such Scanner 12345\" not found"),
@@ -4280,7 +4352,6 @@ mod tests {
         let mut app = app_with_results(0);
         app.settings.device_name = String::new();
         app.settings.device_path = String::new();
-        app.scanner_running = false;
         app.scanner_next_try = Instant::now() - Duration::from_secs(1);
         app.scanner_status = "marker".into();
         let ctx = app.repaint.clone();
@@ -4291,14 +4362,16 @@ mod tests {
     #[test]
     fn a_stopped_scanner_thread_makes_the_app_look_again() {
         let mut app = app_with_results(0);
-        app.scanner_running = true;
+        app.scanner_active
+            .insert(PathBuf::from("/dev/input/event9"));
         // a second channel stands in for the scanner thread
         let (tx, rx) = std::sync::mpsc::channel();
         app.scanner_rx = rx;
         tx.send(ScanEvent::Info("Scanner lost".into())).unwrap();
-        tx.send(ScanEvent::Stopped).unwrap();
+        tx.send(ScanEvent::Stopped(PathBuf::from("/dev/input/event9")))
+            .unwrap();
         app.drain_events();
-        assert!(!app.scanner_running);
+        assert!(app.scanner_active.is_empty());
         assert_eq!(app.scanner_status, "Scanner lost");
         assert!(app.scanner_next_try > Instant::now());
     }
@@ -4315,7 +4388,7 @@ mod tests {
             "{}",
             app.scanner_status
         );
-        assert!(!app.scanner_running);
+        assert!(app.scanner_active.is_empty());
     }
 
     // --- opening the shop pages ---------------------------------------------------------
