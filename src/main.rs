@@ -92,6 +92,10 @@ pub struct Args {
     #[arg(long, value_name = "IPS,IPS,...", value_delimiter = ',')]
     pub print_speed_test: Vec<u8>,
 
+    /// Print the sample label with style tags, outlined and filled, then exit
+    #[arg(long)]
+    pub print_tags_test: bool,
+
     /// Start in a normal window instead of fullscreen (F11 toggles at runtime)
     #[arg(long)]
     pub windowed: bool,
@@ -224,6 +228,29 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
         printer.print(&printer::bitmap_zpl(&img, x, y, &job))?;
         std::thread::sleep(std::time::Duration::from_secs(4));
     }
+    if args.print_tags_test {
+        let size = label::LabelSize::from_mm(settings.label_width_mm, settings.label_height_mm);
+        let (x, y) = (
+            printer::centred_x(size.width),
+            (settings.label_top_mm * 8.0).round() as u32,
+        );
+        let job = printer::JobOptions {
+            darkness: Some(settings.printer_darkness),
+            speed_ips: (settings.printer_speed_ips > 0).then_some(settings.printer_speed_ips),
+        };
+        for (style, name) in [
+            (label::TagStyle::Outline, "outlined"),
+            (label::TagStyle::Filled, "filled"),
+        ] {
+            let mut options = label::LabelOptions::new(label::CodeKind::Barcode);
+            options.tag_style = Some(style);
+            options.caption = Some(name.to_string());
+            let img = label::render_with(&label::sample_content_with_tags(), size, &options)?;
+            println!("printing the sample label with {name} tags");
+            printer.print(&printer::bitmap_zpl(&img, x, y, &job))?;
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        }
+    }
     for name in ["print.tone", "media.speed"] {
         println!(
             "printer setting {name} afterwards: {}",
@@ -250,6 +277,7 @@ fn main() -> Result<()> {
         || !args.print_barcode_test.is_empty()
         || !args.print_darkness_test.is_empty()
         || !args.print_speed_test.is_empty()
+        || args.print_tags_test
     {
         return print_tests(&args, &settings);
     }

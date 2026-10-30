@@ -40,6 +40,8 @@ pub struct Settings {
     pub label_height_mm: f32,
     /// Code on the label: "barcode" (Code 128) or "qr"
     pub label_code: String,
+    /// Styles as tags on the label: "off", "outline" or "filled"
+    pub label_tags: String,
     /// PostgreSQL connection string of our own database (written by `db/db.sh bootstrap`)
     pub database_url: String,
     /// Keep our database in line with the Discogs collection automatically (key U switches)
@@ -73,6 +75,7 @@ impl Default for Settings {
             label_width_mm: 51.0,
             label_height_mm: 38.0,
             label_code: "barcode".to_string(),
+            label_tags: "off".to_string(),
             database_url: String::new(),
             library_auto_sync: true,
             shop_open_tabs: true,
@@ -179,7 +182,21 @@ impl Settings {
             "qr" => "qr".to_string(),
             _ => "barcode".to_string(),
         };
+        self.label_tags = match self.label_tags.trim().to_lowercase().as_str() {
+            "outline" => "outline".to_string(),
+            "filled" => "filled".to_string(),
+            _ => "off".to_string(),
+        };
         self
+    }
+
+    /// How the styles are drawn on the label, if at all.
+    pub fn tag_style(&self) -> Option<crate::label::TagStyle> {
+        match self.label_tags.as_str() {
+            "outline" => Some(crate::label::TagStyle::Outline),
+            "filled" => Some(crate::label::TagStyle::Filled),
+            _ => None,
+        }
     }
 
     /// Whether enough is configured to talk to Discogs.
@@ -437,5 +454,38 @@ mod printer_tests {
         }
         .normalized();
         assert_eq!(padded.database_url, "postgres://x/y");
+    }
+
+    #[test]
+    fn tags_on_the_label_are_off_by_default_and_normalised() {
+        use crate::label::TagStyle;
+        assert_eq!(Settings::default().label_tags, "off");
+        assert_eq!(Settings::default().tag_style(), None);
+        for (text, expected) in [
+            (" Outline ", Some(TagStyle::Outline)),
+            ("FILLED", Some(TagStyle::Filled)),
+            ("off", None),
+            ("rainbow", None),
+            ("", None),
+        ] {
+            let s = Settings {
+                label_tags: text.into(),
+                ..Settings::default()
+            }
+            .normalized();
+            assert_eq!(s.tag_style(), expected, "{text:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings {
+            label_tags: "filled".into(),
+            ..Settings::default()
+        }
+        .save(&path)
+        .unwrap();
+        assert_eq!(
+            Settings::load(&path).unwrap().tag_style(),
+            Some(TagStyle::Filled)
+        );
     }
 }

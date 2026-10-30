@@ -1110,6 +1110,27 @@ impl RecordShelfApp {
                                         );
                                     });
                                 ui.end_row();
+                                ui.label("Style tags:");
+                                egui::ComboBox::from_id_source("label-tags")
+                                    .selected_text(match draft.label_tags.as_str() {
+                                        "outline" => "Outlined",
+                                        "filled" => "Filled",
+                                        _ => "Off",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for (value, name) in [
+                                            ("off", "Off"),
+                                            ("outline", "Outlined"),
+                                            ("filled", "Filled (white on black)"),
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut draft.label_tags,
+                                                value.to_string(),
+                                                name,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
                                 ui.label("Darkness:");
                                 ui.horizontal(|ui| {
                                     ui.add(
@@ -2006,6 +2027,7 @@ impl RecordShelfApp {
             } else {
                 CodeKind::Barcode
             },
+            tag_style: settings.tag_style(),
         }
     }
 
@@ -4339,5 +4361,46 @@ mod tests {
         let saved = Settings::load(&dir.path().join("config.toml")).unwrap();
         assert_eq!(saved.shop_browser, "firefox");
         assert!(!saved.shop_open_tabs);
+    }
+
+    // --- style tags on the label -----------------------------------------------------------
+
+    #[test]
+    fn the_tag_style_of_the_settings_goes_into_the_print_job() {
+        let mut app = app_with_results(0);
+        let content = crate::label::sample_content_with_tags();
+        assert_eq!(
+            app.print_job(content.clone()).tag_style,
+            None,
+            "off by default"
+        );
+        app.settings.label_tags = "outline".into();
+        assert_eq!(
+            app.print_job(content.clone()).tag_style,
+            Some(crate::label::TagStyle::Outline)
+        );
+        app.settings.label_tags = "filled".into();
+        assert_eq!(
+            app.print_job(content).tag_style,
+            Some(crate::label::TagStyle::Filled)
+        );
+    }
+
+    #[test]
+    fn the_tag_style_can_be_chosen_in_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = settings_dialog_app(dir.path());
+        app.settings_draft.label_tags = "filled".into();
+        app.save_settings();
+        assert_eq!(
+            app.settings.tag_style(),
+            Some(crate::label::TagStyle::Filled)
+        );
+        assert_eq!(
+            Settings::load(&dir.path().join("config.toml"))
+                .unwrap()
+                .label_tags,
+            "filled"
+        );
     }
 }

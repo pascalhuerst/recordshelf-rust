@@ -78,7 +78,7 @@ pub struct LabelContent {
     pub catno: String,
     pub artist: String,
     pub title: String,
-    /// Genres and styles, drawn as tags when the options ask for them.
+    /// The styles, drawn as tags when the options ask for them.
     pub tags: Vec<String>,
     pub tracks: Vec<LabelTrack>,
 }
@@ -115,10 +115,7 @@ impl LabelContent {
                     .filter_map(|a| Some((a.name.as_deref()?, a.join.as_deref()))),
             ),
             title: release.title.clone().unwrap_or_default(),
-            tags: tags_of(
-                release.genres.iter().flatten(),
-                release.styles.iter().flatten(),
-            ),
+            tags: tags_of(release.styles.iter().flatten()),
             tracks: release
                 .tracklist
                 .iter()
@@ -147,7 +144,7 @@ impl LabelContent {
             catno,
             artist: record.artist_display(),
             title: record.title.clone(),
-            tags: tags_of(record.genres.iter(), record.styles.iter()),
+            tags: tags_of(record.styles.iter()),
             tracks: record
                 .tracks
                 .iter()
@@ -160,13 +157,11 @@ impl LabelContent {
     }
 }
 
-/// Genres and then styles, without empty entries and repeats.
-fn tags_of<'a>(
-    genres: impl Iterator<Item = &'a String>,
-    styles: impl Iterator<Item = &'a String>,
-) -> Vec<String> {
+/// The styles ("Dub Techno") as tags, without empty entries and repeats. The
+/// genres are left out: they are broad ("Electronic") and say little.
+fn tags_of<'a>(styles: impl Iterator<Item = &'a String>) -> Vec<String> {
     let mut tags: Vec<String> = Vec::new();
-    for tag in genres.chain(styles) {
+    for tag in styles {
         let tag = tag.trim();
         if !tag.is_empty() && !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
             tags.push(tag.to_string());
@@ -743,7 +738,7 @@ pub fn render_with(
     Ok(img)
 }
 
-/// The sample with genres and styles.
+/// The sample with styles.
 pub fn sample_content_with_tags() -> LabelContent {
     LabelContent {
         tags: ["Electronic", "House", "Disco", "Edits"]
@@ -1252,16 +1247,16 @@ mod tests {
     }
 
     #[test]
-    fn genres_and_styles_become_tags_without_repeats() {
+    fn only_the_styles_become_tags_without_repeats() {
         let release: Release = serde_json::from_str(
-            r#"{"title": "T", "genres": ["Electronic", "", " Jazz "], "styles": ["House", "electronic", "Disco"]}"#,
+            r#"{"title": "T", "genres": ["Electronic", "Jazz"], "styles": ["House", "", " Disco ", "house"]}"#,
         )
         .unwrap();
         let content = LabelContent::from_release(1, &release);
         assert_eq!(
             content.tags,
-            ["Electronic", "Jazz", "House", "Disco"],
-            "genres first, no empty ones, no repeats"
+            ["House", "Disco"],
+            "no genres, no empty ones, no repeats"
         );
         let stored = crate::library::StoredRelease::from_catalogue(
             &crate::catalogue::CatalogueRelease::from_release(1, &release, 1).unwrap(),
@@ -1271,6 +1266,12 @@ mod tests {
             LabelContent::from_release(1, &Release::default())
                 .tags
                 .is_empty()
+        );
+        let only_genres: Release =
+            serde_json::from_str(r#"{"title": "T", "genres": ["Rock"]}"#).unwrap();
+        assert!(
+            LabelContent::from_release(1, &only_genres).tags.is_empty(),
+            "no styles, no tags"
         );
     }
 

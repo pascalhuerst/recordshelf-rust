@@ -279,13 +279,16 @@ pub struct PrintJob {
     /// 0 keeps the printer's own speed.
     pub speed_ips: u8,
     pub code: CodeKind,
+    /// Draw the styles as tags (`None`: no tags).
+    pub tag_style: Option<crate::label::TagStyle>,
 }
 
 impl PrintJob {
     /// Draws the label and sends it to the printer, if the printer is ready.
     pub fn run(&self) -> Result<()> {
         let size = LabelSize::from_mm(self.width_mm, self.height_mm);
-        let options = LabelOptions::new(self.code);
+        let mut options = LabelOptions::new(self.code);
+        options.tag_style = self.tag_style;
         let img = label::render_with(&self.content, size, &options)?;
         let job = JobOptions {
             darkness: Some(self.darkness),
@@ -869,6 +872,7 @@ mod tests {
             darkness: 9,
             speed_ips: 3,
             code: CodeKind::Barcode,
+            tag_style: None,
         }
     }
 
