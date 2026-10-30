@@ -76,7 +76,7 @@ impl Command {
     /// Whether the command is only offered for releases we own (a label can
     /// only be printed for a record that is on the shelf).
     pub fn needs_ownership(self) -> bool {
-        matches!(self, Command::Print)
+        matches!(self, Command::Print | Command::Preview)
     }
 
     /// Key as shown to the user.
@@ -240,7 +240,10 @@ mod tests {
         assert_eq!(Command::Preview.key(), Key::P);
         assert!(Command::Preview.needs_shift() && !Command::Print.needs_shift());
         assert_eq!(Command::Preview.key_label(), "Shift+P");
-        assert!(Command::Preview.needs_selection() && !Command::Preview.needs_ownership());
+        assert!(
+            Command::Preview.needs_selection() && Command::Preview.needs_ownership(),
+            "it is offered exactly where the print is"
+        );
         assert_eq!(Command::Add.key(), Key::A);
         assert_eq!(Command::Remove.key_label(), "R");
         assert_eq!(Command::Open.key_label(), "O");
@@ -251,6 +254,10 @@ mod tests {
         assert_eq!(Command::Print.key_label(), "P");
         assert!(Command::Print.needs_selection() && Command::Print.needs_ownership());
         assert!(!Command::Add.needs_ownership() && !Command::Open.needs_ownership());
+        assert_eq!(
+            Command::Print.needs_ownership(),
+            Command::Preview.needs_ownership()
+        );
         assert_eq!(Command::Sync.key(), Key::S);
         assert_eq!(Command::AutoSync.key(), Key::U);
         assert!(Command::Sync.needs_selection() && !Command::AutoSync.needs_selection());

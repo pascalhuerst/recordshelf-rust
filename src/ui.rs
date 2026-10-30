@@ -2064,21 +2064,29 @@ impl RecordShelfApp {
         }
     }
 
-    /// Prints the sticker for a release we own.
-    fn print_label(&mut self, id: u32) {
+    /// Labels (and their preview) are for releases in the collection. Tells the
+    /// user why not if this one is not, or finds out first if that is not known yet.
+    fn owned_or_explain(&mut self, id: u32, key: &str) -> bool {
         match self.ownership.get(&id) {
             None => {
                 self.worker.send(Request::CheckOwnership(id));
-                self.set_info("Checking your collection first; press P again".to_string());
-                return;
+                self.set_info(format!("Checking your collection first; press {key} again"));
+                false
             }
             Some(copies) if copies.is_empty() => {
                 self.set_error(
                     "Labels are only printed for releases in your collection".to_string(),
                 );
-                return;
+                false
             }
-            Some(_) => {}
+            Some(_) => true,
+        }
+    }
+
+    /// Prints the sticker for a release we own.
+    fn print_label(&mut self, id: u32) {
+        if !self.owned_or_explain(id, "P") {
+            return;
         }
         if self.settings.printer_host.trim().is_empty() {
             self.set_error("No printer configured (printer_host in the settings file)".to_string());

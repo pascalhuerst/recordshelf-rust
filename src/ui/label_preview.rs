@@ -169,6 +169,9 @@ impl RecordShelfApp {
 
     /// Shift+P on the Add records tab.
     pub(super) fn preview_selected_label(&mut self, id: u32) {
+        if !self.owned_or_explain(id, "Shift+P") {
+            return;
+        }
         let Some(release) = self.releases.get(&id) else {
             self.request_release(id);
             self.set_info("The release is still loading; press Shift+P again".to_string());
@@ -504,6 +507,7 @@ mod tests {
     #[test]
     fn the_preview_on_the_add_tab_needs_the_release_data() {
         let mut app = app_ready_to_add();
+        app.ownership.insert(1, vec![copy(10, 1)]);
         app.releases.clear();
         app.requested.clear();
         app.run_command(Command::Preview);
@@ -520,14 +524,31 @@ mod tests {
     }
 
     #[test]
-    fn the_preview_does_not_need_ownership() {
+    fn the_preview_is_for_releases_in_the_collection_like_the_print() {
+        // not owned: neither prints nor previews
         let mut app = app_ready_to_add();
         app.releases.insert(1, crate::discogs::Release::default());
         app.ownership.insert(1, Vec::new());
         app.run_command(Command::Preview);
+        assert!(app.label_preview.is_none());
         assert!(
-            app.label_preview.is_some(),
-            "any loaded release can be previewed"
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.is_error && n.text.contains("collection"))
+        );
+        // collection status not known yet: it is looked up, and Shift+P is asked for again
+        let mut app = app_ready_to_add();
+        app.releases.insert(1, crate::discogs::Release::default());
+        let before = app.worker.pending();
+        app.run_command(Command::Preview);
+        assert!(app.label_preview.is_none());
+        assert_eq!(app.worker.pending(), before + 1, "the collection check");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("press Shift+P again")),
+            "{:?}",
+            app.notice.as_ref().map(|n| &n.text)
         );
     }
 
@@ -871,16 +892,34 @@ mod tests {
     }
 
     #[test]
-    fn the_preview_is_offered_with_shift_even_when_the_release_is_not_owned() {
-        let mut app = owned_app();
-        app.ownership.insert(1, Vec::new());
-        let (plain, _) = bar_frame(&mut app, false, vec![], true);
-        assert!(
-            !has(&plain, "Print label") && !has(&plain, "Label preview"),
-            "nothing to print for a release we do not own"
-        );
-        let (shifted, _) = bar_frame(&mut app, true, vec![], true);
-        assert!(has(&shifted, "Label preview  [Shift+P]"));
+    fn the_button_is_there_exactly_when_a_record_with_a_copy_is_shown() {
+        let shown = |texts: &[(String, egui::Pos2)]| {
+            has(texts, "Print label") || has(texts, "Label preview")
+        };
+        for shift in [false, true] {
+            // a release we own is shown: the button, as print or as preview
+            let mut app = owned_app();
+            let (texts, _) = bar_frame(&mut app, shift, vec![], true);
+            assert!(shown(&texts), "owned, shift {shift}");
+
+            // a release we do not own: no button, with or without Shift
+            let mut app = owned_app();
+            app.ownership.insert(1, Vec::new());
+            let (texts, _) = bar_frame(&mut app, shift, vec![], true);
+            assert!(!shown(&texts), "not owned, shift {shift}");
+
+            // nothing is shown (no selection): no button either
+            let mut app = owned_app();
+            app.selected_result = None;
+            let (texts, _) = bar_frame(&mut app, shift, vec![], true);
+            assert!(!shown(&texts), "no record, shift {shift}");
+
+            // collection status not known yet: no button
+            let mut app = owned_app();
+            app.ownership.clear();
+            let (texts, _) = bar_frame(&mut app, shift, vec![], true);
+            assert!(!shown(&texts), "unknown, shift {shift}");
+        }
     }
 
     #[test]
