@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     sync::mpsc::{Receiver, Sender, channel},
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -14,7 +15,8 @@ use crate::discogs::{
 use crate::label::{self, CodeKind, LabelContent, LabelOptions, LabelSize};
 use crate::library::{Entry, Library, RecordRow, StoredRelease};
 use crate::printer::{self, JobOptions, Printer};
-use crate::shops::{Shop, ShopEntry, search_plan};
+use crate::shop_bridge::ShopPage;
+use crate::shops::{Shop, ShopEntry, prefer_artist, search_plan};
 
 /// Requests for the thread that talks to our own database. Each one is
 /// answered by exactly one `LibraryResponse`.
@@ -328,6 +330,11 @@ pub enum Request {
     },
     /// Draw a label and send it to the printer.
     PrintLabel(Box<PrintJob>),
+    /// Ask a shop that needs no browser (deejay.de) for the page of a scanned code.
+    FetchShopPage {
+        shop: Shop,
+        code: String,
+    },
     /// Work on our own database (handled by a thread of its own).
     Library(LibraryRequest),
     /// Moves copies to another folder: `(current folder, instance id)` pairs.
@@ -383,6 +390,8 @@ pub enum Response {
         result: Result<(), String>,
     },
     Library(LibraryResponse),
+    /// The page of a shop, as if a browser tab had brought it.
+    ShopPage(ShopPage),
     Moved {
         release_id: u32,
         to_folder: u32,
@@ -450,6 +459,7 @@ impl Worker {
                 let mut state = State {
                     client: None,
                     username: String::new(),
+                    ..Default::default()
                 };
                 while let Ok(req) = req_rx.recv() {
                     if let Some(resp) = state.handle(req) {
@@ -510,9 +520,13 @@ impl Worker {
     }
 }
 
+#[derive(Default)]
 struct State {
     client: Option<DiscogsClient>,
     username: String,
+    /// For shops that are asked directly. A plain client: it must never carry
+    /// the Discogs credentials.
+    shop_http: Option<reqwest::blocking::Client>,
 }
 
 impl State {
@@ -582,6 +596,9 @@ impl State {
                     result,
                 }
             }
+            Request::FetchShopPage { shop, code } => {
+                Response::ShopPage(self.fetch_shop_page(shop, code))
+            }
             // handled by the library thread, never gets here
             Request::Library(_) => return None,
             Request::PrintLabel(job) => Response::Printed {
@@ -638,13 +655,45 @@ impl State {
         Ok(copies.len())
     }
 
+    /// Asks the shop for the page of a scanned code. Problems come back as a
+    /// status of 0 (no reply) or the HTTP status, like from a browser tab.
+    fn fetch_shop_page(&mut self, shop: Shop, code: String) -> ShopPage {
+        self.fetch_shop_page_from(crate::deejay::BASE, shop, code)
+    }
+
+    fn fetch_shop_page_from(&mut self, base: &str, shop: Shop, code: String) -> ShopPage {
+        let page = |status, entries| ShopPage {
+            shop,
+            code: code.clone(),
+            status,
+            entries,
+        };
+        let Shop::Deejay = shop else {
+            return page(Some(0), Vec::new());
+        };
+        let Some(id) = crate::deejay::article_id(&code) else {
+            return page(Some(0), Vec::new());
+        };
+        let client = self.shop_http.get_or_insert_with(|| {
+            reqwest::blocking::Client::builder()
+                .user_agent("RecordShelf (personal collection tool)")
+                .timeout(Duration::from_secs(20))
+                .build()
+                .expect("build the shop client")
+        });
+        match crate::deejay::fetch_from(client, base, id) {
+            Ok((status, html)) => page(Some(status), crate::shops::parse_page(shop, &html)),
+            Err(_) => page(Some(0), Vec::new()),
+        }
+    }
+
     /// Runs the search plan and returns the first non-empty result list.
     fn shop_lookup(&self, entry: &ShopEntry) -> Result<Vec<SearchItem>> {
         let client = self.client()?;
         for query in search_plan(entry) {
             let found = client.search(&query)?.results;
             if !found.is_empty() {
-                return Ok(found);
+                return Ok(prefer_artist(found, entry));
             }
         }
         Ok(Vec::new())
@@ -742,6 +791,7 @@ mod tests {
         let mut state = State {
             client: None,
             username: "me".into(),
+            ..Default::default()
         };
         match state.handle(Request::LoadRelease(1)) {
             Some(Response::Release {
@@ -759,6 +809,7 @@ mod tests {
         let mut state = State {
             client: None,
             username: "  ".into(),
+            ..Default::default()
         };
         match state.handle(Request::LoadFolders) {
             Some(Response::Folders(Err(msg))) => assert!(msg.contains("username"), "{msg}"),
@@ -771,6 +822,7 @@ mod tests {
         let mut state = State {
             client: None,
             username: String::new(),
+            ..Default::default()
         };
         let resp = state.handle(Request::Configure {
             client: None,
@@ -856,6 +908,7 @@ mod tests {
         let mut state = State {
             client: None,
             username: String::new(),
+            ..Default::default()
         };
         // nothing listens on this port
         let port = {
@@ -1276,6 +1329,103 @@ mod tests {
         }) {
             LibraryResponse::Notes { result, .. } => assert!(result.is_err()),
             _ => panic!(),
+        }
+    }
+
+    // --- shops asked directly -------------------------------------------------------
+
+    fn serve_page(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        (base, handle)
+    }
+
+    const DEEJAY_PAGE: &str = include_str!("../tests/fixtures/deejay_product_960305.html");
+
+    #[test]
+    fn the_worker_fetches_a_deejay_page_and_parses_it() {
+        let (base, server) = serve_page("200 OK", DEEJAY_PAGE);
+        let mut state = State::default();
+        let page =
+            state.fetch_shop_page_from(&base, Shop::Deejay, "https://deejay.de/__960305".into());
+        assert_eq!(page.shop, Shop::Deejay);
+        assert_eq!(page.status, Some(200));
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].catno, "GME-002");
+        let request = server.join().unwrap().to_lowercase();
+        assert!(request.starts_with("get /__960305 "), "{request}");
+        assert!(request.contains("user-agent: recordshelf"), "{request}");
+        assert!(
+            !request.contains("authorization"),
+            "the Discogs credentials stay home: {request}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_deejay_request_comes_back_with_its_status() {
+        let (base, _server) = serve_page("403 Forbidden", "<html>Just a moment...</html>");
+        let page = State::default().fetch_shop_page_from(
+            &base,
+            Shop::Deejay,
+            "https://deejay.de/__960305".into(),
+        );
+        assert_eq!(page.status, Some(403));
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn an_unreachable_deejay_is_reported_as_no_reply() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let page = State::default().fetch_shop_page_from(
+            &format!("http://127.0.0.1:{port}"),
+            Shop::Deejay,
+            "https://deejay.de/__960305".into(),
+        );
+        assert_eq!(page.status, Some(0));
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn only_deejay_is_fetched_directly_and_only_for_its_urls() {
+        let mut state = State::default();
+        let page = state.fetch_shop_page_from("http://127.0.0.1:1", Shop::Hhv, "525768".into());
+        assert_eq!(page.status, Some(0), "hhv needs a browser");
+        let page = state.fetch_shop_page_from("http://127.0.0.1:1", Shop::Deejay, "960305".into());
+        assert_eq!(page.status, Some(0), "no article URL, nothing to ask");
+    }
+
+    #[test]
+    fn a_fetch_request_answers_with_a_shop_page() {
+        let (base, _server) = serve_page("200 OK", DEEJAY_PAGE);
+        let mut state = State::default();
+        let page =
+            state.fetch_shop_page_from(&base, Shop::Deejay, "https://deejay.de/__960305".into());
+        assert_eq!(
+            page.code, "https://deejay.de/__960305",
+            "the scanned code comes back as it was"
+        );
+        // through the request/response path
+        match state.handle(Request::FetchShopPage {
+            shop: Shop::Hhv,
+            code: "525768".into(),
+        }) {
+            Some(Response::ShopPage(p)) => assert_eq!(p.shop, Shop::Hhv),
+            _ => panic!("expected a shop page"),
         }
     }
 }

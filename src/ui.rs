@@ -636,8 +636,16 @@ impl RecordShelfApp {
         if status != Some(200) {
             let status = status.map_or("no reply".to_string(), |s| s.to_string());
             self.shop_info = None;
+            let advice = if shop.uses_browser() {
+                format!("reload the {name} tab")
+            } else {
+                // the shop may have started to check requests, or the network is down
+                format!(
+                    "{name} did not answer as expected; try again, or open the page in your browser"
+                )
+            };
             self.set_error(format!(
-                "{name} lookup for {code} failed ({status}); reload the {name} tab"
+                "{name} lookup for {code} failed ({status}); {advice}"
             ));
             return;
         }
@@ -1109,6 +1117,10 @@ impl RecordShelfApp {
         });
         match route {
             Route::Shop(shop) => self.lookup_in_shop(shop, code),
+            Route::Fetch(shop) => {
+                self.shop_info = Some(format!("{} {code}: looking it up...", shop.name()));
+                self.worker.send(Request::FetchShopPage { shop, code });
+            }
             Route::ShopUnavailable(shop) if self.bridge.is_none() => {
                 self.set_error(format!(
                     "{code} looks like a {} code; start with --shop-bridge",
@@ -1222,6 +1234,7 @@ impl RecordShelfApp {
                 self.images.insert(url, state);
             }
             Response::Library(response) => self.handle_library_response(response),
+            Response::ShopPage(page) => self.handle_shop_page(page),
             Response::Folders(Ok(mut folders)) => {
                 // Folder 0 ("All") is a view; releases cannot be added to it.
                 folders.retain(|f| f.id != 0);
@@ -2083,7 +2096,7 @@ impl eframe::App for RecordShelfApp {
             ui.horizontal(|ui| {
                 ui.label(&self.scanner_status);
                 if let Some(state) = &self.bridge {
-                    for shop in Shop::ALL {
+                    for shop in Shop::BROWSER {
                         ui.separator();
                         if state.bridge.connected(shop) {
                             ui.colored_label(
@@ -3842,5 +3855,112 @@ mod tests {
                 .0
                 .contains("connecting")
         );
+    }
+
+    // --- deejay.de ---------------------------------------------------------------------
+
+    fn deejay_entry() -> shops::ShopEntry {
+        shops::ShopEntry {
+            code: "960305".into(),
+            artist: "Groove Minority".into(),
+            title: "EP #2".into(),
+            catno: "GME-002".into(),
+            label: "> France".into(),
+            barcode: None,
+        }
+    }
+
+    #[test]
+    fn a_deejay_qr_code_is_asked_of_the_shop_directly() {
+        // no bridge, no browser: the app asks the shop itself
+        let mut app = app_with_results(0);
+        assert!(app.bridge.is_none());
+        let before = app.worker.pending();
+        app.route_scan("https://deejay.de/__960305".into());
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(
+            app.shop_info
+                .as_ref()
+                .is_some_and(|i| i.contains("deejay.de") && i.contains("looking it up"))
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_none_or(|n| !n.text.contains("bridge")),
+            "no complaint about a missing bridge"
+        );
+    }
+
+    #[test]
+    fn a_deejay_article_starts_the_discogs_lookup() {
+        let mut app = app_with_results(0);
+        let before = app.worker.pending();
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Deejay,
+            code: "https://deejay.de/__960305".into(),
+            status: Some(200),
+            entries: vec![deejay_entry()],
+        });
+        assert_eq!(app.worker.pending(), before + 1);
+        assert!(
+            app.shop_info
+                .as_ref()
+                .is_some_and(|i| i.contains("GME-002") && i.contains("Groove Minority"))
+        );
+    }
+
+    #[test]
+    fn a_failed_deejay_lookup_does_not_talk_about_browser_tabs() {
+        let mut app = app_with_results(0);
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Deejay,
+            code: "https://deejay.de/__960305".into(),
+            status: Some(403),
+            entries: Vec::new(),
+        });
+        let notice = app.notice.as_ref().unwrap();
+        assert!(
+            notice.is_error && notice.text.contains("403") && !notice.text.contains("tab"),
+            "{}",
+            notice.text
+        );
+        // a browser shop still says so
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Hhv,
+            code: "525768".into(),
+            status: Some(403),
+            entries: Vec::new(),
+        });
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("reload the hhv.de tab")
+        );
+    }
+
+    #[test]
+    fn a_deejay_page_for_another_article_is_not_used() {
+        let mut app = app_with_results(0);
+        let before = app.worker.pending();
+        app.handle_shop_page(ShopPage {
+            shop: Shop::Deejay,
+            code: "https://deejay.de/__111111".into(),
+            status: Some(200),
+            entries: vec![deejay_entry()],
+        });
+        assert_eq!(app.worker.pending(), before);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("no exact match"))
+        );
+    }
+
+    #[test]
+    fn the_status_bar_lists_only_the_browser_shops() {
+        // deejay.de needs no tab, so it has no connection indicator
+        assert!(!Shop::BROWSER.contains(&Shop::Deejay));
     }
 }

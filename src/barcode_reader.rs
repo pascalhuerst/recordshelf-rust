@@ -121,26 +121,16 @@ fn scanner_loop(
         ScanEvent::Info(format!("Listening for scans on {}", device_path.display())),
     );
 
-    let mut buffer = String::new();
+    let mut decoder = KeyDecoder::default();
 
     while !stop.load(Ordering::SeqCst) {
         match device.fetch_events() {
             Ok(events) => {
                 for ev in events {
-                    if let EventSummary::Key(_, keycode, value) = ev.destructure() {
-                        if value != 1 {
-                            continue;
-                        }
-                        if is_enter(keycode) {
-                            let code = buffer.trim().to_string();
-                            buffer.clear();
-                            if code.is_empty() {
-                                continue;
-                            }
-                            emit(&tx, &repaint, ScanEvent::Code(code));
-                        } else if let Some(ch) = translate_key(keycode) {
-                            buffer.push(ch);
-                        }
+                    if let EventSummary::Key(_, keycode, value) = ev.destructure()
+                        && let Some(code) = decoder.feed(keycode, value)
+                    {
+                        emit(&tx, &repaint, ScanEvent::Code(code));
                     }
                 }
             }
@@ -167,7 +157,53 @@ fn is_enter(code: KeyCode) -> bool {
     )
 }
 
-fn translate_key(code: KeyCode) -> Option<char> {
+/// Turns the key events of a scanner (a keyboard to the system) into scanned
+/// codes. Scanners type the characters of a code and finish with Enter; QR
+/// codes with URLs need Shift for characters such as `:` and `_` (US layout).
+#[derive(Default)]
+pub struct KeyDecoder {
+    buffer: String,
+    shift: bool,
+}
+
+impl KeyDecoder {
+    /// Feeds one key event (`value`: 1 press, 0 release, 2 repeat). Returns the
+    /// code when Enter ends one.
+    pub fn feed(&mut self, key: KeyCode, value: i32) -> Option<String> {
+        if matches!(key, KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT) {
+            self.shift = value != 0;
+            return None;
+        }
+        if value != 1 {
+            return None;
+        }
+        if is_enter(key) {
+            let code = self.buffer.trim().to_string();
+            self.buffer.clear();
+            return (!code.is_empty()).then_some(code);
+        }
+        if let Some(ch) = translate_key(key, self.shift) {
+            self.buffer.push(ch);
+        }
+        None
+    }
+}
+
+/// The character of a key, for the keys that occur in the codes we scan.
+/// Letters are always upper case (the codes are case-insensitive).
+fn translate_key(code: KeyCode, shift: bool) -> Option<char> {
+    if shift {
+        return match code {
+            KeyCode::KEY_MINUS => Some('_'),
+            KeyCode::KEY_SEMICOLON => Some(':'),
+            KeyCode::KEY_SLASH => Some('?'),
+            KeyCode::KEY_EQUAL => Some('+'),
+            KeyCode::KEY_3 => Some('#'),
+            KeyCode::KEY_5 => Some('%'),
+            KeyCode::KEY_7 => Some('&'),
+            _ => translate_key(code, false).filter(char::is_ascii_alphabetic),
+        };
+    }
     match code {
         KeyCode::KEY_0 | KeyCode::KEY_KP0 => Some('0'),
         KeyCode::KEY_1 | KeyCode::KEY_KP1 => Some('1'),
@@ -182,6 +218,7 @@ fn translate_key(code: KeyCode) -> Option<char> {
         KeyCode::KEY_MINUS | KeyCode::KEY_KPMINUS => Some('-'),
         KeyCode::KEY_DOT | KeyCode::KEY_KPDOT => Some('.'),
         KeyCode::KEY_SLASH => Some('/'),
+        KeyCode::KEY_EQUAL => Some('='),
         // Letters are reported upper case regardless of Shift: the codes we
         // read (decks.de labels) are case-insensitive.
         KeyCode::KEY_A => Some('A'),
@@ -275,12 +312,12 @@ mod tests {
 
     #[test]
     fn translates_digits_and_punctuation() {
-        assert_eq!(translate_key(KeyCode::KEY_7), Some('7'));
-        assert_eq!(translate_key(KeyCode::KEY_KP0), Some('0'));
-        assert_eq!(translate_key(KeyCode::KEY_MINUS), Some('-'));
-        assert_eq!(translate_key(KeyCode::KEY_A), Some('A'));
-        assert_eq!(translate_key(KeyCode::KEY_Z), Some('Z'));
-        assert_eq!(translate_key(KeyCode::KEY_SPACE), None);
+        assert_eq!(translate_key(KeyCode::KEY_7, false), Some('7'));
+        assert_eq!(translate_key(KeyCode::KEY_KP0, false), Some('0'));
+        assert_eq!(translate_key(KeyCode::KEY_MINUS, false), Some('-'));
+        assert_eq!(translate_key(KeyCode::KEY_A, false), Some('A'));
+        assert_eq!(translate_key(KeyCode::KEY_Z, false), Some('Z'));
+        assert_eq!(translate_key(KeyCode::KEY_SPACE, false), None);
     }
 
     #[test]
@@ -288,5 +325,165 @@ mod tests {
         assert!(is_enter(KeyCode::KEY_ENTER));
         assert!(is_enter(KeyCode::KEY_KPENTER));
         assert!(!is_enter(KeyCode::KEY_SPACE));
+    }
+
+    /// Types a string like a US keyboard (or a scanner) would: Shift around the
+    /// characters that need it, Enter at the end.
+    fn type_codes(text: &str) -> Vec<(KeyCode, i32)> {
+        let mut events = Vec::new();
+        for c in text.chars() {
+            let (key, shift) = match c {
+                '0'..='9' => (digit_key(c), false),
+                '/' => (KeyCode::KEY_SLASH, false),
+                '.' => (KeyCode::KEY_DOT, false),
+                '-' => (KeyCode::KEY_MINUS, false),
+                '_' => (KeyCode::KEY_MINUS, true),
+                ':' => (KeyCode::KEY_SEMICOLON, true),
+                '?' => (KeyCode::KEY_SLASH, true),
+                '=' => (KeyCode::KEY_EQUAL, false),
+                'a'..='z' | 'A'..='Z' => {
+                    (letter_key(c.to_ascii_uppercase()), c.is_ascii_uppercase())
+                }
+                other => panic!("not typeable in the test: {other}"),
+            };
+            if shift {
+                events.push((KeyCode::KEY_LEFTSHIFT, 1));
+            }
+            events.push((key, 1));
+            events.push((key, 0));
+            if shift {
+                events.push((KeyCode::KEY_LEFTSHIFT, 0));
+            }
+        }
+        events.push((KeyCode::KEY_ENTER, 1));
+        events.push((KeyCode::KEY_ENTER, 0));
+        events
+    }
+
+    fn digit_key(c: char) -> KeyCode {
+        [
+            KeyCode::KEY_0,
+            KeyCode::KEY_1,
+            KeyCode::KEY_2,
+            KeyCode::KEY_3,
+            KeyCode::KEY_4,
+            KeyCode::KEY_5,
+            KeyCode::KEY_6,
+            KeyCode::KEY_7,
+            KeyCode::KEY_8,
+            KeyCode::KEY_9,
+        ][c.to_digit(10).unwrap() as usize]
+    }
+
+    fn letter_key(c: char) -> KeyCode {
+        [
+            KeyCode::KEY_A,
+            KeyCode::KEY_B,
+            KeyCode::KEY_C,
+            KeyCode::KEY_D,
+            KeyCode::KEY_E,
+            KeyCode::KEY_F,
+            KeyCode::KEY_G,
+            KeyCode::KEY_H,
+            KeyCode::KEY_I,
+            KeyCode::KEY_J,
+            KeyCode::KEY_K,
+            KeyCode::KEY_L,
+            KeyCode::KEY_M,
+            KeyCode::KEY_N,
+            KeyCode::KEY_O,
+            KeyCode::KEY_P,
+            KeyCode::KEY_Q,
+            KeyCode::KEY_R,
+            KeyCode::KEY_S,
+            KeyCode::KEY_T,
+            KeyCode::KEY_U,
+            KeyCode::KEY_V,
+            KeyCode::KEY_W,
+            KeyCode::KEY_X,
+            KeyCode::KEY_Y,
+            KeyCode::KEY_Z,
+        ][(c as u8 - b'A') as usize]
+    }
+
+    fn scan(text: &str) -> Vec<String> {
+        let mut decoder = KeyDecoder::default();
+        type_codes(text)
+            .into_iter()
+            .filter_map(|(key, value)| decoder.feed(key, value))
+            .collect()
+    }
+
+    #[test]
+    fn a_url_from_a_qr_code_arrives_complete() {
+        // typed with Shift for the colon and the underscores, like the QR reader does
+        assert_eq!(
+            scan("https://deejay.de/__960305"),
+            ["HTTPS://DEEJAY.DE/__960305"]
+        );
+    }
+
+    #[test]
+    fn plain_codes_still_work() {
+        assert_eq!(scan("CNF/O1"), ["CNF/O1"]);
+        assert_eq!(scan("5012345678900"), ["5012345678900"]);
+        assert_eq!(scan("32474433"), ["32474433"]);
+        assert_eq!(scan("a-b.c"), ["A-B.C"]);
+    }
+
+    #[test]
+    fn shift_only_changes_what_it_should() {
+        let mut d = KeyDecoder::default();
+        // a dash typed after Shift was released is a dash again
+        for (k, v) in [
+            (KeyCode::KEY_LEFTSHIFT, 1),
+            (KeyCode::KEY_MINUS, 1),
+            (KeyCode::KEY_MINUS, 0),
+            (KeyCode::KEY_LEFTSHIFT, 0),
+            (KeyCode::KEY_MINUS, 1),
+            (KeyCode::KEY_MINUS, 0),
+        ] {
+            assert_eq!(d.feed(k, v), None);
+        }
+        assert_eq!(d.feed(KeyCode::KEY_ENTER, 1).as_deref(), Some("_-"));
+        // the right shift key counts too, and repeats keep it held
+        for (k, v) in [
+            (KeyCode::KEY_RIGHTSHIFT, 1),
+            (KeyCode::KEY_RIGHTSHIFT, 2),
+            (KeyCode::KEY_SEMICOLON, 1),
+            (KeyCode::KEY_RIGHTSHIFT, 0),
+        ] {
+            d.feed(k, v);
+        }
+        assert_eq!(d.feed(KeyCode::KEY_ENTER, 1).as_deref(), Some(":"));
+    }
+
+    #[test]
+    fn releases_and_unknown_keys_are_ignored() {
+        let mut d = KeyDecoder::default();
+        assert_eq!(d.feed(KeyCode::KEY_1, 0), None);
+        assert_eq!(d.feed(KeyCode::KEY_SPACE, 1), None);
+        assert_eq!(d.feed(KeyCode::KEY_F5, 1), None);
+        assert_eq!(
+            d.feed(KeyCode::KEY_ENTER, 1),
+            None,
+            "nothing was typed: no code"
+        );
+        d.feed(KeyCode::KEY_2, 1);
+        d.feed(KeyCode::KEY_2, 2); // auto repeat is not a second press
+        assert_eq!(d.feed(KeyCode::KEY_KPENTER, 1).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn two_scans_in_a_row_stay_apart() {
+        assert_eq!(scan("123456"), ["123456"]);
+        let mut d = KeyDecoder::default();
+        let mut codes = Vec::new();
+        for text in ["CNF/O1", "525768"] {
+            for (k, v) in type_codes(text) {
+                codes.extend(d.feed(k, v));
+            }
+        }
+        assert_eq!(codes, ["CNF/O1", "525768"]);
     }
 }

@@ -19,8 +19,7 @@ use std::{
 use anyhow::{Context, Result};
 use eframe::egui;
 
-use crate::shops::{Shop, ShopEntry};
-use crate::{decks, hhv};
+use crate::shops::{Shop, ShopEntry, parse_page};
 
 pub const DEFAULT_PORT: u16 = 47321;
 const MAX_BODY: u64 = 5 * 1024 * 1024;
@@ -111,7 +110,7 @@ impl Bridge {
         // Scripts from before hhv.de support do not send `shop`; they are decks.de only.
         let shop = match query.get("shop") {
             None => Shop::Decks,
-            Some(key) => match Shop::from_key(key) {
+            Some(key) => match Shop::from_key(key).filter(|s| s.uses_browser()) {
                 Some(shop) => shop,
                 None => return (400, "unknown shop".into()),
             },
@@ -137,10 +136,7 @@ impl Bridge {
                 let Some(code) = query.get("code") else {
                     return (400, "missing code".into());
                 };
-                let entries = match shop {
-                    Shop::Decks => decks::parse_results(body),
-                    Shop::Hhv => hhv::parse_results(body),
-                };
+                let entries = parse_page(shop, body);
                 let _ = self.tx.send(ShopPage {
                     shop,
                     code: code.clone(),
@@ -443,5 +439,19 @@ mod tests {
         .text()
         .unwrap();
         assert_eq!(body, r#"["525768"]"#);
+    }
+
+    #[test]
+    fn shops_that_need_no_browser_are_not_served() {
+        let (b, _rx) = bridge();
+        assert_eq!(
+            b.handle("GET", "/pending?token=secret&shop=deejay", "").0,
+            400
+        );
+        assert_eq!(
+            b.handle("POST", "/result?token=secret&shop=deejay&code=1", "x")
+                .0,
+            400
+        );
     }
 }

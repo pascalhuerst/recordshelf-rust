@@ -8,6 +8,7 @@ mod collection;
 mod config;
 mod controls;
 mod decks;
+mod deejay;
 mod discogs;
 mod hhv;
 mod label;
