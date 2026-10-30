@@ -78,6 +78,9 @@ const PREFETCH_LIMIT: usize = 5;
 /// so that holding an arrow key does not flood the API.
 const SELECTION_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// The record info needs at least this much width before the label picture is shown beside it.
+const MIN_INFO_WIDTH: f32 = 260.0;
+
 const THUMB_SIZE: f32 = 56.0;
 const COVER_SIZE: f32 = 220.0;
 
@@ -137,8 +140,8 @@ pub struct RecordShelfApp {
     scanner_stop: Arc<AtomicBool>,
     scanner_rx: Receiver<ScanEvent>,
     scanner_status: String,
-    /// The open label preview window, if any.
-    label_preview: Option<label_preview::LabelPreview>,
+    /// The label picture beside the record info.
+    label_panel: Option<label_preview::LabelPanel>,
     /// Opens the shop pages (replaced in tests).
     url_opener: UrlOpener,
     /// When the shop pages are to be opened, if still to be done.
@@ -214,7 +217,7 @@ impl RecordShelfApp {
             scanner_stop,
             scanner_rx,
             scanner_status,
-            label_preview: None,
+            label_panel: None,
             url_opener: Box::new(system_opener),
             shop_tabs_due: None,
             scanner_running,
@@ -1593,11 +1596,7 @@ impl RecordShelfApp {
 
         // Keyboard handling. Skipped while typing, and on the frame a search was
         // triggered by Enter so that the same keypress does not also pick a result.
-        if !search_fields_active
-            && !trigger_search
-            && !self.settings_open
-            && self.label_preview.is_none()
-        {
+        if !search_fields_active && !trigger_search && !self.settings_open {
             self.handle_search_keys(ui.ctx());
         }
         if self.folder_picker_open {
@@ -1619,12 +1618,24 @@ impl RecordShelfApp {
         if let Some(url) = &cover {
             self.ensure_image(url);
         }
+        let label_view = {
+            let content = self.shown_release_label();
+            self.label_view(ui.ctx(), content)
+        };
         egui::ScrollArea::vertical()
             .id_source("search-release")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(release) = self.selected_release() {
                     let owned = release.id.and_then(|id| self.ownership.get(&id));
+                    // the label picture needs room beside the info; without it, it is left out
+                    let view = label_view.as_ref().filter(|v| {
+                        ui.available_width() - COVER_SIZE - v.size.x - 24.0 >= MIN_INFO_WIDTH
+                    });
+                    let info_width = ui.available_width()
+                        - COVER_SIZE
+                        - view.map_or(0.0, |v| v.size.x + 24.0)
+                        - 12.0;
                     ui.horizontal_top(|ui| {
                         match &cover {
                             Some(url) => {
@@ -1633,6 +1644,7 @@ impl RecordShelfApp {
                             None => draw_placeholder(ui, COVER_SIZE),
                         }
                         ui.vertical(|ui| {
+                            ui.set_max_width(info_width.max(MIN_INFO_WIDTH));
                             render_ownership(ui, owned.map(Vec::as_slice), &self.folders);
                             if self.library_ready()
                                 && let Some(id) = release.id
@@ -1646,6 +1658,10 @@ impl RecordShelfApp {
                             }
                             render_release(ui, release);
                         });
+                        if let Some(view) = view {
+                            // at the right edge, beside the record info
+                            label_preview::draw_label_view(ui, view);
+                        }
                     });
                 } else if self.selected_id().is_some() {
                     ui.horizontal_top(|ui| {
@@ -1694,11 +1710,7 @@ impl RecordShelfApp {
         }
 
         let command_pressed = |c: &Command| {
-            ctx.input(|i| {
-                i.key_pressed(c.key())
-                    && i.modifiers.shift == c.needs_shift()
-                    && !i.modifiers.command
-            })
+            ctx.input(|i| i.key_pressed(c.key()) && !i.modifiers.shift && !i.modifiers.command)
         };
         if let Some(cmd) = Command::ALL.into_iter().find(command_pressed) {
             self.run_command(cmd);
@@ -1957,7 +1969,6 @@ impl RecordShelfApp {
             Command::Move => self.move_release(id),
             Command::Open => self.open_release(id),
             Command::Print => self.print_label(id),
-            Command::Preview => self.preview_selected_label(id),
             Command::ChooseFolder | Command::Quit | Command::Sync | Command::AutoSync => {}
         }
     }
@@ -2173,20 +2184,9 @@ impl RecordShelfApp {
             .is_some_and(|copies| !copies.is_empty());
         let library_off = self.library_link == LibraryLink::Off;
         let auto_sync = self.settings.library_auto_sync;
-        // while Shift is held, a button shows (and does) its shifted function
-        let shift = ui.input(|i| i.modifiers.shift);
         let mut clicked = None;
         ui.horizontal(|ui| {
-            for base in Command::ALL {
-                // shifted commands have no button of their own
-                if base.needs_shift() {
-                    continue;
-                }
-                let cmd = if shift {
-                    base.shifted().unwrap_or(base)
-                } else {
-                    base
-                };
+            for cmd in Command::ALL {
                 // the label button only appears for records we own
                 if cmd.needs_ownership() && !owned {
                     continue;
@@ -2201,7 +2201,6 @@ impl RecordShelfApp {
                     Command::Move => "Move".to_string(),
                     Command::Open => "Open in browser".to_string(),
                     Command::Print => "Print label".to_string(),
-                    Command::Preview => "Label preview".to_string(),
                     Command::Sync => "Sync to library".to_string(),
                     Command::AutoSync => {
                         format!("Auto sync: {}", if auto_sync { "on" } else { "off" })
@@ -2359,8 +2358,6 @@ impl eframe::App for RecordShelfApp {
             Tab::Add => self.ui_main(ui),
             Tab::Collection => self.ui_collection(ui),
         });
-
-        self.show_label_preview(ctx);
 
         if self.settings_open {
             self.show_settings(ctx);

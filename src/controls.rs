@@ -13,8 +13,6 @@ pub enum Command {
     Move,
     Open,
     Print,
-    /// Show the label that P would print (Shift+P).
-    Preview,
     /// Bring the selected release in line with the collection in our database.
     Sync,
     /// Switch between syncing by hand (S) and syncing automatically.
@@ -24,13 +22,12 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 10] = [
+    pub const ALL: [Command; 9] = [
         Command::Add,
         Command::Remove,
         Command::Move,
         Command::Open,
         Command::Print,
-        Command::Preview,
         Command::Sync,
         Command::AutoSync,
         Command::ChooseFolder,
@@ -43,7 +40,7 @@ impl Command {
             Command::Remove => Key::R,
             Command::Move => Key::M,
             Command::Open => Key::O,
-            Command::Print | Command::Preview => Key::P,
+            Command::Print => Key::P,
             Command::Sync => Key::S,
             Command::AutoSync => Key::U,
             Command::ChooseFolder => Key::F,
@@ -59,24 +56,10 @@ impl Command {
         )
     }
 
-    /// What the button of this command does while Shift is held (and so what it
-    /// shows then). The shifted command has no button of its own.
-    pub fn shifted(self) -> Option<Command> {
-        match self {
-            Command::Print => Some(Command::Preview),
-            _ => None,
-        }
-    }
-
-    /// Whether the key has to be pressed together with Shift.
-    pub fn needs_shift(self) -> bool {
-        matches!(self, Command::Preview)
-    }
-
     /// Whether the command is only offered for releases we own (a label can
     /// only be printed for a record that is on the shelf).
     pub fn needs_ownership(self) -> bool {
-        matches!(self, Command::Print | Command::Preview)
+        matches!(self, Command::Print)
     }
 
     /// Key as shown to the user.
@@ -87,7 +70,6 @@ impl Command {
             Command::Move => "M",
             Command::Open => "O",
             Command::Print => "P",
-            Command::Preview => "Shift+P",
             Command::Sync => "S",
             Command::AutoSync => "U",
             Command::ChooseFolder => "F",
@@ -230,20 +212,10 @@ mod tests {
 
     #[test]
     fn keys_are_unique_and_labelled() {
-        let keys: Vec<(Key, bool)> = Command::ALL
-            .iter()
-            .map(|c| (c.key(), c.needs_shift()))
-            .collect();
+        let keys: Vec<Key> = Command::ALL.iter().map(|c| c.key()).collect();
         for (i, k) in keys.iter().enumerate() {
             assert!(!keys[i + 1..].contains(k), "{k:?} used twice");
         }
-        assert_eq!(Command::Preview.key(), Key::P);
-        assert!(Command::Preview.needs_shift() && !Command::Print.needs_shift());
-        assert_eq!(Command::Preview.key_label(), "Shift+P");
-        assert!(
-            Command::Preview.needs_selection() && Command::Preview.needs_ownership(),
-            "it is offered exactly where the print is"
-        );
         assert_eq!(Command::Add.key(), Key::A);
         assert_eq!(Command::Remove.key_label(), "R");
         assert_eq!(Command::Open.key_label(), "O");
@@ -254,10 +226,6 @@ mod tests {
         assert_eq!(Command::Print.key_label(), "P");
         assert!(Command::Print.needs_selection() && Command::Print.needs_ownership());
         assert!(!Command::Add.needs_ownership() && !Command::Open.needs_ownership());
-        assert_eq!(
-            Command::Print.needs_ownership(),
-            Command::Preview.needs_ownership()
-        );
         assert_eq!(Command::Sync.key(), Key::S);
         assert_eq!(Command::AutoSync.key(), Key::U);
         assert!(Command::Sync.needs_selection() && !Command::AutoSync.needs_selection());
@@ -373,26 +341,5 @@ mod tests {
         );
         // absurd counts do not overflow
         assert_eq!(decide_sync(100_000, 0, false), Save(u16::MAX));
-    }
-
-    #[test]
-    fn every_shift_command_belongs_to_a_plain_one() {
-        for cmd in Command::ALL {
-            if cmd.needs_shift() {
-                let owners: Vec<_> = Command::ALL
-                    .iter()
-                    .filter(|c| c.shifted() == Some(cmd))
-                    .collect();
-                assert_eq!(
-                    owners.len(),
-                    1,
-                    "{cmd:?} is the shifted form of exactly one button"
-                );
-                assert_eq!(owners[0].key(), cmd.key(), "on the same key");
-            }
-        }
-        assert_eq!(Command::Print.shifted(), Some(Command::Preview));
-        assert_eq!(Command::Add.shifted(), None);
-        assert_eq!(Command::Preview.shifted(), None);
     }
 }

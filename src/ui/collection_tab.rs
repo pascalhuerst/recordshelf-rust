@@ -235,25 +235,6 @@ impl RecordShelfApp {
         self.print_content(content, self.settings.tag_style());
     }
 
-    /// Shift+P: show the label of the selected record.
-    fn preview_stored(&mut self) {
-        let Some(record) = self
-            .collection
-            .details
-            .as_ref()
-            .filter(|d| Some(d.id) == self.collection.selected_id)
-        else {
-            self.set_info("The record is still loading; press Shift+P again".to_string());
-            return;
-        };
-        let title = match record.artist_display().as_str() {
-            "" => record.title.clone(),
-            artists => format!("{artists} - {}", record.title),
-        };
-        let content = LabelContent::from_stored(record);
-        self.open_label_preview(content, title);
-    }
-
     /// D: ask before deleting the selected record from the library.
     fn ask_delete(&mut self) {
         let Some(row) = self.collection.selected_row() else {
@@ -417,18 +398,9 @@ impl RecordShelfApp {
         if pressed(egui::Key::Slash) {
             self.collection.focus_search = true;
         }
-        let (shift, no_shift) = (
-            ctx.input(|i| {
-                i.key_pressed(Command::Preview.key()) && i.modifiers.shift && !i.modifiers.command
-            }),
-            ctx.input(|i| {
-                i.key_pressed(Command::Print.key()) && !i.modifiers.shift && !i.modifiers.command
-            }),
-        );
-        if shift {
-            self.preview_stored();
-        }
-        if no_shift {
+        if ctx.input(|i| {
+            i.key_pressed(Command::Print.key()) && !i.modifiers.shift && !i.modifiers.command
+        }) {
             self.print_stored();
         }
         if pressed(Command::Open.key()) {
@@ -495,7 +467,7 @@ impl RecordShelfApp {
             }
         });
 
-        if !self.collection.dialog_open() && self.label_preview.is_none() {
+        if !self.collection.dialog_open() {
             self.handle_collection_navigation(ui.ctx());
             if !search_active {
                 self.handle_collection_commands(ui.ctx());
@@ -608,20 +580,8 @@ impl RecordShelfApp {
         let mut action = None;
         let (mut edit, mut delete) = (false, false);
         ui.horizontal(|ui| {
-            // while Shift is held, the button shows (and does) its shifted function
-            let shift = ui.input(|i| i.modifiers.shift);
-            let print = if shift {
-                Command::Preview
-            } else {
-                Command::Print
-            };
-            let text = if shift {
-                "Label preview  [Shift+P]"
-            } else {
-                "Print label  [P]"
-            };
-            if ui.button(text).clicked() {
-                action = Some(print);
+            if ui.button("Print label  [P]").clicked() {
+                action = Some(Command::Print);
             }
             if ui.button("Open in browser  [O]").clicked() {
                 action = Some(Command::Open);
@@ -639,7 +599,6 @@ impl RecordShelfApp {
         });
         match action {
             Some(Command::Print) => self.print_stored(),
-            Some(Command::Preview) => self.preview_stored(),
             Some(Command::Open) => self.open_stored(),
             Some(Command::Quit) => self.run_command(Command::Quit),
             _ => {}
@@ -652,6 +611,16 @@ impl RecordShelfApp {
         }
         let selected = self.collection.selected_id;
         let mut sink = LinkSink::default();
+        // the label picture of the record shown
+        let label_view = {
+            let content = self
+                .collection
+                .details
+                .as_ref()
+                .filter(|d| Some(d.id) == selected)
+                .map(|d| LabelContent::from_stored(d));
+            self.label_view(ui.ctx(), content)
+        };
         egui::ScrollArea::vertical()
             .id_source("collection-details")
             .auto_shrink([false, false])
@@ -670,13 +639,28 @@ impl RecordShelfApp {
                     }
                     return;
                 };
+                // the label picture needs room beside the info; without it, it is left out
+                let view = label_view.as_ref().filter(|v| {
+                    ui.available_width() - COVER_SIZE - v.size.x - 24.0 >= MIN_INFO_WIDTH
+                });
+                let info_width = ui.available_width()
+                    - COVER_SIZE
+                    - view.map_or(0.0, |v| v.size.x + 24.0)
+                    - 12.0;
                 ui.horizontal_top(|ui| {
                     if self.collection.selected_row().is_some_and(|r| r.has_cover) {
                         draw_image(ui, &self.images, &cover_key(record.id), COVER_SIZE);
                     } else {
                         draw_placeholder(ui, COVER_SIZE);
                     }
-                    ui.vertical(|ui| render_stored(ui, record, &mut sink));
+                    ui.vertical(|ui| {
+                        ui.set_max_width(info_width.max(MIN_INFO_WIDTH));
+                        render_stored(ui, record, &mut sink);
+                    });
+                    if let Some(view) = view {
+                        // at the right edge, beside the record info
+                        super::label_preview::draw_label_view(ui, view);
+                    }
                 });
             });
         #[cfg(test)]
