@@ -187,10 +187,14 @@ fn scanner_loop(
         return;
     }
 
+    // The scanner is a keyboard to the system: without the grab the window
+    // would also receive every character of a scan (and run the letters as
+    // commands). The grab ends when the device is closed.
+    let grabbed = device.grab();
     emit(
         &tx,
         &repaint,
-        ScanEvent::Info(format!("Listening for scans on {}", device_path.display())),
+        ScanEvent::Info(listening_message(&device_path, grabbed.as_ref().err())),
     );
 
     let mut decoder = KeyDecoder::default();
@@ -221,6 +225,17 @@ fn scanner_loop(
                 return;
             }
         }
+    }
+}
+
+/// What to tell the user once a device is open.
+fn listening_message(path: &std::path::Path, grab_error: Option<&std::io::Error>) -> String {
+    match grab_error {
+        None => format!("Listening for scans on {}", path.display()),
+        Some(err) => format!(
+            "Listening for scans on {}, but could not take the device for us alone ({err}): the characters of a scan may also reach other windows",
+            path.display()
+        ),
     }
 }
 
@@ -440,6 +455,21 @@ mod tests {
         assert_eq!(translate_key(KeyCode::KEY_A, false), Some('A'));
         assert_eq!(translate_key(KeyCode::KEY_Z, false), Some('Z'));
         assert_eq!(translate_key(KeyCode::KEY_SPACE, false), None);
+    }
+
+    #[test]
+    fn the_listening_message_tells_when_the_device_could_not_be_grabbed() {
+        let path = std::path::Path::new("/dev/input/event9");
+        assert_eq!(
+            listening_message(path, None),
+            "Listening for scans on /dev/input/event9"
+        );
+        let busy = std::io::Error::from_raw_os_error(16);
+        let text = listening_message(path, Some(&busy));
+        assert!(
+            text.contains("could not take the device") && text.contains("other windows"),
+            "{text}"
+        );
     }
 
     #[test]
