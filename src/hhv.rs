@@ -38,8 +38,15 @@ pub fn article_number(code: &str) -> Option<String> {
 }
 
 /// The article page must be the one we asked for.
+/// The shop's own number of a record can carry a variant (`853005v1`), the
+/// number we ask for is the article number (`853005`): both name one article.
 pub fn find_entry<'a>(code: &str, entries: &'a [ShopEntry]) -> Option<&'a ShopEntry> {
-    entries.iter().find(|e| e.code == code.trim())
+    let wanted = code.trim();
+    let number = article_number(wanted);
+    entries.iter().find(|e| {
+        e.code.eq_ignore_ascii_case(wanted)
+            || (number.is_some() && article_number(&e.code) == number)
+    })
 }
 
 /// Reads the article from an article page. Anything else (search result list,
@@ -266,5 +273,28 @@ mod tests {
             FIXTURE
         );
         assert_eq!(parse_results(&html).len(), 1);
+    }
+
+    const VARIANT_FIXTURE: &str = include_str!("../tests/fixtures/hhv_product_853005.html");
+
+    #[test]
+    fn an_article_with_a_variant_in_its_sku_is_found_by_its_number() {
+        let entries = parse_results(VARIANT_FIXTURE);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.code, "853005v1", "the shop's sku has the variant");
+        assert_eq!(e.artist, "V.A.");
+        assert_eq!(e.title, "Dancefloor Edits");
+        assert_eq!((e.catno.as_str(), e.label.as_str()), ("LGF008", "Legofunk"));
+        assert_eq!(e.barcode, None);
+        for asked in ["853005", "853005v1", "853005V1", " 0853005\n"] {
+            assert!(find_entry(asked, &entries).is_some(), "{asked}");
+        }
+        assert!(find_entry("853006", &entries).is_none());
+        assert!(
+            find_entry("853005v2", &entries).is_some(),
+            "the article is the same"
+        );
+        assert!(find_entry("CNF/O1", &entries).is_none());
     }
 }
