@@ -37,6 +37,8 @@ pub struct Profile {
     pub printer_speed_ips: u8,
     pub label_font_scale: f32,
     pub label_font_auto: bool,
+    pub label_code_side: String,
+    pub label_barcode_mm: f32,
 }
 
 impl Default for Profile {
@@ -89,6 +91,10 @@ pub struct Settings {
     pub label_font_scale: f32,
     /// Make the text as big as the label allows (`label_font_scale` is then the least size)
     pub label_font_auto: bool,
+    /// Where a barcode goes: "bottom" (along the bottom edge) or "right" (standing at the right edge)
+    pub label_code_side: String,
+    /// Height of the bars of the barcode in mm (the width of the band when it stands at the right)
+    pub label_barcode_mm: f32,
     /// How many screen points make an inch, for the label preview at real size (96 is usual)
     pub preview_ppi: f32,
     /// PostgreSQL connection string of our own database (written by `db/db.sh bootstrap`)
@@ -136,6 +142,8 @@ impl Default for Settings {
             label_hidden: Vec::new(),
             label_font_scale: 1.0,
             label_font_auto: false,
+            label_code_side: "bottom".to_string(),
+            label_barcode_mm: 3.0,
             preview_ppi: 96.0,
             database_url: String::new(),
             profile: String::new(),
@@ -254,6 +262,11 @@ impl Settings {
         } else {
             1.0
         };
+        self.label_code_side = match self.label_code_side.trim().to_lowercase().as_str() {
+            "right" => "right".to_string(),
+            _ => "bottom".to_string(),
+        };
+        self.label_barcode_mm = clamp_mm(self.label_barcode_mm, 2.0, 15.0, 3.0);
         self.profile = self.profile.trim().to_string();
         let mut seen: Vec<String> = vec![self.profile_name().to_lowercase()];
         self.profiles.retain_mut(|p| {
@@ -299,6 +312,8 @@ impl Settings {
             printer_speed_ips: self.printer_speed_ips,
             label_font_scale: self.label_font_scale,
             label_font_auto: self.label_font_auto,
+            label_code_side: self.label_code_side.clone(),
+            label_barcode_mm: self.label_barcode_mm,
         }
     }
 
@@ -315,6 +330,8 @@ impl Settings {
         other.printer_speed_ips = self.printer_speed_ips;
         other.label_font_scale = self.label_font_scale;
         other.label_font_auto = self.label_font_auto;
+        other.label_code_side = self.label_code_side.clone();
+        other.label_barcode_mm = self.label_barcode_mm;
         other.profile = self.profile.clone();
         other.profiles = self.profiles.clone();
     }
@@ -376,6 +393,8 @@ impl Settings {
         self.printer_speed_ips = target.printer_speed_ips;
         self.label_font_scale = target.label_font_scale;
         self.label_font_auto = target.label_font_auto;
+        self.label_code_side = target.label_code_side;
+        self.label_barcode_mm = target.label_barcode_mm;
         self.profile = target.name;
         true
     }
@@ -408,6 +427,19 @@ impl Settings {
         self.profiles.len() < before
     }
 
+    /// Where a barcode goes.
+    pub fn code_side(&self) -> crate::label::CodeSide {
+        match self.label_code_side.as_str() {
+            "right" => crate::label::CodeSide::Right,
+            _ => crate::label::CodeSide::Bottom,
+        }
+    }
+
+    /// Height of the bars of the barcode in dots.
+    pub fn barcode_dots(&self) -> u32 {
+        (self.label_barcode_mm * 8.0).round() as u32
+    }
+
     /// How the styles are drawn on the label, if at all.
     pub fn tag_style(&self) -> Option<crate::label::TagStyle> {
         match self.label_tags.as_str() {
@@ -426,6 +458,47 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_barcode_settings_are_cleaned_up_and_follow_the_profile() {
+        let s = Settings {
+            label_code_side: " RIGHT ".into(),
+            label_barcode_mm: 40.0,
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(
+            (s.label_code_side.as_str(), s.label_barcode_mm),
+            ("right", 15.0)
+        );
+        assert_eq!(s.code_side(), crate::label::CodeSide::Right);
+        assert_eq!(s.barcode_dots(), 120);
+        let odd = Settings {
+            label_code_side: "left".into(),
+            label_barcode_mm: 0.5,
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(
+            (odd.label_code_side.as_str(), odd.label_barcode_mm),
+            ("bottom", 2.0)
+        );
+        let d = Settings::default();
+        assert_eq!(
+            (d.label_code_side.as_str(), d.barcode_dots()),
+            ("bottom", 24)
+        );
+
+        let mut s = s;
+        s.add_profile("Other").unwrap();
+        s.label_code_side = "bottom".into();
+        s.label_barcode_mm = 3.0;
+        assert!(s.switch_profile("Default"));
+        assert_eq!(
+            (s.label_code_side.as_str(), s.label_barcode_mm),
+            ("right", 15.0)
+        );
+    }
 
     #[test]
     fn the_text_size_is_kept_in_range() {

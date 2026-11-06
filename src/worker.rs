@@ -422,6 +422,9 @@ pub struct PrintJob {
     /// Text size (factor of normal); with `font_auto` the least size.
     pub font_scale: f32,
     pub font_auto: bool,
+    pub code_side: crate::label::CodeSide,
+    /// Height of the bars of a barcode in dots.
+    pub barcode_height: u32,
 }
 
 impl PrintJob {
@@ -433,6 +436,8 @@ impl PrintJob {
         options.parts = self.parts;
         options.font_scale = self.font_scale;
         options.font_auto = self.font_auto;
+        options.code_side = self.code_side;
+        options.barcode_height = self.barcode_height;
         let img = label::render_with(&self.content, size, &options)?;
         let job = JobOptions {
             darkness: Some(self.darkness),
@@ -1021,6 +1026,8 @@ mod tests {
             parts: Default::default(),
             font_scale: 1.0,
             font_auto: false,
+            code_side: Default::default(),
+            barcode_height: 24,
         }
     }
 

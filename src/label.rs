@@ -359,6 +359,25 @@ struct CodeBitmap {
 }
 
 impl CodeBitmap {
+    /// Turned a quarter clockwise: a barcode that stands along a side.
+    fn rotated(&self) -> CodeBitmap {
+        let (width, height) = (self.height, self.width);
+        let mut black = vec![false; (width * height) as usize];
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.black[(y * self.width + x) as usize] {
+                    let (nx, ny) = (self.height - 1 - y, x);
+                    black[(ny * width + nx) as usize] = true;
+                }
+            }
+        }
+        CodeBitmap {
+            width,
+            height,
+            black,
+        }
+    }
+
     fn draw(&self, img: &mut GrayImage, left: u32, top: u32) {
         for y in 0..self.height {
             for x in 0..self.width {
@@ -479,10 +498,22 @@ impl LabelParts {
     }
 }
 
+/// Where a barcode goes (a QR code is always in the bottom right corner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodeSide {
+    /// Along the bottom edge, in the middle.
+    #[default]
+    Bottom,
+    /// Standing along the right edge, in the middle; the text keeps to the left of it.
+    Right,
+}
+
 /// How the code is drawn, besides its kind.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabelOptions {
     pub kind: CodeKind,
+    /// Where a barcode is.
+    pub code_side: CodeSide,
     /// Height of the bars of a barcode in dots.
     pub barcode_height: u32,
     /// Width of the narrowest bar of a barcode in dots.
@@ -522,6 +553,7 @@ impl LabelOptions {
     pub fn new(kind: CodeKind) -> Self {
         Self {
             kind,
+            code_side: CodeSide::Bottom,
             barcode_height: 24, // 3 mm; the printed tests read fine down to 2 mm
             barcode_module: 2,
             caption: None,
@@ -592,9 +624,11 @@ fn draw_tags(
         return (0.0, 0);
     }
     let filled = style == TagStyle::Filled;
+    // white on black looks thin in the normal weight
+    let font = if filled { &fonts.bold } else { &fonts.regular };
     let widths: Vec<f32> = tags
         .iter()
-        .map(|t| text_width(&fonts.regular, tag_px, t) + 2.0 * tag_padding)
+        .map(|t| text_width(font, tag_px, t) + 2.0 * tag_padding)
         .collect();
     // how many fit, leaving room for a "+N" if some do not
     let marker_width = |hidden: usize| text_width(&fonts.bold, tag_px, &format!("+{hidden}")) + 4.0;
@@ -620,8 +654,8 @@ fn draw_tags(
         let mut label = tag.clone();
         let mut width = widths[i];
         if width > max_width {
-            label = ellipsize(&fonts.regular, tag_px, tag, max_width - 2.0 * tag_padding);
-            width = text_width(&fonts.regular, tag_px, &label) + 2.0 * tag_padding;
+            label = ellipsize(font, tag_px, tag, max_width - 2.0 * tag_padding);
+            width = text_width(font, tag_px, &label) + 2.0 * tag_padding;
         }
         draw_pill(
             img,
@@ -634,15 +668,7 @@ fn draw_tags(
         );
         let text_top = y + (tag_height - tag_px * 1.2) / 2.0 - 0.5;
         let color = if filled { WHITE } else { BLACK };
-        draw_text_in(
-            img,
-            &fonts.regular,
-            tag_px,
-            x + tag_padding,
-            text_top,
-            &label,
-            color,
-        );
+        draw_text_in(img, font, tag_px, x + tag_padding, text_top, &label, color);
         x += width + tag_gap;
     }
     if shown < tags.len() {
@@ -700,11 +726,12 @@ fn render_scaled(
     let kind = options.kind;
     let fonts = Fonts::load()?;
     let mut img = GrayImage::from_pixel(size.width, size.height, WHITE);
-    let inner_width = (size.width - 2 * MARGIN) as f32;
     let left = MARGIN as f32;
     let mut y = MARGIN as f32 - 2.0;
 
     // Where the code goes decides how much room is left for the tracks.
+    let side_right =
+        kind == CodeKind::Barcode && options.code_side == CodeSide::Right && options.parts.code;
     let code = match kind {
         CodeKind::Qr => qr_code(content.release_id, 4, 2)?,
         CodeKind::Barcode => barcode(
@@ -713,7 +740,13 @@ fn render_scaled(
             options.barcode_height,
         )?,
     };
+    let code = if side_right { code.rotated() } else { code };
     let (code_left, code_top) = match kind {
+        // standing at the right edge, in the middle
+        CodeKind::Barcode if side_right => (
+            size.width - MARGIN + 4 - code.width,
+            size.height.saturating_sub(code.height) / 2,
+        ),
         // bottom right corner; the quiet zone may overlap the margin
         CodeKind::Qr => (
             size.width - MARGIN + 8 - code.width,
@@ -725,6 +758,14 @@ fn render_scaled(
             size.height - MARGIN + 4 - code.height,
         ),
     };
+
+    // the text keeps left of a barcode that stands at the right edge
+    let inner_width = (size.width - 2 * MARGIN) as f32
+        - if side_right {
+            code.width as f32 + 6.0
+        } else {
+            0.0
+        };
 
     // Header: size on the left, label / catalog number on the right.
     let parts = options.parts;
@@ -814,7 +855,12 @@ fn render_scaled(
         .fold(0.0, f32::max);
     let bottom = (size.height - MARGIN) as f32;
     // without the code the whole height is free
-    let code_top = if parts.code { code_top } else { size.height };
+    let code_draw_top = code_top;
+    let code_top = if parts.code && !side_right {
+        code_top
+    } else {
+        size.height
+    };
     let code_top_f = code_top as f32;
     // (top, right edge) of every track line that fits
     let mut rows: Vec<(f32, f32)> = Vec::new();
@@ -867,7 +913,7 @@ fn render_scaled(
     }
 
     if parts.code {
-        code.draw(&mut img, code_left, code_top);
+        code.draw(&mut img, code_left, code_draw_top);
     }
     if let Some(caption) = &options.caption {
         let px = 15.0;
@@ -980,6 +1026,168 @@ mod tests {
         width: 607,
         height: 408,
     };
+
+    /// The barcode standing at the right edge, turned back upright.
+    fn upright_right_band(img: &GrayImage, band: u32) -> GrayImage {
+        let part = image::imageops::crop_imm(
+            img,
+            img.width() - 16 - band - 24,
+            0,
+            band + 40,
+            img.height(),
+        )
+        .to_image();
+        image::imageops::rotate270(&part)
+    }
+
+    #[test]
+    fn the_barcode_can_stand_at_the_right_edge() {
+        let content = sample_content();
+        for (size, mm) in [(SIZE_ZD421, 3.0_f32), (SIZE_ZD421, 6.0), (SIZE_REAL, 3.0)] {
+            let mut options = LabelOptions::new(CodeKind::Barcode);
+            options.code_side = CodeSide::Right;
+            options.barcode_height = (mm * 8.0) as u32;
+            let img = render_with(&content, size, &options).unwrap();
+            let band = options.barcode_height;
+            let upright = upright_right_band(&img, band);
+            assert_eq!(
+                decode(&upright).as_deref(),
+                Some("32474433"),
+                "the barcode reads at the right edge ({mm} mm)"
+            );
+            // the band is as wide as the bars are high: inside the margin, centred vertically
+            let columns: Vec<u32> = (0..img.width())
+                .filter(|&x| {
+                    (0..img.height())
+                        .filter(|&y| img.get_pixel(x, y).0[0] < 128)
+                        .count()
+                        > img.height() as usize / 6
+                })
+                .collect();
+            assert!(!columns.is_empty());
+            assert!(
+                *columns.last().unwrap() <= size.width - MARGIN + 4,
+                "inside the margin"
+            );
+            let rows_with_ink: Vec<u32> = (0..img.height())
+                .filter(|&y| {
+                    (img.width() - MARGIN - band..img.width() - MARGIN)
+                        .any(|x| img.get_pixel(x, y).0[0] < 128)
+                })
+                .collect();
+            let (first, last) = (rows_with_ink[0], *rows_with_ink.last().unwrap());
+            assert!(
+                first > 10 && last < img.height() - 10,
+                "centred: {first}..{last}"
+            );
+            assert!((first as i32 - (img.height() - 1 - last) as i32).abs() < 12);
+        }
+    }
+
+    #[test]
+    fn text_keeps_left_of_a_barcode_at_the_right_edge() {
+        let mut content = sample_content();
+        content.artist = "A very long artist name that needs the whole width".into();
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        options.code_side = CodeSide::Right;
+        options.barcode_height = 48;
+        let img = render_with(&content, SIZE_ZD421, &options).unwrap();
+        let band_left = SIZE_ZD421.width - MARGIN + 4 - 48;
+        // nothing but the barcode right of the text area, and a gap before it
+        for x in band_left - 4..band_left {
+            for y in 0..img.height() {
+                assert_eq!(
+                    img.get_pixel(x, y).0[0],
+                    255,
+                    "ink at {x},{y} touches the barcode"
+                );
+            }
+        }
+        // the tracks may use the whole height now: more lines than with the barcode at the bottom
+        content.tracks = (1..=12)
+            .map(|i| LabelTrack {
+                position: format!("A{i}"),
+                title: format!("Track {i}"),
+            })
+            .collect();
+        options.barcode_height = 80;
+        let (_, right) = render_scaled(&content, SIZE_REAL, &options, 1.0).unwrap();
+        let mut at_bottom = LabelOptions::new(CodeKind::Barcode);
+        at_bottom.barcode_height = 80;
+        let (_, bottom) = render_scaled(&content, SIZE_REAL, &at_bottom, 1.0).unwrap();
+        assert!(
+            right.tracks_hidden < bottom.tracks_hidden,
+            "{right:?} vs {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn the_side_is_ignored_for_a_qr_code_and_a_hidden_code() {
+        let content = sample_content();
+        let mut qr = LabelOptions::new(CodeKind::Qr);
+        let plain = render_with(&content, SIZE_ZD421, &qr).unwrap();
+        qr.code_side = CodeSide::Right;
+        assert_eq!(
+            render_with(&content, SIZE_ZD421, &qr).unwrap().as_raw(),
+            plain.as_raw()
+        );
+        let mut hidden = LabelOptions::new(CodeKind::Barcode);
+        hidden.parts.code = false;
+        let without = render_with(&content, SIZE_ZD421, &hidden).unwrap();
+        hidden.code_side = CodeSide::Right;
+        assert_eq!(
+            render_with(&content, SIZE_ZD421, &hidden).unwrap().as_raw(),
+            without.as_raw()
+        );
+    }
+
+    #[test]
+    fn the_bars_can_be_higher() {
+        let content = sample_content();
+        let mut low = LabelOptions::new(CodeKind::Barcode);
+        low.barcode_height = 16;
+        let mut high = low.clone();
+        high.barcode_height = 64;
+        let ink = |o: &LabelOptions| {
+            let img = render_with(&content, SIZE_ZD421, o).unwrap();
+            ink_in(&img, 300, 408)
+        };
+        assert!(ink(&high) > ink(&low) * 2);
+    }
+
+    #[test]
+    fn filled_tags_are_set_in_bold() {
+        let fonts = Fonts::load().unwrap();
+        let tags = vec!["Techno".to_string(), "Minimal".to_string()];
+        let width = |style| {
+            let mut img = GrayImage::from_pixel(400, 40, WHITE);
+            draw_tags(&mut img, &fonts, (4.0, 4.0), 390.0, &tags, style, 1.0);
+            (0..400)
+                .rev()
+                .find(|&x| (0..40).any(|y| img.get_pixel(x, y).0[0] < 128))
+                .unwrap()
+        };
+        assert!(
+            width(TagStyle::Filled) > width(TagStyle::Outline),
+            "bold is wider"
+        );
+        // white text in the pill is still there
+        let mut img = GrayImage::from_pixel(400, 40, WHITE);
+        draw_tags(
+            &mut img,
+            &fonts,
+            (4.0, 4.0),
+            390.0,
+            &tags,
+            TagStyle::Filled,
+            1.0,
+        );
+        let whites = (10..60)
+            .flat_map(|x| (6..24).map(move |y| (x, y)))
+            .filter(|&(x, y)| img.get_pixel(x, y).0[0] == 255)
+            .count();
+        assert!(whites > 30, "{whites}");
+    }
 
     #[test]
     fn bigger_text_on_request() {

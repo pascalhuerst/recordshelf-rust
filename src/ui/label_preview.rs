@@ -31,6 +31,8 @@ struct PanelKey {
     hidden: Vec<String>,
     font_scale_milli: u32,
     font_auto: bool,
+    code_side: String,
+    barcode_dots: u32,
 }
 
 /// What to draw: the picture, its size on the screen in points, and a caption.
@@ -53,6 +55,10 @@ pub(super) struct LabelView {
     pub font_scale: f32,
     pub font_auto: bool,
     pub used_scale: f32,
+    /// Where the barcode is and how high; whether the label has a barcode at all.
+    pub code_side: String,
+    pub barcode_mm: f32,
+    pub has_barcode: bool,
 }
 
 /// A change made with the toggles beside the picture.
@@ -67,6 +73,9 @@ pub(super) struct LabelAction {
     /// A new text size (factor of normal) / automatic size on or off.
     pub font_scale: Option<f32>,
     pub font_auto: Option<bool>,
+    /// "bottom" or "right", and a new barcode height in mm.
+    pub code_side: Option<String>,
+    pub barcode_mm: Option<f32>,
 }
 
 /// Space around the label panel, in points.
@@ -189,6 +198,8 @@ impl RecordShelfApp {
         options.parts = settings.label_parts();
         options.font_scale = settings.label_font_scale;
         options.font_auto = settings.label_font_auto;
+        options.code_side = settings.code_side();
+        options.barcode_height = settings.barcode_dots();
         label::render_fitted(content, size, &options)
     }
 
@@ -205,6 +216,8 @@ impl RecordShelfApp {
             hidden: s.label_hidden.clone(),
             font_scale_milli: (s.label_font_scale * 1000.0).round() as u32,
             font_auto: s.label_font_auto,
+            code_side: s.label_code_side.clone(),
+            barcode_dots: s.barcode_dots(),
         }
     }
 
@@ -293,6 +306,9 @@ impl RecordShelfApp {
             font_scale: self.settings.label_font_scale,
             font_auto: self.settings.label_font_auto,
             used_scale: p.used_scale,
+            code_side: self.settings.label_code_side.clone(),
+            barcode_mm: self.settings.label_barcode_mm,
+            has_barcode: self.settings.label_code != "qr" && self.settings.label_parts().code,
         })
     }
 
@@ -418,6 +434,35 @@ pub(super) fn draw_label_panel(ui: &mut egui::Ui, view: &LabelView) -> LabelActi
                             action.font_auto = Some(auto);
                         }
                     });
+                    if view.has_barcode {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Barcode:");
+                            for (value, name) in [("bottom", "at the bottom"), ("right", "at the right")]
+                            {
+                                if ui
+                                    .selectable_label(view.code_side == value, name)
+                                    .clicked()
+                                    && view.code_side != value
+                                {
+                                    action.code_side = Some(value.to_string());
+                                }
+                            }
+                            let mut mm = view.barcode_mm;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut mm)
+                                        .clamp_range(2.0..=15.0)
+                                        .speed(0.1)
+                                        .fixed_decimals(1)
+                                        .suffix(" mm high"),
+                                )
+                                .changed()
+                            {
+                                action.barcode_mm = Some(mm);
+                            }
+                        });
+                    }
                     ui.add_space(4.0);
                     ui.label("Show:");
                     ui.horizontal_wrapped(|ui| {
@@ -457,6 +502,12 @@ impl RecordShelfApp {
         if let Some(scale) = action.font_scale {
             self.settings.label_font_scale =
                 scale.clamp(crate::label::MIN_FONT_SCALE, crate::label::MAX_FONT_SCALE);
+        }
+        if let Some(side) = &action.code_side {
+            self.settings.label_code_side = side.clone();
+        }
+        if let Some(mm) = action.barcode_mm {
+            self.settings.label_barcode_mm = mm.clamp(2.0, 15.0);
         }
         if let Some(auto) = action.font_auto {
             self.settings.label_font_auto = auto;
@@ -1223,6 +1274,67 @@ mod tests {
             (1.0, true)
         );
         assert!(app.print_job(crate::label::sample_content()).font_auto);
+    }
+
+    #[test]
+    fn the_barcode_side_and_height_are_chosen_in_the_panel_and_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "token = \"keep\"\n").unwrap();
+        let mut app = collection_app();
+        app.config_path = Some(path.clone());
+        app.collection.details = Some(long_record());
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        for wanted in ["Barcode:", "at the bottom", "at the right"] {
+            assert!(
+                texts.iter().any(|(t, _)| t == wanted),
+                "{wanted:?} in {texts:?}"
+            );
+        }
+        let before = app
+            .render_label_bitmap(&crate::label::sample_content(), None)
+            .unwrap();
+        app.apply_label_action(LabelAction {
+            code_side: Some("right".into()),
+            barcode_mm: Some(5.0),
+            ..LabelAction::default()
+        });
+        assert_eq!(
+            (
+                app.settings.label_code_side.as_str(),
+                app.settings.label_barcode_mm
+            ),
+            ("right", 5.0)
+        );
+        assert_ne!(
+            app.render_label_bitmap(&crate::label::sample_content(), None)
+                .unwrap()
+                .as_raw(),
+            before.as_raw()
+        );
+        let saved = Settings::load(&path).unwrap();
+        assert_eq!(
+            (saved.label_code_side.as_str(), saved.label_barcode_mm),
+            ("right", 5.0)
+        );
+        assert_eq!(saved.token, "keep");
+        let job = app.print_job(crate::label::sample_content());
+        assert_eq!(
+            (job.code_side, job.barcode_height),
+            (crate::label::CodeSide::Right, 40)
+        );
+        app.apply_label_action(LabelAction {
+            barcode_mm: Some(99.0),
+            ..LabelAction::default()
+        });
+        assert_eq!(app.settings.label_barcode_mm, 15.0);
+
+        // nothing to choose for a QR code
+        app.settings.label_code = "qr".into();
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        assert!(!texts.iter().any(|(t, _)| t == "at the right"));
     }
 
     #[test]

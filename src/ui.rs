@@ -1253,6 +1253,35 @@ impl RecordShelfApp {
                                         );
                                     });
                                 ui.end_row();
+                                ui.label("Barcode:");
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_source("label-code-side")
+                                        .selected_text(if draft.label_code_side == "right" {
+                                            "at the right edge"
+                                        } else {
+                                            "at the bottom"
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut draft.label_code_side,
+                                                "bottom".to_string(),
+                                                "at the bottom",
+                                            );
+                                            ui.selectable_value(
+                                                &mut draft.label_code_side,
+                                                "right".to_string(),
+                                                "at the right edge",
+                                            );
+                                        });
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.label_barcode_mm)
+                                            .clamp_range(2.0..=15.0)
+                                            .speed(0.1)
+                                            .fixed_decimals(1)
+                                            .suffix(" mm high"),
+                                    );
+                                });
+                                ui.end_row();
                                 ui.label("Preview scale:");
                                 ui.horizontal(|ui| {
                                     ui.add(
@@ -2254,6 +2283,8 @@ impl RecordShelfApp {
             parts: settings.label_parts(),
             font_scale: settings.label_font_scale,
             font_auto: settings.label_font_auto,
+            code_side: settings.code_side(),
+            barcode_height: settings.barcode_dots(),
         }
     }
 
