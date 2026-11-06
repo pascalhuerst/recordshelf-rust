@@ -2252,6 +2252,8 @@ impl RecordShelfApp {
             },
             tag_style: settings.tag_style(),
             parts: settings.label_parts(),
+            font_scale: settings.label_font_scale,
+            font_auto: settings.label_font_auto,
         }
     }
 

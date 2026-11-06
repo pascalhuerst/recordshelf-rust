@@ -419,6 +419,9 @@ pub struct PrintJob {
     pub tag_style: Option<crate::label::TagStyle>,
     /// Which parts of the label are drawn.
     pub parts: crate::label::LabelParts,
+    /// Text size (factor of normal); with `font_auto` the least size.
+    pub font_scale: f32,
+    pub font_auto: bool,
 }
 
 impl PrintJob {
@@ -428,6 +431,8 @@ impl PrintJob {
         let mut options = LabelOptions::new(self.code);
         options.tag_style = self.tag_style;
         options.parts = self.parts;
+        options.font_scale = self.font_scale;
+        options.font_auto = self.font_auto;
         let img = label::render_with(&self.content, size, &options)?;
         let job = JobOptions {
             darkness: Some(self.darkness),
@@ -1014,6 +1019,8 @@ mod tests {
             code: CodeKind::Barcode,
             tag_style: None,
             parts: Default::default(),
+            font_scale: 1.0,
+            font_auto: false,
         }
     }
 

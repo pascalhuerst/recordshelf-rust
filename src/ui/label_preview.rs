@@ -14,6 +14,8 @@ pub(super) struct LabelPanel {
     texture: egui::TextureHandle,
     display: egui::Vec2,
     caption: String,
+    /// The text size the picture was drawn with (the automatic one is found out when drawing).
+    used_scale: f32,
 }
 
 /// Everything the picture depends on besides the record.
@@ -27,6 +29,8 @@ struct PanelKey {
     qr: bool,
     tags: String,
     hidden: Vec<String>,
+    font_scale_milli: u32,
+    font_auto: bool,
 }
 
 /// What to draw: the picture, its size on the screen in points, and a caption.
@@ -45,10 +49,14 @@ pub(super) struct LabelView {
     /// The printer profiles and the one in use.
     pub profiles: Vec<String>,
     pub profile: String,
+    /// The text size setting, whether it is automatic, and the size used in the picture.
+    pub font_scale: f32,
+    pub font_auto: bool,
+    pub used_scale: f32,
 }
 
 /// A change made with the toggles beside the picture.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub(super) struct LabelAction {
     pub tags: Option<String>,
     pub code: Option<String>,
@@ -56,6 +64,9 @@ pub(super) struct LabelAction {
     pub part: Option<(String, bool)>,
     /// The printer profile to switch to.
     pub profile: Option<String>,
+    /// A new text size (factor of normal) / automatic size on or off.
+    pub font_scale: Option<f32>,
+    pub font_auto: Option<bool>,
 }
 
 /// Space around the label panel, in points.
@@ -151,11 +162,22 @@ fn tag_style_name(style: Option<TagStyle>) -> &'static str {
 
 impl RecordShelfApp {
     /// The label of a record, drawn with the printer settings.
+    #[cfg(test)]
     fn render_label_bitmap(
         &self,
         content: &LabelContent,
         tag_style: Option<TagStyle>,
     ) -> anyhow::Result<GrayImage> {
+        self.render_label_fitted(content, tag_style)
+            .map(|(img, _)| img)
+    }
+
+    /// The label and the text size it was drawn with.
+    fn render_label_fitted(
+        &self,
+        content: &LabelContent,
+        tag_style: Option<TagStyle>,
+    ) -> anyhow::Result<(GrayImage, f32)> {
         let settings = &self.settings;
         let size = label::LabelSize::from_mm(settings.label_width_mm, settings.label_height_mm);
         let mut options = label::LabelOptions::new(if settings.label_code == "qr" {
@@ -165,7 +187,9 @@ impl RecordShelfApp {
         });
         options.tag_style = tag_style;
         options.parts = settings.label_parts();
-        label::render_with(content, size, &options)
+        options.font_scale = settings.label_font_scale;
+        options.font_auto = settings.label_font_auto;
+        label::render_fitted(content, size, &options)
     }
 
     fn panel_key(&self, ctx: &egui::Context) -> PanelKey {
@@ -179,6 +203,8 @@ impl RecordShelfApp {
             qr: s.label_code == "qr",
             tags: s.label_tags.clone(),
             hidden: s.label_hidden.clone(),
+            font_scale_milli: (s.label_font_scale * 1000.0).round() as u32,
+            font_auto: s.label_font_auto,
         }
     }
 
@@ -199,14 +225,15 @@ impl RecordShelfApp {
             .as_ref()
             .is_some_and(|p| p.key == key && p.content == content);
         if !up_to_date {
-            let bitmap = match self.render_label_bitmap(&content, self.settings.tag_style()) {
-                Ok(bitmap) => bitmap,
-                Err(err) => {
-                    self.set_error(format!("Could not draw the label: {err:#}"));
-                    self.label_panel = None;
-                    return None;
-                }
-            };
+            let (bitmap, used_scale) =
+                match self.render_label_fitted(&content, self.settings.tag_style()) {
+                    Ok(rendered) => rendered,
+                    Err(err) => {
+                        self.set_error(format!("Could not draw the label: {err:#}"));
+                        self.label_panel = None;
+                        return None;
+                    }
+                };
             let ppp = ctx.pixels_per_point();
             let points = real_size_points(
                 self.settings.label_width_mm,
@@ -237,6 +264,7 @@ impl RecordShelfApp {
                     panel.key = key;
                     panel.display = display;
                     panel.caption = caption;
+                    panel.used_scale = used_scale;
                 }
                 None => {
                     let texture =
@@ -247,6 +275,7 @@ impl RecordShelfApp {
                         texture,
                         display,
                         caption,
+                        used_scale,
                     });
                 }
             }
@@ -261,6 +290,9 @@ impl RecordShelfApp {
             hidden: self.settings.label_hidden.clone(),
             profiles: self.settings.profile_names(),
             profile: self.settings.profile_name().to_string(),
+            font_scale: self.settings.label_font_scale,
+            font_auto: self.settings.label_font_auto,
+            used_scale: p.used_scale,
         })
     }
 
@@ -351,6 +383,42 @@ pub(super) fn draw_label_panel(ui: &mut egui::Ui, view: &LabelView) -> LabelActi
                         ui.label(RichText::new("(this record has no styles)").small().weak());
                     }
                     ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Text size:");
+                        let step = 0.1_f32;
+                        let shown = if view.font_auto {
+                            view.used_scale
+                        } else {
+                            view.font_scale
+                        };
+                        let (least, most) = (crate::label::MIN_FONT_SCALE, crate::label::MAX_FONT_SCALE);
+                        if ui
+                            .add_enabled(view.font_scale > least + 0.001, egui::Button::new("A-"))
+                            .on_hover_text("Smaller text")
+                            .clicked()
+                        {
+                            action.font_scale =
+                                Some(((view.font_scale - step) * 100.0).round() / 100.0);
+                        }
+                        ui.label(format!("{:.0}%", shown * 100.0));
+                        if ui
+                            .add_enabled(view.font_scale < most - 0.001, egui::Button::new("A+"))
+                            .on_hover_text("Bigger text")
+                            .clicked()
+                        {
+                            action.font_scale =
+                                Some(((view.font_scale + step) * 100.0).round() / 100.0);
+                        }
+                        let mut auto = view.font_auto;
+                        if ui
+                            .checkbox(&mut auto, "as big as fits")
+                            .on_hover_text("Uses the biggest text size at which everything fits on the label; the size above is then the least")
+                            .changed()
+                        {
+                            action.font_auto = Some(auto);
+                        }
+                    });
+                    ui.add_space(4.0);
                     ui.label("Show:");
                     ui.horizontal_wrapped(|ui| {
                         for (name, title) in label::PARTS {
@@ -385,6 +453,13 @@ impl RecordShelfApp {
         }
         if let Some(code) = &action.code {
             self.settings.label_code = code.clone();
+        }
+        if let Some(scale) = action.font_scale {
+            self.settings.label_font_scale =
+                scale.clamp(crate::label::MIN_FONT_SCALE, crate::label::MAX_FONT_SCALE);
+        }
+        if let Some(auto) = action.font_auto {
+            self.settings.label_font_auto = auto;
         }
         if let Some(profile) = &action.profile
             && !self.settings.switch_profile(profile)
@@ -1072,6 +1147,106 @@ mod tests {
         );
         let real = real_size_points(76.0, 51.0, 96.0, 1.0);
         assert!((real.x - 287.2).abs() < 0.5 && (real.y - 192.8).abs() < 0.5);
+    }
+
+    #[test]
+    fn the_text_size_is_chosen_in_the_panel_and_remembered_per_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "token = \"keep\"\n").unwrap();
+        let mut app = collection_app();
+        app.config_path = Some(path.clone());
+        app.collection.details = Some(long_record());
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        for wanted in ["Text size:", "A-", "A+", "100%", "as big as fits"] {
+            assert!(
+                texts.iter().any(|(t, _)| t == wanted),
+                "{wanted:?} in {texts:?}"
+            );
+        }
+        let normal = app
+            .render_label_bitmap(&crate::label::sample_content(), None)
+            .unwrap();
+
+        app.apply_label_action(LabelAction {
+            font_scale: Some(1.4),
+            ..LabelAction::default()
+        });
+        assert_eq!(app.settings.label_font_scale, 1.4);
+        assert_ne!(
+            app.render_label_bitmap(&crate::label::sample_content(), None)
+                .unwrap()
+                .as_raw(),
+            normal.as_raw(),
+            "the picture changes"
+        );
+        let saved = Settings::load(&path).unwrap();
+        assert_eq!(saved.label_font_scale, 1.4);
+        assert_eq!(saved.token, "keep");
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        assert!(texts.iter().any(|(t, _)| t == "140%"), "{texts:?}");
+
+        // out of range values are brought into range
+        app.apply_label_action(LabelAction {
+            font_scale: Some(9.0),
+            ..LabelAction::default()
+        });
+        assert_eq!(app.settings.label_font_scale, crate::label::MAX_FONT_SCALE);
+
+        // each printer profile has its own
+        app.settings.label_font_scale = 1.4;
+        app.settings.add_profile("ZD421").unwrap();
+        app.apply_label_action(LabelAction {
+            font_auto: Some(true),
+            font_scale: Some(1.0),
+            ..LabelAction::default()
+        });
+        assert!(app.settings.label_font_auto);
+        app.apply_label_action(LabelAction {
+            profile: Some("Default".into()),
+            ..LabelAction::default()
+        });
+        assert_eq!(
+            (app.settings.label_font_scale, app.settings.label_font_auto),
+            (1.4, false)
+        );
+        let job = app.print_job(crate::label::sample_content());
+        assert_eq!((job.font_scale, job.font_auto), (1.4, false));
+        app.apply_label_action(LabelAction {
+            profile: Some("ZD421".into()),
+            ..LabelAction::default()
+        });
+        assert_eq!(
+            (app.settings.label_font_scale, app.settings.label_font_auto),
+            (1.0, true)
+        );
+        assert!(app.print_job(crate::label::sample_content()).font_auto);
+    }
+
+    #[test]
+    fn the_automatic_size_is_shown_as_found() {
+        let mut app = collection_app();
+        app.settings.printer_width_mm = 104.0;
+        app.settings.label_width_mm = 76.0;
+        app.settings.label_height_mm = 51.0;
+        app.settings.label_font_auto = true;
+        app.collection.details = Some(long_record());
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        let percent = texts
+            .iter()
+            .find_map(|(t, _)| t.strip_suffix('%').and_then(|n| n.parse::<f32>().ok()))
+            .expect("a percentage is shown");
+        assert!(
+            percent > 100.0,
+            "{percent}% is bigger than normal on the big label"
+        );
+        assert_eq!(
+            app.settings.label_font_scale, 1.0,
+            "the setting is the least size"
+        );
     }
 
     #[test]

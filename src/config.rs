@@ -35,6 +35,8 @@ pub struct Profile {
     pub label_top_mm: f32,
     pub printer_darkness: i8,
     pub printer_speed_ips: u8,
+    pub label_font_scale: f32,
+    pub label_font_auto: bool,
 }
 
 impl Default for Profile {
@@ -83,6 +85,10 @@ pub struct Settings {
     pub label_tags: String,
     /// Parts of the label that are left out: "header", "artist", "title", "tracks", "code"
     pub label_hidden: Vec<String>,
+    /// Text size on the label as a factor of the normal size (1.0); belongs to the printer profile
+    pub label_font_scale: f32,
+    /// Make the text as big as the label allows (`label_font_scale` is then the least size)
+    pub label_font_auto: bool,
     /// How many screen points make an inch, for the label preview at real size (96 is usual)
     pub preview_ppi: f32,
     /// PostgreSQL connection string of our own database (written by `db/db.sh bootstrap`)
@@ -128,6 +134,8 @@ impl Default for Settings {
             label_code: "barcode".to_string(),
             label_tags: "off".to_string(),
             label_hidden: Vec::new(),
+            label_font_scale: 1.0,
+            label_font_auto: false,
             preview_ppi: 96.0,
             database_url: String::new(),
             profile: String::new(),
@@ -240,6 +248,12 @@ impl Settings {
             "qr" => "qr".to_string(),
             _ => "barcode".to_string(),
         };
+        self.label_font_scale = if self.label_font_scale.is_finite() {
+            self.label_font_scale
+                .clamp(crate::label::MIN_FONT_SCALE, crate::label::MAX_FONT_SCALE)
+        } else {
+            1.0
+        };
         self.profile = self.profile.trim().to_string();
         let mut seen: Vec<String> = vec![self.profile_name().to_lowercase()];
         self.profiles.retain_mut(|p| {
@@ -283,6 +297,8 @@ impl Settings {
             label_top_mm: self.label_top_mm,
             printer_darkness: self.printer_darkness,
             printer_speed_ips: self.printer_speed_ips,
+            label_font_scale: self.label_font_scale,
+            label_font_auto: self.label_font_auto,
         }
     }
 
@@ -297,6 +313,8 @@ impl Settings {
         other.label_top_mm = self.label_top_mm;
         other.printer_darkness = self.printer_darkness;
         other.printer_speed_ips = self.printer_speed_ips;
+        other.label_font_scale = self.label_font_scale;
+        other.label_font_auto = self.label_font_auto;
         other.profile = self.profile.clone();
         other.profiles = self.profiles.clone();
     }
@@ -356,6 +374,8 @@ impl Settings {
         self.label_top_mm = target.label_top_mm;
         self.printer_darkness = target.printer_darkness;
         self.printer_speed_ips = target.printer_speed_ips;
+        self.label_font_scale = target.label_font_scale;
+        self.label_font_auto = target.label_font_auto;
         self.profile = target.name;
         true
     }
@@ -406,6 +426,25 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_text_size_is_kept_in_range() {
+        for (given, wanted) in [
+            (1.0, 1.0),
+            (0.1, crate::label::MIN_FONT_SCALE),
+            (7.0, crate::label::MAX_FONT_SCALE),
+            (f32::NAN, 1.0),
+        ] {
+            let s = Settings {
+                label_font_scale: given,
+                ..Settings::default()
+            }
+            .normalized();
+            assert_eq!(s.label_font_scale, wanted, "{given}");
+        }
+        assert_eq!(Settings::default().label_font_scale, 1.0);
+        assert!(!Settings::default().label_font_auto);
+    }
 
     #[test]
     fn hidden_label_parts_are_cleaned_up() {

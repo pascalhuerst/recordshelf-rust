@@ -480,7 +480,7 @@ impl LabelParts {
 }
 
 /// How the code is drawn, besides its kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LabelOptions {
     pub kind: CodeKind,
     /// Height of the bars of a barcode in dots.
@@ -493,6 +493,29 @@ pub struct LabelOptions {
     pub tag_style: Option<TagStyle>,
     /// Which parts are drawn.
     pub parts: LabelParts,
+    /// All text is this many times as big as normal (1.0).
+    pub font_scale: f32,
+    /// Make the text as big as the content allows (up to `MAX_FONT_SCALE`);
+    /// `font_scale` is then only the least size.
+    pub font_auto: bool,
+}
+
+/// The text sizes the settings allow, as a factor of the normal size.
+pub const MIN_FONT_SCALE: f32 = 0.6;
+pub const MAX_FONT_SCALE: f32 = 3.0;
+
+/// What did not fit on a label: the sign that the text should be smaller.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Overflow {
+    pub tracks_hidden: usize,
+    pub tags_hidden: usize,
+    pub title_cut: bool,
+}
+
+impl Overflow {
+    pub fn none(&self) -> bool {
+        *self == Overflow::default()
+    }
 }
 
 impl LabelOptions {
@@ -504,6 +527,8 @@ impl LabelOptions {
             caption: None,
             tag_style: None,
             parts: LabelParts::default(),
+            font_scale: 1.0,
+            font_auto: false,
         }
     }
 }
@@ -541,39 +566,45 @@ fn draw_pill(img: &mut GrayImage, x: u32, y: u32, w: u32, h: u32, filled: bool, 
     }
 }
 
-const TAG_PX: f32 = 15.0;
-const TAG_HEIGHT: f32 = 22.0;
-const TAG_PADDING: f32 = 8.0;
-const TAG_GAP: f32 = 5.0;
+const TAG_PX_BASE: f32 = 15.0;
+const TAG_HEIGHT_BASE: f32 = 22.0;
+const TAG_PADDING_BASE: f32 = 8.0;
+const TAG_GAP_BASE: f32 = 5.0;
 
 /// One row of tags starting at `y`: as many as fit `max_width`; the rest is
 /// counted ("+2"). Returns the height used (0 without tags).
 fn draw_tags(
     img: &mut GrayImage,
     fonts: &Fonts,
-    left: f32,
-    y: f32,
+    (left, y): (f32, f32),
     max_width: f32,
     tags: &[String],
     style: TagStyle,
-) -> f32 {
+    scale: f32,
+) -> (f32, usize) {
+    let (tag_px, tag_height, tag_padding, tag_gap) = (
+        TAG_PX_BASE * scale,
+        TAG_HEIGHT_BASE * scale,
+        TAG_PADDING_BASE * scale,
+        TAG_GAP_BASE * scale,
+    );
     if tags.is_empty() {
-        return 0.0;
+        return (0.0, 0);
     }
     let filled = style == TagStyle::Filled;
     let widths: Vec<f32> = tags
         .iter()
-        .map(|t| text_width(&fonts.regular, TAG_PX, t) + 2.0 * TAG_PADDING)
+        .map(|t| text_width(&fonts.regular, tag_px, t) + 2.0 * tag_padding)
         .collect();
     // how many fit, leaving room for a "+N" if some do not
-    let marker_width = |hidden: usize| text_width(&fonts.bold, TAG_PX, &format!("+{hidden}")) + 4.0;
+    let marker_width = |hidden: usize| text_width(&fonts.bold, tag_px, &format!("+{hidden}")) + 4.0;
     let mut shown = 0;
     let mut used = 0.0;
     for (i, w) in widths.iter().enumerate() {
-        let needed = used + w + if i == 0 { 0.0 } else { TAG_GAP };
+        let needed = used + w + if i == 0 { 0.0 } else { tag_gap };
         let hidden_after = tags.len() - i - 1;
         let reserve = if hidden_after > 0 {
-            TAG_GAP + marker_width(hidden_after)
+            tag_gap + marker_width(hidden_after)
         } else {
             0.0
         };
@@ -589,37 +620,37 @@ fn draw_tags(
         let mut label = tag.clone();
         let mut width = widths[i];
         if width > max_width {
-            label = ellipsize(&fonts.regular, TAG_PX, tag, max_width - 2.0 * TAG_PADDING);
-            width = text_width(&fonts.regular, TAG_PX, &label) + 2.0 * TAG_PADDING;
+            label = ellipsize(&fonts.regular, tag_px, tag, max_width - 2.0 * tag_padding);
+            width = text_width(&fonts.regular, tag_px, &label) + 2.0 * tag_padding;
         }
         draw_pill(
             img,
             x as u32,
             y as u32,
             width.ceil() as u32,
-            TAG_HEIGHT as u32,
+            tag_height as u32,
             filled,
             2.0,
         );
-        let text_top = y + (TAG_HEIGHT - TAG_PX * 1.2) / 2.0 - 0.5;
+        let text_top = y + (tag_height - tag_px * 1.2) / 2.0 - 0.5;
         let color = if filled { WHITE } else { BLACK };
         draw_text_in(
             img,
             &fonts.regular,
-            TAG_PX,
-            x + TAG_PADDING,
+            tag_px,
+            x + tag_padding,
             text_top,
             &label,
             color,
         );
-        x += width + TAG_GAP;
+        x += width + tag_gap;
     }
     if shown < tags.len() {
         let marker = format!("+{}", tags.len() - shown);
-        let text_top = y + (TAG_HEIGHT - TAG_PX * 1.2) / 2.0 - 0.5;
-        draw_text(img, &fonts.bold, TAG_PX, x, text_top, &marker);
+        let text_top = y + (tag_height - tag_px * 1.2) / 2.0 - 0.5;
+        draw_text(img, &fonts.bold, tag_px, x, text_top, &marker);
     }
-    TAG_HEIGHT
+    (tag_height, tags.len() - shown)
 }
 
 /// Draws the label. Black pixels are 0, the rest 255.
@@ -632,6 +663,40 @@ pub fn render_with(
     size: LabelSize,
     options: &LabelOptions,
 ) -> Result<GrayImage> {
+    render_fitted(content, size, options).map(|(img, _)| img)
+}
+
+/// Draws the label and tells the text size used (a factor of the normal size).
+/// With `font_auto` that is the biggest size at which everything fits (not
+/// less than `font_scale`); otherwise `font_scale`.
+pub fn render_fitted(
+    content: &LabelContent,
+    size: LabelSize,
+    options: &LabelOptions,
+) -> Result<(GrayImage, f32)> {
+    let least = options.font_scale.clamp(MIN_FONT_SCALE, MAX_FONT_SCALE);
+    if !options.font_auto {
+        return render_scaled(content, size, options, least).map(|(img, _)| (img, least));
+    }
+    // from big to small: the first size where nothing is left out
+    let mut scale = MAX_FONT_SCALE;
+    while scale > least {
+        let (img, overflow) = render_scaled(content, size, options, scale)?;
+        if overflow.none() {
+            return Ok((img, scale));
+        }
+        scale = ((scale - 0.05) * 100.0).round() / 100.0;
+    }
+    render_scaled(content, size, options, least).map(|(img, _)| (img, least))
+}
+
+fn render_scaled(
+    content: &LabelContent,
+    size: LabelSize,
+    options: &LabelOptions,
+    scale: f32,
+) -> Result<(GrayImage, Overflow)> {
+    let mut overflow = Overflow::default();
     let kind = options.kind;
     let fonts = Fonts::load()?;
     let mut img = GrayImage::from_pixel(size.width, size.height, WHITE);
@@ -663,7 +728,7 @@ pub fn render_with(
 
     // Header: size on the left, label / catalog number on the right.
     let parts = options.parts;
-    let header_px = 21.0;
+    let header_px = 21.0 * scale;
     let size_text = content
         .size_inch
         .map(|s| format!("{s}\""))
@@ -677,7 +742,7 @@ pub fn render_with(
         let (px, line) = fit_label_line(
             &fonts.regular,
             header_px,
-            15.0,
+            15.0 * scale,
             &content.label,
             &content.catno,
             room,
@@ -693,37 +758,55 @@ pub fn render_with(
         );
     }
     if parts.header {
-        y += header_px * 1.25 + 4.0;
+        y += header_px * 1.25 + 4.0 * scale;
     }
 
     // Artist: as large as fits on one line.
     if parts.artist && !content.artist.is_empty() {
-        let (px, line) = fit_line(&fonts.bold, 32.0, 20.0, &content.artist, inner_width);
+        let (px, line) = fit_line(
+            &fonts.bold,
+            32.0 * scale,
+            20.0 * scale,
+            &content.artist,
+            inner_width,
+        );
         draw_text(&mut img, &fonts.bold, px, left, y, &line);
-        y += px * 1.2 + 2.0;
+        y += px * 1.2 + 2.0 * scale;
     }
 
     // Title: up to two lines.
     if parts.title && !content.title.is_empty() {
-        let px = 22.0;
-        for line in wrap(&fonts.regular, px, &content.title, inner_width, 2) {
+        let px = 22.0 * scale;
+        let lines = wrap(&fonts.regular, px, &content.title, inner_width, 2);
+        overflow.title_cut =
+            lines.last().is_some_and(|l| l.ends_with('…')) && !content.title.ends_with('…');
+        for line in lines {
             draw_text(&mut img, &fonts.regular, px, left, y, &line);
             y += px * 1.2;
         }
-        y += 4.0;
+        y += 4.0 * scale;
     }
 
     // Genres and styles as tags.
     if let Some(style) = options.tag_style {
-        let used = draw_tags(&mut img, &fonts, left, y, inner_width, &content.tags, style);
+        let (used, hidden) = draw_tags(
+            &mut img,
+            &fonts,
+            (left, y),
+            inner_width,
+            &content.tags,
+            style,
+            scale,
+        );
+        overflow.tags_hidden = hidden;
         if used > 0.0 {
-            y += used + 5.0;
+            y += used + 5.0 * scale;
         }
     }
 
     // Tracks: as many as fit above (and beside) the code.
     let tracks: &[LabelTrack] = if parts.tracks { &content.tracks } else { &[] };
-    let track_px: f32 = 19.0;
+    let track_px: f32 = 19.0 * scale;
     let line_height = (track_px * 1.25).round();
     let position_width = tracks
         .iter()
@@ -756,6 +839,7 @@ pub fn render_with(
         row_y += line_height;
     }
     let hidden = tracks.len() - rows.len();
+    overflow.tracks_hidden = hidden;
     let marker = format!("+{hidden}");
     let marker_width = text_width(&fonts.bold, track_px, &marker);
     let title_x = left + position_width + 6.0;
@@ -790,7 +874,7 @@ pub fn render_with(
         let top = (size.height - MARGIN) as f32 - px;
         draw_text(&mut img, &fonts.regular, px, left, top, caption);
     }
-    Ok(img)
+    Ok((img, overflow))
 }
 
 /// The sample with styles.
@@ -890,6 +974,119 @@ mod tests {
         let mut options = LabelOptions::new(kind);
         options.parts = LabelParts::without(&[part.to_string()]);
         render_with(&sample_content(), SIZE_TEST, &options).unwrap()
+    }
+
+    const SIZE_ZD421: LabelSize = LabelSize {
+        width: 607,
+        height: 408,
+    };
+
+    #[test]
+    fn bigger_text_on_request() {
+        let content = sample_content();
+        let normal =
+            render_with(&content, SIZE_ZD421, &LabelOptions::new(CodeKind::Barcode)).unwrap();
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        options.font_scale = 1.5;
+        let (big, scale) = render_fitted(&content, SIZE_ZD421, &options).unwrap();
+        assert_eq!(scale, 1.5);
+        assert!(
+            ink_in(&big, 0, 120) > ink_in(&normal, 0, 120) * 3 / 2,
+            "the header, artist and title cover more of the top"
+        );
+        // a size outside the range is brought into it
+        options.font_scale = 9.0;
+        assert_eq!(
+            render_fitted(&content, SIZE_ZD421, &options).unwrap().1,
+            MAX_FONT_SCALE
+        );
+        options.font_scale = 0.0;
+        assert_eq!(
+            render_fitted(&content, SIZE_ZD421, &options).unwrap().1,
+            MIN_FONT_SCALE
+        );
+    }
+
+    #[test]
+    fn the_automatic_size_is_the_biggest_that_fits() {
+        let content = sample_content();
+        for (size, kind) in [
+            (SIZE_ZD421, CodeKind::Barcode),
+            (SIZE_ZD421, CodeKind::Qr),
+            (SIZE_REAL, CodeKind::Barcode),
+            (SIZE_TEST, CodeKind::Qr),
+        ] {
+            let mut options = LabelOptions::new(kind);
+            options.font_auto = true;
+            let (img, scale) = render_fitted(&content, size, &options).unwrap();
+            assert!((1.0..=MAX_FONT_SCALE).contains(&scale), "{scale}");
+            let (_, at_scale) = render_scaled(&content, size, &options, scale).unwrap();
+            assert!(
+                at_scale.none() || scale == 1.0,
+                "{size:?} {kind:?}: {at_scale:?}"
+            );
+            if scale < MAX_FONT_SCALE {
+                let (_, bigger) = render_scaled(&content, size, &options, scale + 0.05).unwrap();
+                assert!(!bigger.none(), "{size:?} {kind:?}: {scale} could be bigger");
+            }
+            assert_eq!(
+                decode(&img).as_deref(),
+                Some("32474433"),
+                "the code still reads at {scale}"
+            );
+        }
+        // the bigger label allows bigger text than the small one
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        options.font_auto = true;
+        let big = render_fitted(&content, SIZE_ZD421, &options).unwrap().1;
+        let small = render_fitted(&content, SIZE_REAL, &options).unwrap().1;
+        assert!(big > small, "{big} vs {small}");
+    }
+
+    #[test]
+    fn the_automatic_size_never_goes_below_the_chosen_one() {
+        let mut content = sample_content();
+        content.tracks = (1..=30)
+            .map(|i| LabelTrack {
+                position: format!("A{i}"),
+                title: format!("Track {i}"),
+            })
+            .collect();
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        options.font_auto = true;
+        options.font_scale = 1.2;
+        // 30 tracks never fit: the least size is used
+        assert_eq!(render_fitted(&content, SIZE_REAL, &options).unwrap().1, 1.2);
+    }
+
+    #[test]
+    fn what_does_not_fit_is_reported() {
+        let mut content = sample_content_with_tags();
+        content.title = "A very long title ".repeat(8);
+        let mut options = LabelOptions::new(CodeKind::Barcode);
+        options.tag_style = Some(TagStyle::Outline);
+        content.tags = (1..=12).map(|i| format!("Style number {i}")).collect();
+        let (_, overflow) = render_scaled(&content, SIZE_TEST, &options, 1.0).unwrap();
+        assert!(
+            overflow.title_cut && overflow.tags_hidden > 0,
+            "{overflow:?}"
+        );
+        content.tracks = (1..=30)
+            .map(|i| LabelTrack {
+                position: format!("A{i}"),
+                title: format!("Track {i}"),
+            })
+            .collect();
+        let (_, many) = render_scaled(&content, SIZE_TEST, &options, 1.0).unwrap();
+        assert!(many.tracks_hidden > 0, "{many:?}");
+        let (_, fine) = render_scaled(
+            &sample_content(),
+            SIZE_ZD421,
+            &LabelOptions::new(CodeKind::Barcode),
+            1.0,
+        )
+        .unwrap();
+        assert!(fine.none(), "{fine:?}");
     }
 
     #[test]
