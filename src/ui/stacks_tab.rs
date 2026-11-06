@@ -6,6 +6,42 @@ use super::*;
 use crate::library::{StackEntry, StackInfo};
 use crate::worker::{ScanCode, StackOp, StackState};
 
+/// Opens a file in the viewer.
+pub(super) type FileOpener = Box<dyn FnMut(&std::path::Path) -> std::io::Result<()>>;
+
+/// What the threads that talk to CUPS report back.
+pub(super) enum ListEvent {
+    /// The printers and CUPS' default one.
+    Printers(Result<(Vec<String>, Option<String>), String>),
+    /// What `lp` said about the list that was sent.
+    Printed(Result<String, String>),
+}
+
+type PrintersQuery =
+    std::sync::Arc<dyn Fn() -> Result<(Vec<String>, Option<String>), String> + Send + Sync>;
+type PrintFile =
+    std::sync::Arc<dyn Fn(&std::path::Path, &str, &str) -> Result<String, String> + Send + Sync>;
+
+/// How CUPS is asked (replaced in tests, which must not print).
+#[derive(Clone)]
+pub(super) struct ListBackend {
+    pub printers: PrintersQuery,
+    pub print: PrintFile,
+}
+
+impl ListBackend {
+    pub fn cups() -> Self {
+        Self {
+            printers: std::sync::Arc::new(|| {
+                crate::stack_list::cups_printers().map_err(|e| format!("{e:#}"))
+            }),
+            print: std::sync::Arc::new(|path, printer, title| {
+                crate::stack_list::print_file(path, printer, title).map_err(|e| format!("{e:#}"))
+            }),
+        }
+    }
+}
+
 /// A window asking for a stack name: a new stack, or the new name of one.
 pub(super) struct NameDialog {
     /// The stack to rename (`None`: start a new one).
@@ -67,6 +103,110 @@ impl StacksState {
 }
 
 impl RecordShelfApp {
+    /// Asks CUPS which printers there are (in the background).
+    pub(super) fn ask_list_printers(&mut self) {
+        self.list_printers_asked = true;
+        let (tx, ask, ctx) = (
+            self.list_events_tx.clone(),
+            self.list_backend.printers.clone(),
+            self.repaint.clone(),
+        );
+        std::thread::spawn(move || {
+            let _ = tx.send(ListEvent::Printers(ask()));
+            ctx.request_repaint();
+        });
+    }
+
+    pub(super) fn drain_list_events(&mut self) {
+        while let Ok(event) = self.list_events_rx.try_recv() {
+            match event {
+                ListEvent::Printers(Ok((printers, default))) => {
+                    self.list_printers = printers;
+                    self.list_default = default;
+                }
+                // not worth an error: printing says it when it is needed
+                ListEvent::Printers(Err(_)) => {}
+                ListEvent::Printed(Ok(said)) => self.set_info(if said.is_empty() {
+                    "The list was sent to the printer".to_string()
+                } else {
+                    format!("The list was sent to the printer ({said})")
+                }),
+                ListEvent::Printed(Err(err)) => {
+                    self.set_error(format!("Printing the list failed: {err}"))
+                }
+            }
+        }
+    }
+
+    /// Writes the PDF of the shown stack; returns its path and the stack's name.
+    fn write_list_pdf(&mut self) -> Option<(std::path::PathBuf, String)> {
+        let Some(info) = self.stacks.shown_info() else {
+            self.set_error("There is no stack to print".to_string());
+            return None;
+        };
+        let name = info.name.clone();
+        let path = crate::stack_list::pdf_path(&name);
+        match crate::stack_list::write_pdf(&path, &name, &self.stacks.entries) {
+            Ok(()) => Some((path, name)),
+            Err(err) => {
+                self.set_error(format!("Could not make the list: {err:#}"));
+                None
+            }
+        }
+    }
+
+    /// Shows the list of the stack as PDF in the viewer.
+    pub(super) fn preview_stack_list(&mut self) {
+        let Some((path, _)) = self.write_list_pdf() else {
+            return;
+        };
+        match (self.file_opener)(&path) {
+            Ok(()) => self.set_info(format!("The list is in {}", path.display())),
+            Err(err) => self.set_error(format!("Could not open {}: {err}", path.display())),
+        }
+    }
+
+    /// Prints the list of the stack on the paper printer.
+    pub(super) fn print_stack_list(&mut self) {
+        let Some((path, name)) = self.write_list_pdf() else {
+            return;
+        };
+        let printer = match crate::stack_list::choose_printer(
+            &self.settings.list_printer,
+            &self.list_printers,
+            self.list_default.as_deref(),
+        ) {
+            Ok(printer) => printer,
+            Err(err) => {
+                if !self.list_printers_asked {
+                    self.ask_list_printers();
+                }
+                self.set_error(format!("{err}"));
+                return;
+            }
+        };
+        self.set_info(format!("Sending the list of stack {name} to {printer}..."));
+        let (tx, print, ctx) = (
+            self.list_events_tx.clone(),
+            self.list_backend.print.clone(),
+            self.repaint.clone(),
+        );
+        let title = format!("Stack {name}");
+        std::thread::spawn(move || {
+            let _ = tx.send(ListEvent::Printed(print(&path, &printer, &title)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn choose_list_printer(&mut self, printer: String) {
+        self.settings.list_printer = printer.clone();
+        if let Some(path) = &self.config_path
+            && let Err(err) = Settings::update_on_disk(path, |s| s.list_printer = printer)
+        {
+            self.set_error(format!("{err:#}"));
+        }
+    }
+
     /// Reads the stacks (when the database is connected).
     pub(super) fn load_stacks(&mut self) {
         self.stack_op(StackOp::Load);
@@ -248,6 +388,9 @@ impl RecordShelfApp {
         if !self.stacks.loaded {
             self.load_stacks();
         }
+        if !self.list_printers_asked {
+            self.ask_list_printers();
+        }
         let ctx = ui.ctx().clone();
         let modal = self.stacks.dialog.is_some() || self.stacks.confirm_delete.is_some();
         if !modal {
@@ -304,6 +447,12 @@ impl RecordShelfApp {
         }
         if pressed(egui::Key::Enter) {
             self.show_selected_entry_in_collection();
+        }
+        if pressed(egui::Key::P) {
+            self.print_stack_list();
+        }
+        if pressed(egui::Key::V) {
+            self.preview_stack_list();
         }
         if pressed(Command::AutoStack.key()) {
             self.toggle_auto_stack();
@@ -389,6 +538,59 @@ impl RecordShelfApp {
                     self.stacks.confirm_delete = self.stacks.shown;
                 }
             });
+        });
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(RichText::new("List on paper").strong());
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(shown.is_some(), egui::Button::new("Print list  [P]"))
+                .on_hover_text("Prints the shown stack on the paper printer (A4)")
+                .clicked()
+            {
+                self.print_stack_list();
+            }
+            if ui
+                .add_enabled(shown.is_some(), egui::Button::new("View PDF  [V]"))
+                .clicked()
+            {
+                self.preview_stack_list();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Printer:");
+            let chosen = self.settings.list_printer.clone();
+            let default_name = self
+                .list_default
+                .clone()
+                .map(|d| format!("CUPS default ({d})"))
+                .unwrap_or_else(|| "CUPS default".to_string());
+            let mut pick = None;
+            egui::ComboBox::from_id_source("list-printer")
+                .selected_text(if chosen.is_empty() {
+                    default_name.clone()
+                } else {
+                    chosen.clone()
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(chosen.is_empty(), &default_name)
+                        .clicked()
+                    {
+                        pick = Some(String::new());
+                    }
+                    for printer in &self.list_printers {
+                        if ui.selectable_label(*printer == chosen, printer).clicked() {
+                            pick = Some(printer.clone());
+                        }
+                    }
+                });
+            if ui.small_button("Refresh").clicked() {
+                self.ask_list_printers();
+            }
+            if let Some(printer) = pick {
+                self.choose_list_printer(printer);
+            }
         });
         ui.add_space(6.0);
         let mut auto = self.settings.stack_auto_add;
@@ -629,8 +831,62 @@ mod tests {
         }
     }
 
+    type Sent = std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, String, String)>>>;
+
+    /// A backend that prints nowhere: it records what would be sent.
+    fn fake_backend(answer: Result<String, String>) -> (ListBackend, Sent) {
+        let sent: Sent = Default::default();
+        let record = sent.clone();
+        let backend = ListBackend {
+            printers: std::sync::Arc::new(|| {
+                Ok((vec!["Office".into(), "Other".into()], Some("Office".into())))
+            }),
+            print: std::sync::Arc::new(move |path, printer, title| {
+                record.lock().unwrap().push((
+                    path.to_path_buf(),
+                    printer.to_string(),
+                    title.to_string(),
+                ));
+                answer.clone()
+            }),
+        };
+        (backend, sent)
+    }
+
+    /// Waits for what the threads report and takes it in.
+    fn settle(app: &mut RecordShelfApp, until: impl Fn(&RecordShelfApp) -> bool) {
+        for _ in 0..200 {
+            app.drain_list_events();
+            if until(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "nothing came back: {:?}",
+            app.notice.as_ref().map(|n| &n.text)
+        );
+    }
+
+    fn opened() -> (
+        FileOpener,
+        std::rc::Rc<std::cell::RefCell<Vec<std::path::PathBuf>>>,
+    ) {
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<std::path::PathBuf>>> = Default::default();
+        let record = seen.clone();
+        (
+            Box::new(move |p| {
+                record.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            }),
+            seen,
+        )
+    }
+
     fn app() -> RecordShelfApp {
         let mut app = app_with_results(0);
+        app.list_backend = fake_backend(Ok("request id is Office-7 (1 file(s))".into())).0;
+        app.file_opener = opened().0;
         app.library_link = LibraryLink::Ready;
         app.tab = Tab::Stacks;
         app.stacks.apply(state(true));
@@ -998,5 +1254,152 @@ mod tests {
         let before = app.worker.pending();
         app.on_tab_changed();
         assert_eq!(app.worker.pending(), before + 1);
+    }
+
+    #[test]
+    fn the_list_goes_to_the_chosen_printer() {
+        let mut app = app();
+        let (backend, sent) = fake_backend(Ok("request id is Other-3 (1 file(s))".into()));
+        app.list_backend = backend;
+        app.settings.list_printer = "Other".into();
+        frame(&mut app, plain(egui::Key::P));
+        settle(&mut app, |a| {
+            a.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("sent to the printer"))
+        });
+        let notice = app.notice.as_ref().unwrap();
+        assert!(
+            !notice.is_error && notice.text.contains("request id is Other-3"),
+            "{}",
+            notice.text
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (path, printer, title) = &sent[0];
+        assert_eq!((printer.as_str(), title.as_str()), ("Other", "Stack Box A"));
+        assert!(
+            std::fs::read(path).unwrap().starts_with(b"%PDF"),
+            "the file exists"
+        );
+    }
+
+    #[test]
+    fn without_a_choice_the_default_printer_is_used() {
+        let mut app = app();
+        let (backend, sent) = fake_backend(Ok(String::new()));
+        app.list_backend = backend;
+        // the tab asks CUPS for its printers
+        frame(&mut app, vec![]);
+        settle(&mut app, |a| a.list_default.is_some());
+        assert_eq!(app.list_printers, ["Office", "Other"]);
+        app.settings.list_printer = String::new();
+        app.print_stack_list();
+        settle(&mut app, |a| {
+            a.notice.as_ref().is_some_and(|n| n.text.contains("sent"))
+        });
+        assert_eq!(sent.lock().unwrap()[0].1, "Office");
+        assert_eq!(
+            app.notice.as_ref().unwrap().text,
+            "The list was sent to the printer"
+        );
+    }
+
+    #[test]
+    fn no_printer_to_use_is_said_clearly() {
+        let mut app = app();
+        let (backend, sent) = fake_backend(Ok(String::new()));
+        app.list_backend = backend;
+        app.list_printers = vec!["A".into(), "B".into()];
+        app.list_default = None;
+        app.print_stack_list();
+        let notice = app.notice.as_ref().unwrap();
+        assert!(
+            notice.is_error && notice.text.contains("choose a printer"),
+            "{}",
+            notice.text
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        // nothing to print without a stack
+        app.stacks.apply(StackState::default());
+        app.print_stack_list();
+        assert!(app.notice.as_ref().unwrap().text.contains("no stack"));
+    }
+
+    #[test]
+    fn a_failed_print_is_reported() {
+        let mut app = app();
+        app.list_backend = fake_backend(Err("lp: The printer or class does not exist.".into())).0;
+        app.settings.list_printer = "Gone".into();
+        app.print_stack_list();
+        settle(&mut app, |a| a.notice.as_ref().is_some_and(|n| n.is_error));
+        let text = &app.notice.as_ref().unwrap().text;
+        assert!(
+            text.contains("Printing the list failed") && text.contains("does not exist"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_pdf_can_be_looked_at_first() {
+        let mut app = app();
+        let (opener, seen) = opened();
+        app.file_opener = opener;
+        frame(&mut app, plain(egui::Key::V));
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].file_name().unwrap(), "stack-Box_A.pdf");
+        assert!(std::fs::read(&seen[0]).unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn the_printer_choice_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "token = \"keep\"\n").unwrap();
+        let mut app = app();
+        app.config_path = Some(path.clone());
+        app.choose_list_printer("Other".into());
+        assert_eq!(app.settings.list_printer, "Other");
+        let saved = Settings::load(&path).unwrap();
+        assert_eq!(
+            (saved.list_printer.as_str(), saved.token.as_str()),
+            ("Other", "keep")
+        );
+        app.choose_list_printer(String::new());
+        assert_eq!(Settings::load(&path).unwrap().list_printer, "");
+    }
+
+    #[test]
+    fn the_tab_offers_the_list_on_paper() {
+        let mut app = app();
+        app.list_printers = vec!["Office".into()];
+        app.list_default = Some("Office".into());
+        frame(&mut app, vec![]);
+        let texts = frame(&mut app, vec![]);
+        for wanted in [
+            "List on paper",
+            "Print list  [P]",
+            "View PDF  [V]",
+            "CUPS default (Office)",
+        ] {
+            assert!(texts.iter().any(|t| t == wanted), "{wanted:?} in {texts:?}");
+        }
+    }
+
+    #[test]
+    fn an_unavailable_cups_does_not_disturb() {
+        let mut app = app();
+        app.list_backend.printers = std::sync::Arc::new(|| Err("lpstat: not found".into()));
+        frame(&mut app, vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        app.drain_list_events();
+        assert!(
+            app.notice
+                .as_ref()
+                .is_none_or(|n| !n.text.contains("lpstat")),
+            "no complaint before printing is tried"
+        );
+        assert!(app.list_printers.is_empty());
     }
 }

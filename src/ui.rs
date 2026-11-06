@@ -148,6 +148,16 @@ pub struct RecordShelfApp {
     url_opener: UrlOpener,
     /// When the shop pages are to be opened, if still to be done.
     shop_tabs_due: Option<Instant>,
+    /// CUPS printers for the stack lists (and its default), what the last print said.
+    list_printers: Vec<String>,
+    list_default: Option<String>,
+    list_printers_asked: bool,
+    list_events_tx: std::sync::mpsc::Sender<stacks_tab::ListEvent>,
+    list_events_rx: Receiver<stacks_tab::ListEvent>,
+    /// How the CUPS printers are asked for and a file is sent to one (replaced in tests).
+    list_backend: stacks_tab::ListBackend,
+    /// Opens a file in the viewer (replaced in tests).
+    file_opener: stacks_tab::FileOpener,
     /// What the sticker said for the article number looked up last: (number, scanned text).
     last_shop_scan: Option<(String, String)>,
     /// The devices a scanner thread is listening to (several receivers can work at once).
@@ -220,6 +230,7 @@ impl RecordShelfApp {
         repaint.set_zoom_factor(settings.zoom());
         let (scanner_stop, scanner_rx, scanner_tx, scanner_status, scanner_active) =
             start_scanner(&settings, &repaint);
+        let (list_tx, list_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             worker: Worker::spawn(repaint.clone()),
             settings,
@@ -233,6 +244,13 @@ impl RecordShelfApp {
             url_opener: Box::new(system_opener),
             shop_tabs_due: None,
             last_shop_scan: None,
+            list_printers: Vec::new(),
+            list_default: None,
+            list_printers_asked: false,
+            list_events_tx: list_tx,
+            list_events_rx: list_rx,
+            list_backend: stacks_tab::ListBackend::cups(),
+            file_opener: Box::new(|path| open::that_detached(path)),
             scanner_active,
             scanner_next_try: Instant::now() + SCANNER_RETRY,
             notice: None,
@@ -1485,6 +1503,7 @@ impl RecordShelfApp {
     }
 
     fn drain_events(&mut self) {
+        self.drain_list_events();
         while let Ok(ev) = self.scanner_rx.try_recv() {
             match ev {
                 ScanEvent::Info(msg) => self.scanner_status = msg,

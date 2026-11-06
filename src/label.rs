@@ -17,8 +17,8 @@ use crate::discogs::Release;
 /// Dots per inch of the label printer (Zebra ZD411, 203 dpi version).
 pub const DPI: f32 = 203.0;
 
-const REGULAR: &[u8] = include_bytes!("../assets/fonts/DejaVuSansCondensed.ttf");
-const BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSansCondensed-Bold.ttf");
+pub(crate) const REGULAR: &[u8] = include_bytes!("../assets/fonts/DejaVuSansCondensed.ttf");
+pub(crate) const BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSansCondensed-Bold.ttf");
 
 const BLACK: Luma<u8> = Luma([0]);
 const WHITE: Luma<u8> = Luma([255]);

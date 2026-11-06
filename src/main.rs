@@ -16,6 +16,7 @@ mod library;
 mod printer;
 mod shop_bridge;
 mod shops;
+mod stack_list;
 mod ui;
 mod worker;
 

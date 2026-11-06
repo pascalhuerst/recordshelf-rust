@@ -101,6 +101,8 @@ pub struct Settings {
     pub database_url: String,
     /// Keep our database in line with the Discogs collection automatically (key U switches)
     pub library_auto_sync: bool,
+    /// The CUPS printer for stack lists on paper (empty: CUPS' default, or the only printer)
+    pub list_printer: String,
     /// Put every label that was printed on the active stack (key J switches)
     pub stack_auto_add: bool,
     /// With --shop-bridge: open the shop pages (decks.de, hhv.de) in the browser at the start
@@ -149,6 +151,7 @@ impl Default for Settings {
             profile: String::new(),
             profiles: Vec::new(),
             library_auto_sync: true,
+            list_printer: String::new(),
             stack_auto_add: true,
             shop_open_tabs: true,
             shop_browser: String::new(),
@@ -236,6 +239,7 @@ impl Settings {
             &mut self.device_name,
             &mut self.device_path,
             &mut self.printer_host,
+            &mut self.list_printer,
             &mut self.database_url,
             &mut self.shop_browser,
         ] {
