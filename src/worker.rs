@@ -409,6 +409,8 @@ pub struct PrintJob {
     pub width_mm: f32,
     pub height_mm: f32,
     pub top_mm: f32,
+    /// Width of the printer's print area in mm (ZD411 56, ZD421 104).
+    pub print_width_mm: f32,
     pub darkness: i8,
     /// 0 keeps the printer's own speed.
     pub speed_ips: u8,
@@ -433,7 +435,7 @@ impl PrintJob {
         };
         let zpl = printer::bitmap_zpl(
             &img,
-            printer::centred_x(size.width),
+            printer::centred_x(size.width, printer::print_width_dots(self.print_width_mm)),
             (self.top_mm * 8.0).round() as u32,
             &job,
         );
@@ -1006,6 +1008,7 @@ mod tests {
             width_mm: 51.0,
             height_mm: 38.0,
             top_mm: 1.5,
+            print_width_mm: 56.0,
             darkness: 9,
             speed_ips: 3,
             code: CodeKind::Barcode,
@@ -1029,6 +1032,27 @@ mod tests {
             &zpl[..80.min(zpl.len())]
         );
         assert!(zpl.contains(&format!("^GFA,{0},{0},51,", 51 * 304)));
+    }
+
+    #[test]
+    fn a_wider_printer_centres_a_wider_label() {
+        let (printer, server) = printer::testing::fake_printer(printer::testing::STATUS_OK);
+        PrintJob {
+            width_mm: 76.0,
+            height_mm: 51.0,
+            print_width_mm: 104.0,
+            ..job(&printer.host, printer.port)
+        }
+        .run()
+        .unwrap();
+        let zpl = server.join().unwrap().remove(1);
+        // (832 - 608) / 2 dots from the left, 1.5 mm from the top
+        assert!(
+            zpl.contains("^FO112,12^GFA,"),
+            "{}",
+            &zpl[..80.min(zpl.len())]
+        );
+        assert!(zpl.contains(&format!("^GFA,{0},{0},76,", 76 * 408)));
     }
 
     #[test]

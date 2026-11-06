@@ -13,12 +13,21 @@ use image::GrayImage;
 pub const DEFAULT_PORT: u16 = 9100;
 
 /// Width of the print area of the ZD411 in dots (56 mm at 203 dpi).
+#[cfg(test)]
 pub const PRINT_WIDTH: u32 = 448;
 
-/// Left offset that centres a label of `label_width` dots in the print area.
-/// The stock is fed centred (measured with the calibration label).
-pub fn centred_x(label_width: u32) -> u32 {
-    PRINT_WIDTH.saturating_sub(label_width) / 2
+/// Dots per millimetre of the 203 dpi printers.
+pub const DOTS_PER_MM: f32 = 8.0;
+
+/// The width of the print area in dots (ZD411: 56 mm = 448, ZD421: 104 mm = 832).
+pub fn print_width_dots(width_mm: f32) -> u32 {
+    (width_mm * DOTS_PER_MM).round() as u32
+}
+
+/// Left offset that centres a label of `label_width` dots in a print area of
+/// `print_width` dots. The stock is fed centred (measured with the calibration label).
+pub fn centred_x(label_width: u32, print_width: u32) -> u32 {
+    print_width.saturating_sub(label_width) / 2
 }
 const TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -520,10 +529,22 @@ mod tests {
 
     #[test]
     fn labels_are_centred_in_the_print_area() {
-        assert_eq!(centred_x(408), 20, "51 mm label: 2.5 mm each side");
-        assert_eq!(centred_x(416), 16, "52 mm label: 2 mm each side");
-        assert_eq!(centred_x(448), 0);
-        assert_eq!(centred_x(500), 0, "wider than the print area");
+        assert_eq!(
+            centred_x(408, PRINT_WIDTH),
+            20,
+            "51 mm label: 2.5 mm each side"
+        );
+        assert_eq!(
+            centred_x(416, PRINT_WIDTH),
+            16,
+            "52 mm label: 2 mm each side"
+        );
+        assert_eq!(centred_x(448, PRINT_WIDTH), 0);
+        assert_eq!(centred_x(500, PRINT_WIDTH), 0, "wider than the print area");
+        // 76 mm stock on the 104 mm wide ZD421
+        let width = print_width_dots(104.0);
+        assert_eq!(width, 832);
+        assert_eq!(centred_x(print_width_dots(76.0), width), 112);
     }
 
     #[test]

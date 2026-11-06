@@ -826,8 +826,8 @@ pub fn sample_content() -> LabelContent {
     }
 }
 
-/// Label sizes in millimetres: the real ones (52 x 39) and the test labels (51 x 38).
-pub const SIZES_MM: [(f32, f32); 2] = [(52.0, 39.0), (51.0, 38.0)];
+/// Label sizes in millimetres: the real ones (52 x 39, 76 x 51 on the ZD421) and the test labels (51 x 38).
+pub const SIZES_MM: [(f32, f32); 3] = [(52.0, 39.0), (51.0, 38.0), (76.0, 51.0)];
 
 /// Writes previews of all sizes and code kinds into `dir` (enlarged 3x, so they
 /// can be looked at on a screen) and returns the file names.
@@ -1275,8 +1275,8 @@ mod tests {
         let files = write_previews(dir.path(), &sample_content()).unwrap();
         assert_eq!(
             files.len(),
-            8,
-            "two sizes: qr, barcode, and the barcode with tags in two styles"
+            12,
+            "three sizes: qr, barcode, and the barcode with tags in two styles"
         );
         for f in files {
             assert!(f.exists(), "{}", f.display());

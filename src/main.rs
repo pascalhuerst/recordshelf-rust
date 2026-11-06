@@ -158,7 +158,10 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
     if args.print_calibration {
         // the printer's whole print area: 448 dots wide, as long as its label
         println!("printing the calibration label");
-        printer.print(&printer::calibration_zpl(448, status.label_length))?;
+        printer.print(&printer::calibration_zpl(
+            printer::print_width_dots(settings.printer_width_mm),
+            status.label_length,
+        ))?;
     }
     for mm in &args.print_barcode_test {
         // test labels are the 51 x 38 mm ones
@@ -172,7 +175,10 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
             options.barcode_height
         );
         let (x, y) = (
-            printer::centred_x(size.width),
+            printer::centred_x(
+                size.width,
+                printer::print_width_dots(settings.printer_width_mm),
+            ),
             (settings.label_top_mm * 8.0).round() as u32,
         );
         printer.print(&printer::bitmap_zpl(
@@ -191,7 +197,10 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
         let img = label::render_with(&label::sample_content(), size, &options)?;
         println!("printing a label with darkness adjusted by {delta:+}");
         let (x, y) = (
-            printer::centred_x(size.width),
+            printer::centred_x(
+                size.width,
+                printer::print_width_dots(settings.printer_width_mm),
+            ),
             (settings.label_top_mm * 8.0).round() as u32,
         );
         printer.print(&printer::bitmap_zpl(
@@ -218,7 +227,10 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
             settings.printer_darkness
         );
         let (x, y) = (
-            printer::centred_x(size.width),
+            printer::centred_x(
+                size.width,
+                printer::print_width_dots(settings.printer_width_mm),
+            ),
             (settings.label_top_mm * 8.0).round() as u32,
         );
         let job = printer::JobOptions {
@@ -231,7 +243,10 @@ fn print_tests(args: &Args, settings: &Settings) -> Result<()> {
     if args.print_tags_test {
         let size = label::LabelSize::from_mm(settings.label_width_mm, settings.label_height_mm);
         let (x, y) = (
-            printer::centred_x(size.width),
+            printer::centred_x(
+                size.width,
+                printer::print_width_dots(settings.printer_width_mm),
+            ),
             (settings.label_top_mm * 8.0).round() as u32,
         );
         let job = printer::JobOptions {

@@ -42,6 +42,9 @@ pub(super) struct LabelView {
     pub has_tags: bool,
     /// Names of the parts left out.
     pub hidden: Vec<String>,
+    /// The printer profiles and the one in use.
+    pub profiles: Vec<String>,
+    pub profile: String,
 }
 
 /// A change made with the toggles beside the picture.
@@ -51,6 +54,8 @@ pub(super) struct LabelAction {
     pub code: Option<String>,
     /// A part to switch on or off: (name, shown).
     pub part: Option<(String, bool)>,
+    /// The printer profile to switch to.
+    pub profile: Option<String>,
 }
 
 /// Space around the label panel, in points.
@@ -254,6 +259,8 @@ impl RecordShelfApp {
             code_choice: self.settings.label_code.clone(),
             has_tags: !p.content.tags.is_empty(),
             hidden: self.settings.label_hidden.clone(),
+            profiles: self.settings.profile_names(),
+            profile: self.settings.profile_name().to_string(),
         })
     }
 
@@ -286,6 +293,24 @@ pub(super) fn draw_label_panel(ui: &mut egui::Ui, view: &LabelView) -> LabelActi
                 ui.set_width(content_width);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.label(RichText::new("Label").strong());
+                    if view.profiles.len() > 1 {
+                        ui.horizontal(|ui| {
+                            ui.label("Printer:");
+                            egui::ComboBox::from_id_source("label-profile")
+                                .selected_text(view.profile.clone())
+                                .show_ui(ui, |ui| {
+                                    for name in &view.profiles {
+                                        if ui
+                                            .selectable_label(*name == view.profile, name)
+                                            .clicked()
+                                            && *name != view.profile
+                                        {
+                                            action.profile = Some(name.clone());
+                                        }
+                                    }
+                                });
+                        });
+                    }
                     ui.add_space(4.0);
                     egui::Frame::none()
                         .stroke(egui::Stroke::new(1.0_f32, Color32::GRAY))
@@ -361,6 +386,12 @@ impl RecordShelfApp {
         if let Some(code) = &action.code {
             self.settings.label_code = code.clone();
         }
+        if let Some(profile) = &action.profile
+            && !self.settings.switch_profile(profile)
+        {
+            self.set_error(format!("There is no printer profile {profile}"));
+            return;
+        }
         if let Some((name, shown)) = &action.part {
             self.settings.label_hidden.retain(|h| h != name);
             if !shown {
@@ -372,11 +403,13 @@ impl RecordShelfApp {
             self.settings.label_code.clone(),
             self.settings.label_hidden.clone(),
         );
+        let now = self.settings.clone();
         if let Some(path) = &self.config_path
             && let Err(err) = Settings::update_on_disk(path, |s| {
                 s.label_tags = tags;
                 s.label_code = code;
                 s.label_hidden = hidden;
+                now.copy_printer_settings_to(s);
             })
         {
             self.set_error(format!("{err:#}"));
@@ -911,6 +944,7 @@ mod tests {
             tags: Some("filled".into()),
             code: Some("qr".into()),
             part: Some(("tracks".into(), false)),
+            ..LabelAction::default()
         });
         assert_eq!(app.settings.label_hidden, ["tracks"]);
         assert!(!app.settings.label_parts().tracks);
@@ -952,6 +986,92 @@ mod tests {
         let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
         assert!(texts.iter().any(|(t, _)| t == "Artist"), "checkbox shown");
         assert!(app.label_panel.as_ref().unwrap().key.hidden == ["artist"]);
+    }
+
+    #[test]
+    fn the_printer_profile_is_switched_in_the_panel_and_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "token = \"keep\"\n").unwrap();
+        let mut app = collection_app();
+        app.config_path = Some(path.clone());
+        app.settings.printer_host = "192.168.4.55".into();
+        app.settings.add_profile("ZD421").unwrap();
+        app.settings.printer_host = "192.168.4.60".into();
+        app.settings.printer_width_mm = 104.0;
+        app.settings.label_width_mm = 76.0;
+        app.settings.label_height_mm = 51.0;
+
+        // the choice is offered with more than one profile
+        app.collection.details = Some(long_record());
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        assert!(
+            texts.iter().any(|(t, _)| t == "Printer:"),
+            "profile choice shown"
+        );
+
+        app.apply_label_action(LabelAction {
+            profile: Some("Default".into()),
+            ..LabelAction::default()
+        });
+        assert_eq!(app.settings.printer_host, "192.168.4.55");
+        assert_eq!(app.settings.label_width_mm, 51.0);
+        let saved = Settings::load(&path).unwrap();
+        assert_eq!(saved.profile_name(), "Default");
+        assert_eq!(saved.printer_host, "192.168.4.55");
+        assert_eq!(saved.token, "keep");
+        assert_eq!(saved.profile_names(), ["Default", "ZD421"]);
+
+        app.apply_label_action(LabelAction {
+            profile: Some("ZD421".into()),
+            ..LabelAction::default()
+        });
+        let job = app.print_job(crate::label::sample_content());
+        assert_eq!(
+            (
+                job.host.as_str(),
+                job.width_mm,
+                job.height_mm,
+                job.print_width_mm
+            ),
+            ("192.168.4.60", 76.0, 51.0, 104.0)
+        );
+        assert_eq!(Settings::load(&path).unwrap().printer_width_mm, 104.0);
+
+        app.apply_label_action(LabelAction {
+            profile: Some("Nope".into()),
+            ..LabelAction::default()
+        });
+        assert!(app.notice.as_ref().unwrap().is_error);
+        assert_eq!(app.settings.profile_name(), "ZD421");
+    }
+
+    #[test]
+    fn a_single_profile_shows_no_printer_choice() {
+        let mut app = collection_app();
+        app.collection.details = Some(long_record());
+        layout_frame(&mut app, 1300.0, 900.0);
+        let (_, texts) = layout_frame(&mut app, 1300.0, 900.0);
+        assert!(!texts.iter().any(|(t, _)| t == "Printer:"));
+    }
+
+    #[test]
+    fn a_76_by_51_label_is_drawn_at_its_real_size() {
+        let mut app = collection_app();
+        app.settings.printer_width_mm = 104.0;
+        app.settings.label_width_mm = 76.0;
+        app.settings.label_height_mm = 51.0;
+        let img = app
+            .render_label_bitmap(&crate::label::sample_content(), None)
+            .unwrap();
+        assert_eq!(
+            (img.width(), img.height()),
+            (607, 408),
+            "76 x 51 mm at 203 dpi"
+        );
+        let real = real_size_points(76.0, 51.0, 96.0, 1.0);
+        assert!((real.x - 287.2).abs() < 0.5 && (real.y - 192.8).abs() < 0.5);
     }
 
     #[test]

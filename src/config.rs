@@ -6,6 +6,27 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// The printer and the label size of one printer setup (see `Settings::profiles`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    pub name: String,
+    pub printer_host: String,
+    pub printer_port: u16,
+    pub printer_width_mm: f32,
+    pub label_width_mm: f32,
+    pub label_height_mm: f32,
+    pub label_top_mm: f32,
+    pub printer_darkness: i8,
+    pub printer_speed_ips: u8,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Settings::default().current_profile()
+    }
+}
+
 /// Persistent user settings, stored as TOML in the user's config directory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,6 +50,8 @@ pub struct Settings {
     /// Label printer (Zebra, raw ZPL on TCP): host name or IP address
     pub printer_host: String,
     pub printer_port: u16,
+    /// Width of the printer's print area in mm (ZD411: 56, ZD421: 104)
+    pub printer_width_mm: f32,
     /// Distance of the label's top edge from the printer's print origin, in mm
     pub label_top_mm: f32,
     /// Darkness adjustment per label, relative to the printer's own setting
@@ -56,6 +79,11 @@ pub struct Settings {
     pub shop_open_tabs: bool,
     /// Browser command for those pages (empty: the system's default browser)
     pub shop_browser: String,
+    /// Name of the printer profile in use ("" = the settings as they are, "Default")
+    pub profile: String,
+    /// The other printer profiles: the printer and label size settings of each
+    /// (the ones in use are the plain settings above, see `switch_profile`)
+    pub profiles: Vec<Profile>,
     /// Settings this version does not know (hand written, or from a newer
     /// version) are kept when saving instead of being dropped.
     #[serde(flatten)]
@@ -75,6 +103,7 @@ impl Default for Settings {
             folder_id: 0,
             printer_host: String::new(),
             printer_port: crate::printer::DEFAULT_PORT,
+            printer_width_mm: 56.0,
             label_top_mm: 1.5,
             printer_darkness: 9,
             printer_speed_ips: 3,
@@ -85,6 +114,8 @@ impl Default for Settings {
             label_hidden: Vec::new(),
             preview_ppi: 96.0,
             database_url: String::new(),
+            profile: String::new(),
+            profiles: Vec::new(),
             library_auto_sync: true,
             stack_auto_add: true,
             shop_open_tabs: true,
@@ -183,14 +214,24 @@ impl Settings {
         }
         self.printer_darkness = self.printer_darkness.clamp(-30, 30);
         self.printer_speed_ips = self.printer_speed_ips.min(6);
-        // the print area is 56 mm wide; labels smaller than 20 mm make no sense
-        self.label_width_mm = clamp_mm(self.label_width_mm, 20.0, 56.0, 51.0);
+        // labels must fit the print area (56 mm on the ZD411); smaller than 20 mm makes no sense
+        self.printer_width_mm = clamp_mm(self.printer_width_mm, 20.0, 120.0, 56.0);
+        self.label_width_mm = clamp_mm(self.label_width_mm, 20.0, self.printer_width_mm, 51.0);
         self.label_height_mm = clamp_mm(self.label_height_mm, 20.0, 150.0, 38.0);
         self.label_top_mm = clamp_mm(self.label_top_mm, 0.0, 10.0, 1.5);
         self.label_code = match self.label_code.trim().to_lowercase().as_str() {
             "qr" => "qr".to_string(),
             _ => "barcode".to_string(),
         };
+        self.profile = self.profile.trim().to_string();
+        let mut seen: Vec<String> = vec![self.profile_name().to_lowercase()];
+        self.profiles.retain_mut(|p| {
+            p.name = p.name.trim().to_string();
+            let key = p.name.to_lowercase();
+            let keep = !p.name.is_empty() && !seen.contains(&key);
+            seen.push(key);
+            keep
+        });
         self.preview_ppi = clamp_mm(self.preview_ppi, 40.0, 400.0, 96.0);
         self.label_tags = match self.label_tags.trim().to_lowercase().as_str() {
             "outline" => "outline".to_string(),
@@ -211,6 +252,123 @@ impl Settings {
     /// Which parts of the label are drawn.
     pub fn label_parts(&self) -> crate::label::LabelParts {
         crate::label::LabelParts::without(&self.label_hidden)
+    }
+
+    /// The profile in use, as it is in the settings now.
+    pub fn current_profile(&self) -> Profile {
+        Profile {
+            name: self.profile_name().to_string(),
+            printer_host: self.printer_host.clone(),
+            printer_port: self.printer_port,
+            printer_width_mm: self.printer_width_mm,
+            label_width_mm: self.label_width_mm,
+            label_height_mm: self.label_height_mm,
+            label_top_mm: self.label_top_mm,
+            printer_darkness: self.printer_darkness,
+            printer_speed_ips: self.printer_speed_ips,
+        }
+    }
+
+    /// Copies the printer and label size settings and the profiles to `other`
+    /// (to save a profile change without touching anything else in a file).
+    pub fn copy_printer_settings_to(&self, other: &mut Settings) {
+        other.printer_host = self.printer_host.clone();
+        other.printer_port = self.printer_port;
+        other.printer_width_mm = self.printer_width_mm;
+        other.label_width_mm = self.label_width_mm;
+        other.label_height_mm = self.label_height_mm;
+        other.label_top_mm = self.label_top_mm;
+        other.printer_darkness = self.printer_darkness;
+        other.printer_speed_ips = self.printer_speed_ips;
+        other.profile = self.profile.clone();
+        other.profiles = self.profiles.clone();
+    }
+
+    pub fn profile_name(&self) -> &str {
+        let name = self.profile.trim();
+        if name.is_empty() { "Default" } else { name }
+    }
+
+    /// Names of all profiles, the one in use first.
+    pub fn profile_names(&self) -> Vec<String> {
+        let mut names = vec![self.profile_name().to_string()];
+        for p in &self.profiles {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(&p.name)) {
+                names.push(p.name.clone());
+            }
+        }
+        names
+    }
+
+    fn put_profile(&mut self, profile: Profile) {
+        match self
+            .profiles
+            .iter_mut()
+            .find(|p| p.name.eq_ignore_ascii_case(&profile.name))
+        {
+            Some(slot) => *slot = profile,
+            None => self.profiles.push(profile),
+        }
+    }
+
+    /// Makes another profile the one in use: what is set now is kept under its
+    /// name, and the printer and label size settings of the other take its place.
+    /// False if there is no such profile.
+    pub fn switch_profile(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case(self.profile_name()) {
+            return true;
+        }
+        let Some(target) = self
+            .profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            return false;
+        };
+        let current = self.current_profile();
+        self.put_profile(current);
+        self.profiles
+            .retain(|p| !p.name.eq_ignore_ascii_case(&target.name));
+        self.printer_host = target.printer_host;
+        self.printer_port = target.printer_port;
+        self.printer_width_mm = target.printer_width_mm;
+        self.label_width_mm = target.label_width_mm;
+        self.label_height_mm = target.label_height_mm;
+        self.label_top_mm = target.label_top_mm;
+        self.printer_darkness = target.printer_darkness;
+        self.printer_speed_ips = target.printer_speed_ips;
+        self.profile = target.name;
+        true
+    }
+
+    /// Keeps what is set now as a new profile with this name and switches to it
+    /// (the old one is kept under its own name). Errors say what is wrong with the name.
+    pub fn add_profile(&mut self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("a profile needs a name".to_string());
+        }
+        if self
+            .profile_names()
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name))
+        {
+            return Err(format!("there is a profile called {name} already"));
+        }
+        let old = self.current_profile();
+        self.put_profile(old);
+        self.profile = name.to_string();
+        Ok(())
+    }
+
+    /// Deletes a profile that is not the one in use.
+    pub fn delete_profile(&mut self, name: &str) -> bool {
+        let before = self.profiles.len();
+        self.profiles
+            .retain(|p| !p.name.eq_ignore_ascii_case(name.trim()));
+        self.profiles.len() < before
     }
 
     /// How the styles are drawn on the label, if at all.
@@ -366,6 +524,148 @@ mod tests {
         assert_eq!(loaded.folder_id, 7);
         assert_eq!(loaded.username, "me");
         assert_eq!(loaded.zoom_factor, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    fn zd421() -> Settings {
+        Settings {
+            printer_host: "192.168.4.60".into(),
+            printer_width_mm: 104.0,
+            label_width_mm: 76.0,
+            label_height_mm: 51.0,
+            printer_speed_ips: 4,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn the_settings_start_with_one_profile_called_default() {
+        let s = Settings::default();
+        assert_eq!(s.profile_names(), ["Default"]);
+        assert_eq!(s.current_profile().printer_width_mm, 56.0);
+        assert!(!s.clone().delete_profile("Default"));
+    }
+
+    #[test]
+    fn the_printer_must_be_wide_enough_for_the_label() {
+        let s = zd421().normalized();
+        assert_eq!((s.printer_width_mm, s.label_width_mm), (104.0, 76.0));
+        let narrow = Settings {
+            label_width_mm: 76.0,
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(narrow.label_width_mm, 56.0, "no wider than the print area");
+    }
+
+    #[test]
+    fn a_profile_is_added_and_switched_to_and_back() {
+        let mut s = Settings {
+            printer_host: "192.168.4.55".into(),
+            label_width_mm: 52.0,
+            label_height_mm: 39.0,
+            ..Settings::default()
+        };
+        s.add_profile("ZD421 76x51").unwrap();
+        assert_eq!(s.profile_name(), "ZD421 76x51");
+        assert_eq!(s.profile_names(), ["ZD421 76x51", "Default"]);
+        // change the new profile's values
+        let (host, width, w, h, speed) = {
+            let z = zd421();
+            (
+                z.printer_host,
+                z.printer_width_mm,
+                z.label_width_mm,
+                z.label_height_mm,
+                z.printer_speed_ips,
+            )
+        };
+        s.printer_host = host;
+        s.printer_width_mm = width;
+        s.label_width_mm = w;
+        s.label_height_mm = h;
+        s.printer_speed_ips = speed;
+
+        assert!(s.switch_profile("default"));
+        assert_eq!(s.profile_name(), "Default");
+        assert_eq!(s.printer_host, "192.168.4.55");
+        assert_eq!(
+            (s.label_width_mm, s.label_height_mm, s.printer_width_mm),
+            (52.0, 39.0, 56.0)
+        );
+        assert_eq!(s.profiles.len(), 1, "only the others are kept apart");
+
+        assert!(s.switch_profile("ZD421 76x51"));
+        assert_eq!(s.printer_host, "192.168.4.60");
+        assert_eq!(
+            (s.label_width_mm, s.label_height_mm, s.printer_width_mm),
+            (76.0, 51.0, 104.0)
+        );
+        assert_eq!(s.printer_speed_ips, 4);
+        assert!(!s.switch_profile("nonexistent"));
+        assert_eq!(s.profile_name(), "ZD421 76x51", "unchanged");
+    }
+
+    #[test]
+    fn profile_names_are_checked() {
+        let mut s = Settings::default();
+        assert!(s.add_profile("  ").is_err());
+        assert!(s.add_profile("default").unwrap_err().contains("already"));
+        s.add_profile("B").unwrap();
+        assert!(s.add_profile("b").is_err());
+        assert!(s.delete_profile("Default"));
+        assert!(!s.delete_profile("Default"));
+        assert_eq!(s.profile_names(), ["B"]);
+    }
+
+    #[test]
+    fn profiles_survive_saving_and_old_files_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut s = zd421();
+        s.add_profile("ZD421").unwrap();
+        s.save(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.profile, "ZD421");
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].name, "Default");
+        // a file from before profiles
+        std::fs::write(&path, "printer_host = \"10.0.0.1\"\n").unwrap();
+        let old = Settings::load(&path).unwrap();
+        assert_eq!(old.profile_names(), ["Default"]);
+        assert_eq!(old.printer_width_mm, 56.0);
+    }
+
+    #[test]
+    fn duplicate_and_blank_profiles_in_a_hand_edited_file_are_dropped() {
+        let s = Settings {
+            profile: "A".into(),
+            profiles: vec![
+                Profile {
+                    name: " ".into(),
+                    ..Profile::default()
+                },
+                Profile {
+                    name: "a".into(),
+                    ..Profile::default()
+                },
+                Profile {
+                    name: "B".into(),
+                    ..Profile::default()
+                },
+                Profile {
+                    name: "b".into(),
+                    ..Profile::default()
+                },
+            ],
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(s.profile_names(), ["A", "B"]);
     }
 }
 

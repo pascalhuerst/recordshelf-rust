@@ -200,6 +200,9 @@ pub struct RecordShelfApp {
     bridge: Option<BridgeState>,
     shop_info: Option<String>,
     settings_draft: Settings,
+    /// The name typed for a new printer profile in the settings, and what is wrong with it.
+    profile_input: String,
+    profile_error: Option<String>,
     devices: Vec<InputDevice>,
 }
 
@@ -266,6 +269,8 @@ impl RecordShelfApp {
             bridge: None,
             shop_info: None,
             settings_draft: Settings::default(),
+            profile_input: String::new(),
+            profile_error: None,
             devices: Vec::new(),
         };
         app.configure_worker();
@@ -1090,6 +1095,11 @@ impl RecordShelfApp {
                             .num_columns(2)
                             .spacing([8.0, 6.0])
                             .show(ui, |ui| {
+                                ui.label("Profile:");
+                                ui.vertical(|ui| {
+                                    profile_row(ui, draft, &mut self.profile_input, &mut self.profile_error);
+                                });
+                                ui.end_row();
                                 ui.label("Host:");
                                 ui.horizontal(|ui| {
                                     ui.add(
@@ -1104,11 +1114,23 @@ impl RecordShelfApp {
                                     );
                                 });
                                 ui.end_row();
+                                ui.label("Print area:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(&mut draft.printer_width_mm)
+                                            .clamp_range(20.0..=120.0)
+                                            .speed(0.5)
+                                            .fixed_decimals(0)
+                                            .suffix(" mm wide"),
+                                    );
+                                    ui.label(RichText::new("(ZD411: 56, ZD421: 104)").small());
+                                });
+                                ui.end_row();
                                 ui.label("Label size:");
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::DragValue::new(&mut draft.label_width_mm)
-                                            .clamp_range(20.0..=56.0)
+                                            .clamp_range(20.0..=draft.printer_width_mm)
                                             .speed(0.1)
                                             .fixed_decimals(1)
                                             .suffix(" mm"),
@@ -2136,6 +2158,7 @@ impl RecordShelfApp {
             width_mm: settings.label_width_mm,
             height_mm: settings.label_height_mm,
             top_mm: settings.label_top_mm,
+            print_width_mm: settings.printer_width_mm,
             darkness: settings.printer_darkness,
             speed_ips: settings.printer_speed_ips,
             code: if settings.label_code == "qr" {
@@ -2476,6 +2499,62 @@ fn step(selected: &mut Option<usize>, len: usize, up: bool, down: bool) {
     }
     if down {
         *selected = Some(selected.map_or(0, |s| (s + 1).min(len - 1)));
+    }
+}
+
+/// The printer profiles in the settings: choose one, add the settings as shown
+/// as a new one, delete the others.
+fn profile_row(
+    ui: &mut egui::Ui,
+    draft: &mut Settings,
+    input: &mut String,
+    error: &mut Option<String>,
+) {
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_source("printer-profile")
+            .selected_text(draft.profile_name().to_string())
+            .show_ui(ui, |ui| {
+                for name in draft.profile_names() {
+                    if ui
+                        .selectable_label(name == draft.profile_name(), &name)
+                        .clicked()
+                    {
+                        draft.switch_profile(&name);
+                        *error = None;
+                    }
+                }
+            });
+        ui.add(
+            egui::TextEdit::singleline(input)
+                .desired_width(140.0)
+                .hint_text("name of a new profile"),
+        );
+        if ui
+            .add_enabled(!input.trim().is_empty(), egui::Button::new("Add profile"))
+            .on_hover_text("Keeps these printer settings as they are for the old profile and starts the new one with them")
+            .clicked()
+        {
+            match draft.add_profile(input) {
+                Ok(()) => {
+                    input.clear();
+                    *error = None;
+                }
+                Err(err) => *error = Some(err),
+            }
+        }
+    });
+    let others: Vec<String> = draft.profile_names().into_iter().skip(1).collect();
+    if !others.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for name in others {
+                if ui.small_button(format!("Delete {name}")).clicked() {
+                    draft.delete_profile(&name);
+                }
+            }
+        });
+    }
+    if let Some(err) = error {
+        ui.colored_label(Color32::RED, err.as_str());
     }
 }
 
