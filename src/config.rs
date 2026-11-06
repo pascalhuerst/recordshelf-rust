@@ -6,6 +6,22 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+static LAST_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fingerprint of the text of a settings file.
+pub fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The fingerprint of what this program wrote to a settings file last: a file
+/// with that content is not a change made by somebody else.
+pub fn last_written_hash() -> u64 {
+    LAST_WRITTEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The printer and the label size of one printer setup (see `Settings::profiles`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -182,6 +198,7 @@ impl Settings {
                 .with_context(|| format!("create config dir {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("serialize settings")?;
+        LAST_WRITTEN.store(text_hash(&text), std::sync::atomic::Ordering::SeqCst);
         fs::write(path, text).with_context(|| format!("write settings file {}", path.display()))?;
         #[cfg(unix)]
         {

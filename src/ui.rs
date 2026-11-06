@@ -203,6 +203,9 @@ pub struct RecordShelfApp {
     /// The name typed for a new printer profile in the settings, and what is wrong with it.
     profile_input: String,
     profile_error: Option<String>,
+    /// The settings file as last seen: (modification time, fingerprint of the text).
+    config_seen: Option<(std::time::SystemTime, u64)>,
+    config_next_check: Instant,
     devices: Vec<InputDevice>,
 }
 
@@ -271,6 +274,8 @@ impl RecordShelfApp {
             settings_draft: Settings::default(),
             profile_input: String::new(),
             profile_error: None,
+            config_seen: None,
+            config_next_check: Instant::now() + CONFIG_CHECK,
             devices: Vec::new(),
         };
         app.configure_worker();
@@ -912,8 +917,27 @@ impl RecordShelfApp {
             self.set_error(format!("{err:#}"));
             return;
         }
-        let old = std::mem::replace(&mut self.settings, draft);
+        self.apply_settings(draft);
+        if self.config_path.is_none() {
+            self.set_info("Settings applied (no config path, not saved)".to_string());
+        } else {
+            self.set_info("Settings saved".to_string());
+        }
+    }
+
+    /// Takes new settings into use at once, without a restart: whatever the
+    /// changed values affect (scanner, Discogs account, database) starts over.
+    fn apply_settings(&mut self, new: Settings) {
+        let old = std::mem::replace(&mut self.settings, new);
         let new = &self.settings;
+        if (old.zoom_factor - new.zoom_factor).abs() > 1e-3 {
+            self.repaint.set_zoom_factor(new.zoom());
+        }
+        if old.folder_id != new.folder_id
+            && let Some(i) = self.folders.iter().position(|f| f.id == new.folder_id)
+        {
+            self.folder_selected = Some(i);
+        }
 
         let scanner_changed =
             (&old.device_name, &old.device_path) != (&new.device_name, &new.device_path);
@@ -947,16 +971,67 @@ impl RecordShelfApp {
         if library_changed {
             self.configure_library();
         }
-        if self.config_path.is_none() {
-            self.set_info("Settings applied (no config path, not saved)".to_string());
-        } else {
-            self.set_info("Settings saved".to_string());
+    }
+
+    /// Looks whether the settings file was changed by somebody else (an editor,
+    /// another tool) and takes the new values into use. Our own writes are
+    /// recognised by their content. Looked at once a second.
+    fn check_config_file(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if now < self.config_next_check {
+            ctx.request_repaint_after(self.config_next_check - now);
+            return;
+        }
+        self.config_next_check = now + CONFIG_CHECK;
+        ctx.request_repaint_after(CONFIG_CHECK);
+        if self.settings_open {
+            return; // the dialog has its own copy; look again when it is closed
+        }
+        self.reload_settings(false);
+    }
+
+    /// Reads the settings file again and uses it. Without `force` nothing happens
+    /// unless the file really changed since it was last looked at.
+    fn reload_settings(&mut self, force: bool) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            return; // no file (yet)
+        };
+        if !force && self.config_seen.is_some_and(|(seen, _)| seen == modified) {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let hash = crate::config::text_hash(&text);
+        let previous = self.config_seen.replace((modified, hash));
+        if !force
+            && (hash == crate::config::last_written_hash()
+                || previous.is_some_and(|(_, h)| h == hash))
+        {
+            return; // our own write, or only touched
+        }
+        if previous.is_none() && !force {
+            return; // the first look only notes the state at the start
+        }
+        match Settings::load(&path) {
+            Ok(loaded) => {
+                let loaded = loaded.normalized();
+                if loaded == self.settings {
+                    return;
+                }
+                self.apply_settings(loaded);
+                self.set_info("Settings reloaded from the file".to_string());
+            }
+            Err(err) => self.set_error(format!("The settings file has a problem: {err:#}")),
         }
     }
 
     fn show_settings(&mut self, ctx: &egui::Context) {
         let mut open = true;
-        let (mut save, mut cancel) = (false, false);
+        let (mut save, mut cancel, mut reload) = (false, false, false);
         let mut change_folder = false;
         let devices = self.devices.clone();
         let mut refresh_devices = false;
@@ -1301,6 +1376,10 @@ impl RecordShelfApp {
                 ui.horizontal(|ui| {
                     save = ui.button("Save").clicked();
                     cancel = ui.button("Cancel").clicked();
+                    reload = ui
+                        .button("Reload from file")
+                        .on_hover_text("Throw away these edits and read the settings file again (changes made in an editor are also picked up by themselves)")
+                        .clicked();
                 });
             });
         if refresh_devices {
@@ -1311,6 +1390,11 @@ impl RecordShelfApp {
         }
         if save {
             self.save_settings();
+        }
+        if reload {
+            self.reload_settings(true);
+            self.settings_draft = self.settings.clone();
+            self.profile_error = None;
         }
         self.settings_open = open && !save && !cancel;
     }
@@ -2373,6 +2457,7 @@ impl eframe::App for RecordShelfApp {
             }
         }
         self.persist_zoom(ctx);
+        self.check_config_file(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
@@ -2633,6 +2718,9 @@ fn spawn_readers(
     }
     started
 }
+
+/// How often the settings file is looked at for changes made outside the app.
+const CONFIG_CHECK: Duration = Duration::from_secs(1);
 
 /// How often a scanner that is not there is looked for again (plugging it in
 /// is enough, no restart needed).
@@ -3667,6 +3755,173 @@ mod tests {
         };
         app.open_settings();
         app
+    }
+
+    /// Writes the file as somebody else would (an editor), a moment later than the last write.
+    fn edit_file_outside(path: &std::path::Path, text: &str) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn app_watching(dir: &std::path::Path) -> RecordShelfApp {
+        let mut app = settings_dialog_app(dir);
+        app.settings_open = false;
+        Settings {
+            token: "tok".into(),
+            ..Settings::default()
+        }
+        .save(app.config_path.as_ref().unwrap())
+        .unwrap();
+        app.reload_settings(false); // the first look notes the state
+        assert!(app.notice.is_none() || !app.notice.as_ref().unwrap().text.contains("reloaded"));
+        app
+    }
+
+    #[test]
+    fn changes_made_in_an_editor_are_used_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_watching(dir.path());
+        let path = app.config_path.clone().unwrap();
+        edit_file_outside(
+            &path,
+            "token = \"tok\"\nprofile = \"ZD421\"\nprinter_host = \"192.168.4.60\"\nprinter_width_mm = 104.0\nlabel_width_mm = 76.0\nlabel_height_mm = 51.0\n\n[[profiles]]\nname = \"Default\"\nprinter_host = \"192.168.4.55\"\n",
+        );
+        app.reload_settings(false);
+        assert_eq!(app.settings.profile_names(), ["ZD421", "Default"]);
+        assert_eq!(app.settings.printer_host, "192.168.4.60");
+        assert_eq!(app.settings.label_width_mm, 76.0);
+        let notice = app.notice.as_ref().unwrap();
+        assert!(
+            !notice.is_error && notice.text.contains("reloaded"),
+            "{}",
+            notice.text
+        );
+        // the label panel offers the new profile at once
+        let view = {
+            let ctx = app.repaint.clone();
+            app.label_view(&ctx, Some(crate::label::sample_content()))
+                .unwrap()
+        };
+        assert_eq!(view.profiles, ["ZD421", "Default"]);
+        // looking again changes nothing
+        app.notice = None;
+        app.reload_settings(false);
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn what_the_app_writes_itself_is_not_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_watching(dir.path());
+        // a command line override that is not in the file
+        app.settings.token = "from the command line".into();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.apply_label_action(crate::ui::label_preview::LabelAction {
+            tags: Some("filled".into()),
+            ..Default::default()
+        });
+        app.notice = None;
+        app.reload_settings(false);
+        assert_eq!(app.settings.token, "from the command line");
+        assert!(app.notice.is_none(), "no reload for our own write");
+        // saving the dialog neither
+        app.open_settings();
+        app.settings_draft.printer_port = 9111;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.save_settings();
+        app.notice = None;
+        app.reload_settings(false);
+        assert!(app.notice.is_none());
+        assert_eq!(app.settings.printer_port, 9111);
+    }
+
+    #[test]
+    fn a_broken_file_is_reported_and_the_settings_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_watching(dir.path());
+        let path = app.config_path.clone().unwrap();
+        edit_file_outside(&path, "token = [this is not toml\n");
+        app.reload_settings(false);
+        let notice = app.notice.as_ref().unwrap();
+        assert!(
+            notice.is_error && notice.text.contains("settings file"),
+            "{}",
+            notice.text
+        );
+        assert_eq!(app.settings.token, "tok");
+        // fixed again: picked up
+        edit_file_outside(&path, "token = \"new\"\n");
+        app.reload_settings(false);
+        assert_eq!(app.settings.token, "new");
+    }
+
+    #[test]
+    fn a_reload_restarts_what_the_changed_values_affect() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_watching(dir.path());
+        let path = app.config_path.clone().unwrap();
+        app.releases.insert(
+            1,
+            serde_json::from_str(r#"{"id": 1, "title": "T"}"#).unwrap(),
+        );
+        // a new account: what was fetched is forgotten
+        edit_file_outside(&path, "token = \"other\"\nusername = \"someone\"\n");
+        app.reload_settings(false);
+        assert!(app.releases.is_empty());
+        // another scanner: the search for it starts
+        edit_file_outside(
+            &path,
+            "token = \"other\"\nusername = \"someone\"\ndevice_name = \"Reloaded Scanner 42\"\n",
+        );
+        app.reload_settings(false);
+        assert!(
+            app.scanner_status
+                .contains("\"Reloaded Scanner 42\" not found"),
+            "{}",
+            app.scanner_status
+        );
+        // zoom
+        edit_file_outside(
+            &path,
+            "token = \"other\"\nusername = \"someone\"\nzoom_factor = 1.5\n",
+        );
+        app.reload_settings(false);
+        let _ = app.repaint.clone().run(Default::default(), |_| {}); // takes effect with the next frame
+        assert_eq!(app.repaint.zoom_factor(), 1.5);
+    }
+
+    #[test]
+    fn while_the_dialog_is_open_the_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_watching(dir.path());
+        let path = app.config_path.clone().unwrap();
+        edit_file_outside(&path, "token = \"edited\"\n");
+        app.open_settings();
+        app.config_next_check = Instant::now() - Duration::from_secs(1);
+        let ctx = app.repaint.clone();
+        app.check_config_file(&ctx);
+        assert_eq!(
+            app.settings.token, "tok",
+            "the dialog's edits are not trampled"
+        );
+        app.settings_open = false;
+        app.config_next_check = Instant::now() - Duration::from_secs(1);
+        app.check_config_file(&ctx);
+        assert_eq!(
+            app.settings.token, "edited",
+            "picked up when the dialog is closed"
+        );
+    }
+
+    #[test]
+    fn the_reload_button_throws_away_the_edits_of_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_watching(dir.path());
+        app.open_settings();
+        app.settings_draft.token = "typed but not saved".into();
+        app.reload_settings(true);
+        app.settings_draft = app.settings.clone();
+        assert_eq!(app.settings_draft.token, "tok");
     }
 
     #[test]
